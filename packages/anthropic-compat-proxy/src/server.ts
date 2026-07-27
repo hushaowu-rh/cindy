@@ -259,6 +259,7 @@ function isSafePathOverride(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const queryIndex = value.indexOf('?');
   const pathname = queryIndex === -1 ? value : value.slice(0, queryIndex);
+  const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(pathname);
   const hasDotSegment = pathname
     .split('/')
     .some((segment) => {
@@ -275,6 +276,7 @@ function isSafePathOverride(value: unknown): value is string {
     && !/[^\u0021-\u007e]/.test(value)
     && /^\/[A-Za-z0-9\-._~%!$&()*+,;=:@/?]*$/.test(value)
     && !/%(?![0-9A-Fa-f]{2})/.test(value)
+    && !hasEncodedPathSeparator
     && !hasDotSegment
   );
 }

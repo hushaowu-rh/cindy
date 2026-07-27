@@ -9,6 +9,7 @@ export function isProviderRequestPath(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const queryIndex = value.indexOf('?');
   const path = queryIndex === -1 ? value : value.slice(0, queryIndex);
+  const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(path);
   const hasDotSegment = path
     .split('/')
     .some((segment) => {
@@ -27,6 +28,7 @@ export function isProviderRequestPath(value: unknown): value is string {
     // Characters outside RFC 3986 path/query delimiters must be percent-encoded by the caller.
     && /^\/[A-Za-z0-9\-._~%!$&()*+,;=:@/?]*$/.test(value)
     && !/%(?![0-9A-Fa-f]{2})/.test(value)
+    && !hasEncodedPathSeparator
     && !hasDotSegment
   );
 }

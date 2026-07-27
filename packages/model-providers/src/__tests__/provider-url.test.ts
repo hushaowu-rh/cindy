@@ -43,6 +43,10 @@ describe('isProviderRequestPath', () => {
     '/%2E%2e/infer',
     '/.%2e/infer',
     '/%2e./infer',
+    '/%2e%2e%2fadmin',
+    '/%2E%2E%5Cadmin',
+    '/safe%2Fpart',
+    '/safe%5cpart',
     '/模型',
     '/v1\\messages',
     'responses',
@@ -53,6 +57,7 @@ describe('isProviderRequestPath', () => {
   it('does not treat dot-like query values as path segments', () => {
     expect(isProviderRequestPath('/infer?next=../other')).toBe(true);
     expect(isProviderRequestPath('/infer?next=%2e%2e')).toBe(true);
+    expect(isProviderRequestPath('/infer?next=%2fadmin')).toBe(true);
   });
 });
 

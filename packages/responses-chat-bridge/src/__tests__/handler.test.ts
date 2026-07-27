@@ -81,13 +81,13 @@ describe('createResponsesChatHandler', () => {
     ) as typeof fetch;
     const handler = createResponsesChatHandler({
       upstreamBase: 'https://provider.example/gateway?tenant=acme',
-      chatCompletionsPath: '/infer?stream=1',
+      chatCompletionsPath: '/infer?stream=1&next=%2fadmin',
       buildHeaders: async () => ({}),
     }, { fetchImpl });
     const res = new FakeResponse();
     await handler.handle({ parsedBody: { model: 'm', input: 'hi' }, res: res as never });
     expect(fetchImpl).toHaveBeenCalledWith(
-      'https://provider.example/gateway/infer?tenant=acme&stream=1',
+      'https://provider.example/gateway/infer?tenant=acme&stream=1&next=%2fadmin',
       expect.anything(),
     );
   });
@@ -120,6 +120,8 @@ describe('createResponsesChatHandler', () => {
     ['a backslash in the chat path', 'https://provider.example/v1', '/v1\\chat'],
     ['a dot segment in the chat path', 'https://provider.example/v1', '/../admin'],
     ['an encoded dot segment in the chat path', 'https://provider.example/v1', '/%2e%2e/admin'],
+    ['an encoded slash in the chat path', 'https://provider.example/v1', '/%2e%2e%2fadmin'],
+    ['an encoded backslash in the chat path', 'https://provider.example/v1', '/safe%5Cpart'],
     ['a WHATWG-normalized character in the chat path', 'https://provider.example/v1', '/a<b'],
     ['an incomplete percent escape', 'https://provider.example/v1', '/chat%2'],
     ['an invalid percent escape', 'https://provider.example/v1', '/%ZZ'],

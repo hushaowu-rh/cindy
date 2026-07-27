@@ -651,11 +651,11 @@ describe('anthropic-compat-proxy routingTransform', () => {
     proxy = await createAnthropicCompatProxy({
       upstream: `${custom.url}/base?tenant=acme`,
       transformRequest: [],
-      routingTransform: () => ({ pathOverride: '/infer?stream=1' }),
+      routingTransform: () => ({ pathOverride: '/infer?stream=1&next=%2fadmin' }),
     });
 
     await post(proxy.url, { model: 'custom-model' });
-    expect(custom.paths).toEqual(['/base/infer?tenant=acme&stream=1']);
+    expect(custom.paths).toEqual(['/base/infer?tenant=acme&stream=1&next=%2fadmin']);
   });
 
   it.each([
@@ -670,6 +670,8 @@ describe('anthropic-compat-proxy routingTransform', () => {
     '/café',
     '/../admin',
     '/.%2e/admin',
+    '/%2e%2e%2fadmin',
+    '/safe%5Cpart',
     '/a<b',
     '/infer%2',
     '/%ZZ',

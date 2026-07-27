@@ -45,6 +45,7 @@ function joinUrl(base: string, path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const queryIndex = normalizedPath.indexOf('?');
   const pathname = queryIndex === -1 ? normalizedPath : normalizedPath.slice(0, queryIndex);
+  const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(pathname);
   const hasDotSegment = pathname
     .split('/')
     .some((segment) => {
@@ -59,6 +60,7 @@ function joinUrl(base: string, path: string): string {
     || /[^\u0021-\u007e]/.test(normalizedPath)
     || !/^\/[A-Za-z0-9\-._~%!$&()*+,;=:@/?]*$/.test(normalizedPath)
     || /%(?![0-9A-Fa-f]{2})/.test(normalizedPath)
+    || hasEncodedPathSeparator
     || hasDotSegment
   ) {
     throw new TypeError('invalid chat completions path');

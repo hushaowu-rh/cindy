@@ -324,6 +324,19 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
               subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
               requestSessionsReseed: (deviceId) => remoteSessionStore.requestReseed(deviceId),
+              onDeviceUnavailable: (deviceId) => {
+                // 新连接按 unknown 乐观探测一次;relay 明确回 DEVICE_OFFLINE 后恢复
+                // 当前代 false verdict,让退避重跑过滤该设备而不是持续重放整套计划。
+                presenceAvailableByDeviceRef.current.set(deviceId, false);
+                presencePendingRecoveryDeviceIdsRef.current.add(deviceId);
+                clearDeviceResponsivenessTrackingFor(deviceId);
+                remoteSubscribedTopicsRef.current.delete(deviceId);
+                scheduleUnavailableDeviceMirrorWipe(
+                  presenceWipeTimersRef.current,
+                  presenceAvailableByDeviceRef.current,
+                  deviceId,
+                );
+              },
               rebuildSessionSnapshot: (deviceId, sessionId, opts) => rebuildSessionSnapshot(client, deviceId, sessionId, opts),
             });
             await probeRun;
@@ -472,15 +485,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         // 桌面端离线:给一个短宽限。弱网下桌面端会反复闪断,每次都立即清空
         // 会话镜像 + 能力缓存会让手机端界面整片消失重建、随后一轮 re-fetch 风暴;
         // 宽限内恢复在线则取消清理(presence.recovered 分支照常触发补齐)。
-        if (!wipeTimers.has(snap.deviceId)) {
-          wipeTimers.set(snap.deviceId, setTimeout(() => {
-            wipeTimers.delete(snap.deviceId);
-            // 宽限到点仍不可用才真正清(期间可能已恢复又再次离线,以 ref 里的现值为准)
-            if (presenceAvailableByDeviceRef.current.get(snap.deviceId) === false) {
-              wipeUnavailableDeviceMirror(snap.deviceId);
-            }
-          }, PRESENCE_OFFLINE_WIPE_GRACE_MS));
-        }
+        scheduleUnavailableDeviceMirrorWipe(
+          wipeTimers,
+          presenceAvailableByDeviceRef.current,
+          snap.deviceId,
+        );
         return;
       }
       clearPresenceWipeTimer(wipeTimers, snap.deviceId);
@@ -1008,6 +1017,21 @@ function wipeUnavailableDeviceMirror(deviceId: string): void {
   // 否则模型 / 权限 / plan 支持度会先按旧能力渲染并接受点击。
   evictAgentCapabilitiesForDevice(deviceId);
   evictComposerPaletteCacheForDevice(deviceId);
+}
+
+function scheduleUnavailableDeviceMirrorWipe(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+  availabilityByDevice: ReadonlyMap<string, boolean>,
+  deviceId: string,
+): void {
+  if (timers.has(deviceId)) return;
+  timers.set(deviceId, setTimeout(() => {
+    timers.delete(deviceId);
+    // 宽限到点仍不可用才真正清(期间可能已恢复又再次离线,以 ref 里的现值为准)
+    if (availabilityByDevice.get(deviceId) === false) {
+      wipeUnavailableDeviceMirror(deviceId);
+    }
+  }, PRESENCE_OFFLINE_WIPE_GRACE_MS));
 }
 
 function clearPresenceWipeTimer(

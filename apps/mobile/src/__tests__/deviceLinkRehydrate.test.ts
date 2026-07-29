@@ -67,6 +67,56 @@ describe('rehydrateDeviceLinkTopics', () => {
     expect(dev2).not.toBe(dev1Second);
   });
 
+  it('restores unavailable state after an authoritative offline failure', async () => {
+    const { harness } = deps();
+    const onDeviceUnavailable = vi.fn();
+    harness.onDeviceUnavailable = onDeviceUnavailable;
+    vi.mocked(harness.openLink).mockRejectedValueOnce(
+      Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
+    );
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: [] },
+    ], harness);
+
+    expect(harness.subscribe).not.toHaveBeenCalled();
+    expect(harness.rebuildSessionSnapshot).not.toHaveBeenCalled();
+    expect(onDeviceUnavailable).toHaveBeenCalledOnce();
+    expect(onDeviceUnavailable).toHaveBeenCalledWith('dev-1');
+    expect(result.transientFailures).toBe(0);
+  });
+
+  it('stops the current device plan when a snapshot confirms it is offline', async () => {
+    const { harness } = deps();
+    const onDeviceUnavailable = vi.fn();
+    harness.onDeviceUnavailable = onDeviceUnavailable;
+    vi.mocked(harness.rebuildSessionSnapshot).mockRejectedValueOnce(
+      Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
+    );
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: false, topics: ['session:s1', 'session:s2'] },
+    ], harness);
+
+    expect(harness.rebuildSessionSnapshot).toHaveBeenCalledTimes(1);
+    expect(onDeviceUnavailable).toHaveBeenCalledWith('dev-1');
+  });
+
+  it('does not treat transport failures as an unavailable presence verdict', async () => {
+    const { harness } = deps();
+    const onDeviceUnavailable = vi.fn();
+    harness.onDeviceUnavailable = onDeviceUnavailable;
+    vi.mocked(harness.subscribe).mockRejectedValueOnce(
+      Object.assign(new Error('not connected'), { code: 'NOT_CONNECTED' }),
+    );
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: false, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceUnavailable).not.toHaveBeenCalled();
+  });
+
   it('continues rebuilding other devices and sessions when one replay step fails', async () => {
     const { calls, harness } = deps();
     vi.mocked(harness.openLink).mockRejectedValueOnce(new Error('open failed'));

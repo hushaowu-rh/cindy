@@ -93,6 +93,7 @@ describe('reconnect host-authoritative healing', () => {
     expect(remoteSessionStore.getMessages(SESSION_ID).map((item) => item.id)).toEqual(['m1', 'm2']);
 
     await rehydrateDeviceLinkTopics(registry.snapshot(), {
+      createDeviceSendCohort: vi.fn(() => 1),
       openLink: vi.fn(async () => undefined),
       subscribe: vi.fn(async () => undefined),
       requestSessionsReseed,

@@ -2,11 +2,25 @@ import type { Topic } from '@cindy/device-link';
 import type { RehydratePlan } from '@/device-link/topicRegistry';
 import { isTransientRemoteError } from '@/device-link/remoteRetry';
 
+export interface DeviceLinkRehydrateSendOptions {
+  /** 同一设备的一轮补齐共享一个响应性观测 cohort。 */
+  responsivenessCohort?: number;
+}
+
 export interface DeviceLinkRehydrateDeps {
-  openLink(deviceId: string): Promise<unknown>;
-  subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
+  createDeviceSendCohort(deviceId: string): number;
+  openLink(deviceId: string, opts?: DeviceLinkRehydrateSendOptions): Promise<unknown>;
+  subscribe(
+    deviceId: string,
+    topics: readonly Topic[],
+    opts?: DeviceLinkRehydrateSendOptions,
+  ): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
-  rebuildSessionSnapshot(deviceId: string, sessionId: string): Promise<unknown>;
+  rebuildSessionSnapshot(
+    deviceId: string,
+    sessionId: string,
+    opts?: DeviceLinkRehydrateSendOptions,
+  ): Promise<unknown>;
 }
 
 export interface DeviceLinkRehydrateResult {
@@ -40,12 +54,15 @@ export async function rehydrateDeviceLinkTopics(
   };
 
   for (const plan of plans) {
+    const sendOpts: DeviceLinkRehydrateSendOptions = {
+      responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
+    };
     if (plan.openLink) {
-      await track(deps.openLink(plan.deviceId));
+      await track(deps.openLink(plan.deviceId, sendOpts));
     }
 
     if (plan.topics.length === 0) continue;
-    await track(deps.subscribe(plan.deviceId, plan.topics));
+    await track(deps.subscribe(plan.deviceId, plan.topics, sendOpts));
 
     for (const topic of plan.topics) {
       if (topic === 'sessions') {
@@ -54,7 +71,7 @@ export async function rehydrateDeviceLinkTopics(
       }
       const sessionId = readSessionTopic(topic);
       if (sessionId) {
-        await track(deps.rebuildSessionSnapshot(plan.deviceId, sessionId));
+        await track(deps.rebuildSessionSnapshot(plan.deviceId, sessionId, sendOpts));
       }
     }
   }

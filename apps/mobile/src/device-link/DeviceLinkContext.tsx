@@ -42,7 +42,10 @@ import { evictComposerPaletteCacheForDevice, resetComposerPaletteCache } from '@
 import { clearAllDeviceModelMeta, evictDeviceModelMeta } from '@/device-link/deviceModelMetaCache';
 import { dispatchFileBrowserWatchEvent } from '@/device-link/fileBrowserWatch';
 import { resolveMobileInvokeTimeoutMs } from '@/device-link/invokeTimeouts';
-import { rehydrateDeviceLinkTopics } from '@/device-link/rehydrate';
+import {
+  rehydrateDeviceLinkTopics,
+  type DeviceLinkRehydrateSendOptions,
+} from '@/device-link/rehydrate';
 import { invalidateOfflineScheduleIndexFailureFor, invalidateTransientScheduleIndexFailures } from '@/session/scheduleIndex';
 import { isTransientRemoteError } from '@/device-link/remoteRetry';
 import { createRnWebSocket } from '@/device-link/rnWebSocket';
@@ -165,11 +168,15 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const [connectionEpoch, setConnectionEpoch] = useState(0);
   const [lastPresenceSnapshot, setLastPresenceSnapshot] = useState<PresenceSnapshot | null>(null);
 
-  const sendOpenLinkOnce = useCallback((client: DeviceLinkClient, deviceId: string) => {
+  const sendOpenLinkOnce = useCallback((
+    client: DeviceLinkClient,
+    deviceId: string,
+    opts?: DeviceLinkRehydrateSendOptions,
+  ) => {
     const existing = openLinkInFlightRef.current.get(deviceId);
     if (existing) return existing;
 
-    const request = sendOpenLinkWithAccessHandling(client, deviceId);
+    const request = sendOpenLinkWithAccessHandling(client, deviceId, opts);
     openLinkInFlightRef.current.set(deviceId, request);
     const cleanup = (): void => {
       if (openLinkInFlightRef.current.get(deviceId) === request) {
@@ -184,10 +191,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     client: DeviceLinkClient,
     deviceId: string,
     topics: readonly Topic[],
+    opts?: DeviceLinkRehydrateSendOptions,
   ) => {
     const toSend = topicsMissingRemoteAck(remoteSubscribedTopicsRef.current, deviceId, topics);
     if (toSend.length === 0) return;
-    await sendSubscribeWithAccessHandling(client, deviceId, toSend);
+    await sendSubscribeWithAccessHandling(client, deviceId, toSend, opts);
     markHeldRemoteTopicsSubscribed(remoteSubscribedTopicsRef.current, registryRef.current, deviceId, toSend);
   }, []);
 
@@ -317,10 +325,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               }
             })();
             const result = await rehydrateDeviceLinkTopics(plans, {
-              openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
-              subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
+              createDeviceSendCohort: (deviceId) => createDeviceSendCohort(deviceId),
+              openLink: (deviceId, opts) => sendOpenLinkOnce(client, deviceId, opts),
+              subscribe: (deviceId, topics, opts) => sendTrackedSubscribe(client, deviceId, topics, opts),
               requestSessionsReseed: (deviceId) => remoteSessionStore.requestReseed(deviceId),
-              rebuildSessionSnapshot: (deviceId, sessionId) => rebuildSessionSnapshot(client, deviceId, sessionId),
+              rebuildSessionSnapshot: (deviceId, sessionId, opts) => rebuildSessionSnapshot(client, deviceId, sessionId, opts),
             });
             await probeRun;
             // 探测后仍 open 的设备持续计入"未完成"信号(review P1:不能在探测
@@ -736,11 +745,11 @@ async function rebuildSessionSnapshot(
   client: DeviceLinkClient,
   deviceId: string,
   sessionId: string,
+  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<void> {
   // 这四个并发请求是同一轮补齐:一次路由抖动可能让它们同时等满超时,但这只
   // 代表一个独立故障观测。共享显式 cohort,避免单轮 fan-out 直接凑满 3 次阈值。
-  const responsivenessCohort = createDeviceSendCohort(deviceId);
-  const sendOpts = { responsivenessCohort };
+  const sendOpts = opts ?? { responsivenessCohort: createDeviceSendCohort(deviceId) };
   // 四路快照独立拉取、独立落库:断连补齐窗口本就脆弱,一个子请求失败不应拖垮
   // 其余(旧实现共用一个 catch,任一失败三份快照全丢)。goal 覆盖断连窗口内
   // 丢失的 maker:goal:status-changed push;model-pref / turn-cost 无对应查询通道,
@@ -810,13 +819,18 @@ function ensureOnlineForRequest(client: DeviceLinkClient): Promise<void> {
 function sendOpenLinkWithAccessHandling(
   client: DeviceLinkClient,
   deviceId: string,
+  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<LinkAcceptPayload> {
-  return withAccessRevokedHandling(deviceId, () => sendOpenLink(client, deviceId));
+  return withAccessRevokedHandling(deviceId, () => sendOpenLink(client, deviceId, opts));
 }
 
-async function sendOpenLink(client: DeviceLinkClient, deviceId: string): Promise<LinkAcceptPayload> {
+async function sendOpenLink(
+  client: DeviceLinkClient,
+  deviceId: string,
+  opts?: DeviceLinkRehydrateSendOptions,
+): Promise<LinkAcceptPayload> {
   // 熔断门禁放在连接等待之前:open 时快速失败,不消耗 1.5s 重连等待也不上管道。
-  const slot = acquireDeviceSendSlot(deviceId);
+  const slot = acquireDeviceSendSlot(deviceId, opts?.responsivenessCohort);
   try {
     await ensureOnlineForRequest(client);
   } catch (err) {
@@ -910,17 +924,19 @@ function sendSubscribeWithAccessHandling(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
+  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<void> {
-  return withAccessRevokedHandling(deviceId, () => sendSubscribe(client, deviceId, topics));
+  return withAccessRevokedHandling(deviceId, () => sendSubscribe(client, deviceId, topics, opts));
 }
 
 async function sendSubscribe(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
+  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<void> {
   // subscribe 同样走隧道请求超时等待(默认 15s),一样计入并受熔断限制(见 sendInvoke 注释)。
-  const slot = acquireDeviceSendSlot(deviceId);
+  const slot = acquireDeviceSendSlot(deviceId, opts?.responsivenessCohort);
   try {
     await ensureOnlineForRequest(client);
   } catch (err) {

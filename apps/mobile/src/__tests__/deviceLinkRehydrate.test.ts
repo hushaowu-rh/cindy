@@ -4,7 +4,14 @@ import type { DeviceLinkRehydrateDeps } from '@/device-link/rehydrate';
 
 function deps() {
   const calls: string[] = [];
+  const cohorts = new Map<string, number>();
+  let nextCohort = 0;
   const harness: DeviceLinkRehydrateDeps = {
+    createDeviceSendCohort: vi.fn((deviceId: string) => {
+      const cohort = ++nextCohort;
+      cohorts.set(deviceId, cohort);
+      return cohort;
+    }),
     openLink: vi.fn(async (deviceId: string) => {
       calls.push(`open:${deviceId}`);
     }),
@@ -38,6 +45,25 @@ describe('rehydrateDeviceLinkTopics', () => {
       'subscribe:dev-2:session:s2',
       'rebuild:dev-2:s2',
     ]);
+  });
+
+  it('shares one responsiveness cohort across every step for a device', async () => {
+    const { harness } = deps();
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['session:s1', 'session:s2'] },
+      { deviceId: 'dev-2', openLink: true, topics: ['session:s3'] },
+    ], harness);
+
+    expect(harness.createDeviceSendCohort).toHaveBeenCalledWith('dev-1');
+    expect(harness.createDeviceSendCohort).toHaveBeenCalledWith('dev-2');
+    expect(harness.createDeviceSendCohort).toHaveBeenCalledTimes(2);
+    const dev1Cohort = vi.mocked(harness.openLink).mock.calls[0][1]?.responsivenessCohort;
+    expect(dev1Cohort).toBeDefined();
+    expect(vi.mocked(harness.subscribe).mock.calls[0][2]?.responsivenessCohort).toBe(dev1Cohort);
+    expect(vi.mocked(harness.rebuildSessionSnapshot).mock.calls[0][2]?.responsivenessCohort).toBe(dev1Cohort);
+    expect(vi.mocked(harness.rebuildSessionSnapshot).mock.calls[1][2]?.responsivenessCohort).toBe(dev1Cohort);
+    expect(vi.mocked(harness.rebuildSessionSnapshot).mock.calls[2][2]?.responsivenessCohort).not.toBe(dev1Cohort);
   });
 
   it('continues rebuilding other devices and sessions when one replay step fails', async () => {

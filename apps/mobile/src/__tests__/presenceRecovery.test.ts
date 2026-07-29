@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { updatePresenceAvailability } from '@/device-link/presenceRecovery';
+import {
+  isPresenceEligibleForRemoteRequest,
+  resetPresenceAvailabilityForConnection,
+  updatePresenceAvailability,
+} from '@/device-link/presenceRecovery';
 
 describe('updatePresenceAvailability', () => {
   it('does not treat the first available snapshot as a recovery', () => {
@@ -53,5 +57,26 @@ describe('updatePresenceAvailability', () => {
       available: true,
       recovered: false,
     });
+  });
+
+  it('forgets delta-only verdicts at a new connection epoch so stale offline cannot block rehydrate', () => {
+    const states = new Map<string, boolean>();
+    updatePresenceAvailability(states, {
+      deviceId: 'dev-1',
+      online: false,
+      remoteControlEnabled: true,
+    });
+    updatePresenceAvailability(states, {
+      deviceId: 'dev-2',
+      online: true,
+      remoteControlEnabled: true,
+    });
+    expect(isPresenceEligibleForRemoteRequest(states, 'dev-1')).toBe(false);
+
+    expect(resetPresenceAvailabilityForConnection(states)).toEqual(['dev-1']);
+
+    expect(states.size).toBe(0);
+    expect(isPresenceEligibleForRemoteRequest(states, 'dev-1')).toBe(true);
+    expect(isPresenceEligibleForRemoteRequest(states, 'dev-2')).toBe(true);
   });
 });

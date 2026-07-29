@@ -62,6 +62,8 @@ import {
   classifyDeviceSendFailure,
   classifyDeviceSendSuccess,
   classifyLinkOpenFailure,
+  clearDeviceResponsivenessTrackingFor,
+  createDeviceSendCohort,
   DEVICE_RESPONSIVENESS_PROBE_CHANNEL,
   isDeviceProbeDue,
   resetDeviceResponsivenessTracking,
@@ -70,7 +72,11 @@ import {
 } from '@/device-link/unresponsiveDevicesStore';
 import { remoteScheduleEventStore } from '@/scheduler/remoteScheduleEvents';
 import { buildMobileDeviceName } from '@/device-link/mobileDeviceIdentity';
-import { updatePresenceAvailability } from '@/device-link/presenceRecovery';
+import {
+  isPresenceEligibleForRemoteRequest,
+  resetPresenceAvailabilityForConnection,
+  updatePresenceAvailability,
+} from '@/device-link/presenceRecovery';
 import type { InputProjection, PendingInteraction, RemoteMessage } from '@/session/types';
 import { createVisualMockDeviceLinkContext, seedVisualMockStore } from '@/debug/visualMock';
 
@@ -266,7 +272,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
             const grantedPlans = allPlans.filter(
               (plan) => !revokedDevicesStore.has(plan.deviceId),
             );
-            // 熔断 open 的设备整体退出常规 rehydrate(每一步都会本地快速失败),
+            // presence 已权威声明 unavailable 的设备不进入本轮 rehydrate。熔断
+            // clear 会触发 store 订阅补跑一轮,若这里仍对离线设备重放 openLink /
+            // subscribe / snapshot,只会制造一簇 DEVICE_OFFLINE 并放大弱网抖动。
+            // 首次尚无 presence(map=undefined)仍允许尝试;恢复快照会显式触发下一轮。
+            const availablePlans = grantedPlans.filter(
+              (plan) => isPresenceEligibleForRemoteRequest(presenceAvailableByDeviceRef.current, plan.deviceId),
+            );
             // 改走显式代表性探测(review P1 多轮收敛):不能依赖 openLink /
             // subscribe 顺带探测——link-accept 与 subscribe 都在被控端 dispatch
             // 里于 runInvoke 之前特判应答,IPC/DB 卡死时照常回包会误关熔断;
@@ -279,13 +291,18 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
             // 首页的设备行)不在 registry 里,熔断 open 后若不纳入,它既收不到
             // 探测也不占未完成信号,会在没有业务流量时永久停留在未响应态。
             const openDeviceIds = new Set<string>();
-            for (const plan of grantedPlans) {
+            for (const plan of availablePlans) {
               if (unresponsiveDevicesStore.has(plan.deviceId)) openDeviceIds.add(plan.deviceId);
             }
             for (const deviceId of unresponsiveDevicesStore.getSnapshot()) {
-              if (!revokedDevicesStore.has(deviceId)) openDeviceIds.add(deviceId);
+              if (
+                !revokedDevicesStore.has(deviceId)
+                && isPresenceEligibleForRemoteRequest(presenceAvailableByDeviceRef.current, deviceId)
+              ) {
+                openDeviceIds.add(deviceId);
+              }
             }
-            const plans = grantedPlans.filter(
+            const plans = availablePlans.filter(
               (plan) => !unresponsiveDevicesStore.has(plan.deviceId),
             );
             // 探测与健康设备的 rehydrate 并发跑(review P1):探测一台死设备最长
@@ -403,6 +420,18 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         clearRehydrateRetry(true);
         return;
       }
+      // presence 是当前在线控制端收到的 delta,server 不会在 hello-ack 后重放
+      // 全量快照。进入新连接代际先丢弃旧 verdict:后台期间若设备从 unavailable
+      // 恢复,旧 false 不能永久挡住本轮 rehydrate。上一代仍 pending 的离线镜像
+      // 清理在清空 verdict 前立即结算,否则其 timer 随后看到 undefined 会静默跳过,
+      // 真离线设备的 stale mirror 将永久残留。已恢复设备由紧随其后的 rehydrate 重建。
+      const staleUnavailableDeviceIds = resetPresenceAvailabilityForConnection(
+        presenceAvailableByDeviceRef.current,
+      );
+      for (const deviceId of staleUnavailableDeviceIds) {
+        clearPresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
+        wipeUnavailableDeviceMirror(deviceId);
+      }
       setConnectionEpoch((n) => n + 1);
       void rehydrateWithClient(client);
     });
@@ -412,27 +441,21 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       const presence = updatePresenceAvailability(presenceAvailableByDeviceRef.current, snap);
       const wipeTimers = presenceWipeTimersRef.current;
       if (!presence.available) {
+        // Relay 的权威 presence 已说明目标离线或关闭远控:此前 INVOKE_TIMEOUT
+        // 只能视为这次可用性变化的下游症状,不再代表桌面 IPC/DB 卡死。立即清除
+        // 响应性计数并翻代,让在途请求随后到达的 timeout 也无法重建误熔断。
+        // 清理响应性状态会触发 rehydrate,但 presence 仍是 unavailable 时该设备会被
+        // availablePlans 过滤,不再立即重放一批注定 DEVICE_OFFLINE 的请求。
+        clearDeviceResponsivenessTrackingFor(snap.deviceId);
         // 订阅跟踪必须立即失效(不进宽限):桌面端断开可能已丢失订阅者状态,
         // 恢复后的 rehydrate 靠 topicsMissingRemoteAck 判断要不要重发 subscribe,
         // 跟踪不清会误判「已订阅」而跳过重订阅,push 流静默断掉。重订阅本身
         // 便宜且服务端幂等;需要宽限的只是下面会引起界面闪烁的缓存清理。
         remoteSubscribedTopicsRef.current.delete(snap.deviceId);
-        const wipeDevice = () => {
-          remoteSessionStore.removeDevice(snap.deviceId);
-          remoteScheduleEventStore.clearDevice(snap.deviceId);
-          // Drop the cached provider catalog so a returning/re-granted device re-fetches it
-          // instead of serving a list frozen from a previous connection.
-          evictDeviceProviders(snap.deviceId);
-          evictDeviceModelMeta(snap.deviceId);
-          // 能力表与供应商目录同时机驱逐:桌面端重连 / 升级 / 重新授权后必须重取,
-          // 否则模型 / 权限 / plan 支持度会先按旧能力渲染并接受点击。
-          evictAgentCapabilitiesForDevice(snap.deviceId);
-          evictComposerPaletteCacheForDevice(snap.deviceId);
-        };
         if (snap.online && !snap.remoteControlEnabled) {
           // 用户在桌面端显式关闭了远控:立即清,镜像不该多留一秒
           clearPresenceWipeTimer(wipeTimers, snap.deviceId);
-          wipeDevice();
+          wipeUnavailableDeviceMirror(snap.deviceId);
           return;
         }
         // 桌面端离线:给一个短宽限。弱网下桌面端会反复闪断,每次都立即清空
@@ -442,7 +465,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
           wipeTimers.set(snap.deviceId, setTimeout(() => {
             wipeTimers.delete(snap.deviceId);
             // 宽限到点仍不可用才真正清(期间可能已恢复又再次离线,以 ref 里的现值为准)
-            if (presenceAvailableByDeviceRef.current.get(snap.deviceId) === false) wipeDevice();
+            if (presenceAvailableByDeviceRef.current.get(snap.deviceId) === false) {
+              wipeUnavailableDeviceMirror(snap.deviceId);
+            }
           }, PRESENCE_OFFLINE_WIPE_GRACE_MS));
         }
         return;
@@ -704,6 +729,10 @@ async function rebuildSessionSnapshot(
   deviceId: string,
   sessionId: string,
 ): Promise<void> {
+  // 这四个并发请求是同一轮补齐:一次路由抖动可能让它们同时等满超时,但这只
+  // 代表一个独立故障观测。共享显式 cohort,避免单轮 fan-out 直接凑满 3 次阈值。
+  const responsivenessCohort = createDeviceSendCohort(deviceId);
+  const sendOpts = { responsivenessCohort };
   // 四路快照独立拉取、独立落库:断连补齐窗口本就脆弱,一个子请求失败不应拖垮
   // 其余(旧实现共用一个 catch,任一失败三份快照全丢)。goal 覆盖断连窗口内
   // 丢失的 maker:goal:status-changed push;model-pref / turn-cost 无对应查询通道,
@@ -712,24 +741,27 @@ async function rebuildSessionSnapshot(
     sendInvokeWithAccessHandling<RemoteMessage[]>(client, deviceId, 'local-db:messages:list', [
       sessionId,
       { limit: 80 },
-    ]),
+    ], sendOpts),
     sendInvokeWithAccessHandling<PendingInteraction[]>(
       client,
       deviceId,
       'maker:get-pending-interactions',
       [sessionId],
+      sendOpts,
     ),
     sendInvokeWithAccessHandling<InputProjection>(
       client,
       deviceId,
       'maker:input:get-projection',
       [sessionId],
+      sendOpts,
     ),
     sendInvokeWithAccessHandling<MobileGoalStatusPayload | null | undefined>(
       client,
       deviceId,
       'maker:goal:get-status',
       [sessionId],
+      sendOpts,
     ),
   ]);
   if (history.status === 'fulfilled' && Array.isArray(history.value)) {
@@ -807,12 +839,18 @@ async function sendOpenLink(client: DeviceLinkClient, deviceId: string): Promise
   }
 }
 
+interface SendInvokeOptions {
+  preSend?: () => void;
+  /** 同一轮明确 fan-out 共享;普通独立请求省略。 */
+  responsivenessCohort?: number;
+}
+
 function sendInvokeWithAccessHandling<T>(
   client: DeviceLinkClient,
   deviceId: string,
   channel: string,
   args: unknown[],
-  opts?: { preSend?: () => void },
+  opts?: SendInvokeOptions,
 ): Promise<T> {
   return withAccessRevokedHandling(deviceId, () => sendInvoke<T>(client, deviceId, channel, args, opts));
 }
@@ -822,10 +860,11 @@ async function sendInvoke<T>(
   deviceId: string,
   channel: string,
   args: unknown[],
-  opts?: { preSend?: () => void },
+  opts?: SendInvokeOptions,
 ): Promise<T> {
   // 熔断门禁放在连接等待之前:open 时快速失败,不消耗 1.5s 重连等待也不上管道。
-  const slot = acquireDeviceSendSlot(deviceId);
+  // 同一轮显式 fan-out 复用 cohort;普通调用省略时每次 acquire 都是独立观测。
+  const slot = acquireDeviceSendSlot(deviceId, opts?.responsivenessCohort);
   try {
     await ensureOnlineForRequest(client);
     // 连接就绪后、真正发送前的最后检查点:重连等待期间调用方状态可能已失效
@@ -938,6 +977,19 @@ function unwrapInvoke<T = unknown>(result: InvokeResultPayload): T {
 function requireClient(client: DeviceLinkClient | null): DeviceLinkClient {
   if (!client) throw new DeviceLinkError('NOT_CONNECTED', 'device-link client is not ready');
   return client;
+}
+
+function wipeUnavailableDeviceMirror(deviceId: string): void {
+  remoteSessionStore.removeDevice(deviceId);
+  remoteScheduleEventStore.clearDevice(deviceId);
+  // Drop the cached provider catalog so a returning/re-granted device re-fetches it
+  // instead of serving a list frozen from a previous connection.
+  evictDeviceProviders(deviceId);
+  evictDeviceModelMeta(deviceId);
+  // 能力表与供应商目录同时机驱逐:桌面端重连 / 升级 / 重新授权后必须重取,
+  // 否则模型 / 权限 / plan 支持度会先按旧能力渲染并接受点击。
+  evictAgentCapabilitiesForDevice(deviceId);
+  evictComposerPaletteCacheForDevice(deviceId);
 }
 
 function clearPresenceWipeTimer(

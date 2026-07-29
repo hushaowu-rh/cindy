@@ -275,7 +275,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
             // presence 已权威声明 unavailable 的设备不进入本轮 rehydrate。熔断
             // clear 会触发 store 订阅补跑一轮,若这里仍对离线设备重放 openLink /
             // subscribe / snapshot,只会制造一簇 DEVICE_OFFLINE 并放大弱网抖动。
-            // 首次尚无 presence(map=undefined)仍允许尝试;恢复快照会显式触发下一轮。
+            // 当前连接尚无该设备的 presence 记录(unknown)仍允许尝试;恢复快照会显式触发下一轮。
             const availablePlans = grantedPlans.filter(
               (plan) => isPresenceEligibleForRemoteRequest(presenceAvailableByDeviceRef.current, plan.deviceId),
             );

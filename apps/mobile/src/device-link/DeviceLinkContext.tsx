@@ -158,6 +158,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const presenceWipeTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const openLinkInFlightRef = useRef(new Map<string, Promise<LinkAcceptPayload>>());
   const presenceAvailableByDeviceRef = useRef(new Map<string, boolean>());
+  const presencePendingRecoveryDeviceIdsRef = useRef(new Set<string>());
   const [status, setStatus] = useState<DeviceLinkStatus>('stopped');
   const [connectionIssue, setConnectionIssue] = useState<DeviceLinkConnectionIssue | null>(null);
   const [presenceVersion, setPresenceVersion] = useState(0);
@@ -362,6 +363,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       clearPresenceWipeTimers(presenceWipeTimersRef.current);
       openLinkInFlightRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
+      presencePendingRecoveryDeviceIdsRef.current.clear();
       setStatus('stopped');
       setConnectionIssue(null);
       remoteSessionStore.clear();
@@ -427,6 +429,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       // 真离线设备的 stale mirror 将永久残留。已恢复设备由紧随其后的 rehydrate 重建。
       const staleUnavailableDeviceIds = resetPresenceAvailabilityForConnection(
         presenceAvailableByDeviceRef.current,
+        presencePendingRecoveryDeviceIdsRef.current,
       );
       for (const deviceId of staleUnavailableDeviceIds) {
         clearPresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
@@ -438,7 +441,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     const offPresence = client.onPresenceChanged((snap) => {
       setLastPresenceSnapshot(snap);
       setPresenceVersion((n) => n + 1);
-      const presence = updatePresenceAvailability(presenceAvailableByDeviceRef.current, snap);
+      const presence = updatePresenceAvailability(
+        presenceAvailableByDeviceRef.current,
+        snap,
+        presencePendingRecoveryDeviceIdsRef.current,
+      );
       const wipeTimers = presenceWipeTimersRef.current;
       if (!presence.available) {
         // Relay 的权威 presence 已说明目标离线或关闭远控:此前 INVOKE_TIMEOUT
@@ -588,6 +595,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       openLinkInFlightRef.current.clear();
       remoteSubscribedTopicsRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
+      presencePendingRecoveryDeviceIdsRef.current.clear();
       if (clientRef.current === client) clientRef.current = null;
     };
   }, [auth.getAccessToken, auth.isAuthenticated, clearRehydrateRetry, rehydrateWithClient]);

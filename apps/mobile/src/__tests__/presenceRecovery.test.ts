@@ -73,10 +73,22 @@ describe('updatePresenceAvailability', () => {
     });
     expect(isPresenceEligibleForRemoteRequest(states, 'dev-1')).toBe(false);
 
-    expect(resetPresenceAvailabilityForConnection(states)).toEqual(['dev-1']);
+    const pendingRecovery = new Set<string>();
+    expect(resetPresenceAvailabilityForConnection(states, pendingRecovery)).toEqual(['dev-1']);
 
     expect(states.size).toBe(0);
+    expect(pendingRecovery).toEqual(new Set(['dev-1']));
     expect(isPresenceEligibleForRemoteRequest(states, 'dev-1')).toBe(true);
     expect(isPresenceEligibleForRemoteRequest(states, 'dev-2')).toBe(true);
+
+    expect(updatePresenceAvailability(states, {
+      deviceId: 'dev-1',
+      online: true,
+      remoteControlEnabled: true,
+    }, pendingRecovery)).toEqual({
+      available: true,
+      recovered: true,
+    });
+    expect(pendingRecovery.size).toBe(0);
   });
 });

@@ -18,14 +18,16 @@ export function isPresenceEligibleForRemoteRequest(
 
 export function resetPresenceAvailabilityForConnection(
   availabilityByDevice: Map<string, boolean>,
+  pendingRecoveryDeviceIds: Set<string>,
 ): string[] {
   // presence-changed 是只发给「当时在线控制端」的增量广播,新连接没有全量重放。
   // 每个连接代际都必须丢弃旧 verdict,否则后台期间漏掉的恢复事件会让 stale false
-  // 永久挡住该设备的 rehydrate。返回上一代明确 unavailable 的设备,让调用方在
-  // 清空 verdict 的同时结算其 pending mirror wipe;随后本轮 rehydrate 会重建已恢复设备。
+  // 永久挡住该设备的 rehydrate。上一代明确 unavailable 的设备另存为 pending
+  // recovery:当前连接按 unknown 乐观尝试,而它稍后首个 available 快照仍能形成恢复边。
   const unavailableDeviceIds = [...availabilityByDevice.entries()]
     .filter(([, available]) => !available)
     .map(([deviceId]) => deviceId);
+  for (const deviceId of unavailableDeviceIds) pendingRecoveryDeviceIds.add(deviceId);
   availabilityByDevice.clear();
   return unavailableDeviceIds;
 }
@@ -33,12 +35,15 @@ export function resetPresenceAvailabilityForConnection(
 export function updatePresenceAvailability(
   availabilityByDevice: Map<string, boolean>,
   snap: PresenceAvailabilitySnapshot,
+  pendingRecoveryDeviceIds?: Set<string>,
 ): PresenceAvailabilityUpdate {
   const available = snap.online && snap.remoteControlEnabled;
   const wasAvailable = availabilityByDevice.get(snap.deviceId);
   availabilityByDevice.set(snap.deviceId, available);
+  const recoveredAcrossConnection = available && pendingRecoveryDeviceIds?.delete(snap.deviceId) === true;
+  if (!available) pendingRecoveryDeviceIds?.add(snap.deviceId);
   return {
     available,
-    recovered: available && wasAvailable === false,
+    recovered: available && (wasAvailable === false || recoveredAcrossConnection),
   };
 }

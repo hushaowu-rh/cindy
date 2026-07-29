@@ -115,6 +115,8 @@ export function createDeviceResponsivenessBreaker(
   const generationOf = (deviceId: string): number => generations.get(deviceId) ?? 0;
   const bumpGeneration = (deviceId: string): void => {
     generations.set(deviceId, generationOf(deviceId) + 1);
+    // cohort id 保持单调递增:它可能先于 acquire 被补齐流程暂存,翻代后若从 1
+    // 重新发号,会与新一代普通请求碰撞并把独立 timeout 误判成已计数。
     countedTimeoutCohorts.delete(deviceId);
   };
   const newCohort = (deviceId: string): number => {

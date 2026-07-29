@@ -817,18 +817,16 @@ function ensureOnlineForRequest(client: DeviceLinkClient): Promise<void> {
 function sendOpenLinkWithAccessHandling(
   client: DeviceLinkClient,
   deviceId: string,
-  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<LinkAcceptPayload> {
-  return withAccessRevokedHandling(deviceId, () => sendOpenLink(client, deviceId, opts));
+  return withAccessRevokedHandling(deviceId, () => sendOpenLink(client, deviceId));
 }
 
 async function sendOpenLink(
   client: DeviceLinkClient,
   deviceId: string,
-  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<LinkAcceptPayload> {
   // 熔断门禁放在连接等待之前:open 时快速失败,不消耗 1.5s 重连等待也不上管道。
-  const slot = acquireDeviceSendSlot(deviceId, opts?.responsivenessCohort);
+  const slot = acquireDeviceSendSlot(deviceId);
   try {
     await ensureOnlineForRequest(client);
   } catch (err) {
@@ -922,19 +920,17 @@ function sendSubscribeWithAccessHandling(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
-  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<void> {
-  return withAccessRevokedHandling(deviceId, () => sendSubscribe(client, deviceId, topics, opts));
+  return withAccessRevokedHandling(deviceId, () => sendSubscribe(client, deviceId, topics));
 }
 
 async function sendSubscribe(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
-  opts?: DeviceLinkRehydrateSendOptions,
 ): Promise<void> {
   // subscribe 同样走隧道请求超时等待(默认 15s),一样计入并受熔断限制(见 sendInvoke 注释)。
-  const slot = acquireDeviceSendSlot(deviceId, opts?.responsivenessCohort);
+  const slot = acquireDeviceSendSlot(deviceId);
   try {
     await ensureOnlineForRequest(client);
   } catch (err) {

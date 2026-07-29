@@ -76,7 +76,14 @@ import {
 import { remoteScheduleEventStore } from '@/scheduler/remoteScheduleEvents';
 import { buildMobileDeviceName } from '@/device-link/mobileDeviceIdentity';
 import {
+  capturePresenceAvailabilityEpoch,
+  createPresenceAvailabilityEpochs,
+  getOrCreatePresenceTrackedRequest,
+  isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
+  markPresenceAvailabilityEpoch,
+  type PresenceTrackedRequest,
+  resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
   updatePresenceAvailability,
 } from '@/device-link/presenceRecovery';
@@ -159,8 +166,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   // 供退避计时器回调拿到最新的 rehydrateWithClient(二者互相引用,用 ref 解环)
   const rehydrateFnRef = useRef<(client: DeviceLinkClient) => Promise<void>>(() => Promise.resolve());
   const presenceWipeTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const openLinkInFlightRef = useRef(new Map<string, Promise<LinkAcceptPayload>>());
+  const openLinkInFlightRef = useRef(
+    new Map<string, PresenceTrackedRequest<LinkAcceptPayload>>(),
+  );
   const presenceAvailableByDeviceRef = useRef(new Map<string, boolean>());
+  const presenceAvailabilityEpochsRef = useRef(createPresenceAvailabilityEpochs());
   const presencePendingRecoveryDeviceIdsRef = useRef(new Set<string>());
   const [status, setStatus] = useState<DeviceLinkStatus>('stopped');
   const [connectionIssue, setConnectionIssue] = useState<DeviceLinkConnectionIssue | null>(null);
@@ -169,18 +179,12 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const [lastPresenceSnapshot, setLastPresenceSnapshot] = useState<PresenceSnapshot | null>(null);
 
   const sendOpenLinkOnce = useCallback((client: DeviceLinkClient, deviceId: string) => {
-    const existing = openLinkInFlightRef.current.get(deviceId);
-    if (existing) return existing;
-
-    const request = sendOpenLinkWithAccessHandling(client, deviceId);
-    openLinkInFlightRef.current.set(deviceId, request);
-    const cleanup = (): void => {
-      if (openLinkInFlightRef.current.get(deviceId) === request) {
-        openLinkInFlightRef.current.delete(deviceId);
-      }
-    };
-    void request.then(cleanup, cleanup);
-    return request;
+    return getOrCreatePresenceTrackedRequest(
+      openLinkInFlightRef.current,
+      presenceAvailabilityEpochsRef.current,
+      deviceId,
+      () => sendOpenLinkWithAccessHandling(client, deviceId),
+    );
   }, []);
 
   const sendTrackedSubscribe = useCallback(async (
@@ -201,7 +205,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const probeUnresponsiveDevice = useCallback(
     async (client: DeviceLinkClient, deviceId: string): Promise<void> => {
       try {
-        await sendOpenLinkOnce(client, deviceId);
+        await sendOpenLinkOnce(client, deviceId).request;
         await sendInvokeWithAccessHandling(
           client,
           deviceId,
@@ -320,6 +324,17 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               }
             })();
             const result = await rehydrateDeviceLinkTopics(plans, {
+              capturePresenceEpoch: (deviceId) =>
+                capturePresenceAvailabilityEpoch(
+                  presenceAvailabilityEpochsRef.current,
+                  deviceId,
+                ),
+              isPresenceEpochCurrent: (deviceId, capturedPresenceEpoch) =>
+                isPresenceAvailabilityEpochCurrent(
+                  presenceAvailabilityEpochsRef.current,
+                  deviceId,
+                  capturedPresenceEpoch,
+                ),
               createDeviceSendCohort: (deviceId) => createDeviceSendCohort(deviceId),
               openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
               subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
@@ -327,6 +342,8 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               onDeviceUnavailable: (deviceId) => {
                 // 新连接按 unknown 乐观探测一次;relay 明确回 DEVICE_OFFLINE 后恢复
                 // 当前代 false verdict,让退避重跑过滤该设备而不是持续重放整套计划。
+                // rehydrate 已按请求发起时的 presence epoch 丢弃旧路由离线回包,
+                // 因此这里不会覆盖更晚的 available=true。
                 presenceAvailableByDeviceRef.current.set(deviceId, false);
                 presencePendingRecoveryDeviceIdsRef.current.add(deviceId);
                 clearDeviceResponsivenessTrackingFor(deviceId);
@@ -380,6 +397,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       clearPresenceWipeTimers(presenceWipeTimersRef.current);
       openLinkInFlightRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
+      resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       setStatus('stopped');
       setConnectionIssue(null);
@@ -456,6 +474,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       void rehydrateWithClient(client);
     });
     const offPresence = client.onPresenceChanged((snap) => {
+      markPresenceAvailabilityEpoch(presenceAvailabilityEpochsRef.current, snap.deviceId);
       setLastPresenceSnapshot(snap);
       setPresenceVersion((n) => n + 1);
       const presence = updatePresenceAvailability(
@@ -608,6 +627,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       openLinkInFlightRef.current.clear();
       remoteSubscribedTopicsRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
+      resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       if (clientRef.current === client) clientRef.current = null;
     };
@@ -616,7 +636,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const openLink = useCallback(
     async (deviceId: string) => {
       registryRef.current.trackOpenLink(deviceId);
-      return sendOpenLinkOnce(requireClient(clientRef.current), deviceId);
+      return sendOpenLinkOnce(requireClient(clientRef.current), deviceId).request;
     },
     [sendOpenLinkOnce],
   );

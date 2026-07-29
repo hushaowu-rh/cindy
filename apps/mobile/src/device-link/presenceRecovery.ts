@@ -7,6 +7,71 @@ export interface PresenceAvailabilityUpdate {
   recovered: boolean;
 }
 
+export interface PresenceAvailabilityEpochs {
+  next: number;
+  byDevice: Map<string, number>;
+}
+
+export function createPresenceAvailabilityEpochs(): PresenceAvailabilityEpochs {
+  return { next: 0, byDevice: new Map() };
+}
+
+export function markPresenceAvailabilityEpoch(
+  epochs: PresenceAvailabilityEpochs,
+  deviceId: string,
+): void {
+  epochs.next += 1;
+  epochs.byDevice.set(deviceId, epochs.next);
+}
+
+export function capturePresenceAvailabilityEpoch(
+  epochs: PresenceAvailabilityEpochs,
+  deviceId: string,
+): number {
+  return epochs.byDevice.get(deviceId) ?? 0;
+}
+
+export function isPresenceAvailabilityEpochCurrent(
+  epochs: PresenceAvailabilityEpochs,
+  deviceId: string,
+  capturedEpoch: number,
+): boolean {
+  return capturePresenceAvailabilityEpoch(epochs, deviceId) === capturedEpoch;
+}
+
+export function resetPresenceAvailabilityEpochs(
+  epochs: PresenceAvailabilityEpochs,
+): void {
+  epochs.next = 0;
+  epochs.byDevice.clear();
+}
+
+export interface PresenceTrackedRequest<T> {
+  capturedPresenceEpoch: number;
+  request: Promise<T>;
+}
+
+export function getOrCreatePresenceTrackedRequest<T>(
+  inFlight: Map<string, PresenceTrackedRequest<T>>,
+  epochs: PresenceAvailabilityEpochs,
+  deviceId: string,
+  createRequest: () => Promise<T>,
+): PresenceTrackedRequest<T> {
+  const existing = inFlight.get(deviceId);
+  if (existing) return existing;
+
+  const tracked = {
+    capturedPresenceEpoch: capturePresenceAvailabilityEpoch(epochs, deviceId),
+    request: createRequest(),
+  };
+  inFlight.set(deviceId, tracked);
+  const cleanup = (): void => {
+    if (inFlight.get(deviceId) === tracked) inFlight.delete(deviceId);
+  };
+  void tracked.request.then(cleanup, cleanup);
+  return tracked;
+}
+
 export function isPresenceEligibleForRemoteRequest(
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,

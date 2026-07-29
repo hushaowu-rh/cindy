@@ -6,9 +6,15 @@ function deps() {
   const calls: string[] = [];
   let nextCohort = 0;
   const harness: DeviceLinkRehydrateDeps = {
+    capturePresenceEpoch: vi.fn(() => 0),
+    isPresenceEpochCurrent: vi.fn(() => true),
     createDeviceSendCohort: vi.fn(() => ++nextCohort),
-    openLink: vi.fn(async (deviceId: string) => {
+    openLink: vi.fn((deviceId: string) => {
       calls.push(`open:${deviceId}`);
+      return {
+        capturedPresenceEpoch: 0,
+        request: Promise.resolve(),
+      };
     }),
     subscribe: vi.fn(async (deviceId: string, topics) => {
       calls.push(`subscribe:${deviceId}:${topics.join(',')}`);
@@ -71,9 +77,12 @@ describe('rehydrateDeviceLinkTopics', () => {
     const { harness } = deps();
     const onDeviceUnavailable = vi.fn();
     harness.onDeviceUnavailable = onDeviceUnavailable;
-    vi.mocked(harness.openLink).mockRejectedValueOnce(
-      Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
-    );
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
+      ),
+    });
 
     const result = await rehydrateDeviceLinkTopics([
       { deviceId: 'dev-1', openLink: true, topics: [] },
@@ -102,6 +111,27 @@ describe('rehydrateDeviceLinkTopics', () => {
     expect(onDeviceUnavailable).toHaveBeenCalledWith('dev-1');
   });
 
+  it('ignores a stale offline verdict after a newer presence delta', async () => {
+    const { harness } = deps();
+    const onDeviceUnavailable = vi.fn();
+    harness.onDeviceUnavailable = onDeviceUnavailable;
+    vi.mocked(harness.isPresenceEpochCurrent).mockReturnValue(false);
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
+      ),
+    });
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceUnavailable).not.toHaveBeenCalled();
+    expect(harness.subscribe).toHaveBeenCalledOnce();
+    expect(result.transientFailures).toBe(1);
+  });
+
   it('does not treat transport failures as an unavailable presence verdict', async () => {
     const { harness } = deps();
     const onDeviceUnavailable = vi.fn();
@@ -119,7 +149,10 @@ describe('rehydrateDeviceLinkTopics', () => {
 
   it('continues rebuilding other devices and sessions when one replay step fails', async () => {
     const { calls, harness } = deps();
-    vi.mocked(harness.openLink).mockRejectedValueOnce(new Error('open failed'));
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(new Error('open failed')),
+    });
     vi.mocked(harness.subscribe).mockRejectedValueOnce(new Error('subscribe failed'));
     vi.mocked(harness.rebuildSessionSnapshot).mockRejectedValueOnce(new Error('rebuild failed'));
 
@@ -158,9 +191,12 @@ describe('rehydrateDeviceLinkTopics', () => {
 
   it('does not count permanent failures (retrying them is pointless)', async () => {
     const { harness } = deps();
-    vi.mocked(harness.openLink).mockRejectedValueOnce(
-      Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
-    );
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
+      ),
+    });
     vi.mocked(harness.rebuildSessionSnapshot).mockRejectedValueOnce(new Error('unexpected'));
 
     const result = await rehydrateDeviceLinkTopics([

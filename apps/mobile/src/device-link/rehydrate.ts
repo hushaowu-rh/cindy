@@ -7,9 +7,16 @@ export interface DeviceLinkRehydrateSendOptions {
   responsivenessCohort?: number;
 }
 
+export interface PresenceTrackedRehydrateStep {
+  capturedPresenceEpoch: number;
+  request: Promise<unknown>;
+}
+
 export interface DeviceLinkRehydrateDeps {
   createDeviceSendCohort(deviceId: string): number;
-  openLink(deviceId: string): Promise<unknown>;
+  capturePresenceEpoch(deviceId: string): number;
+  isPresenceEpochCurrent(deviceId: string, capturedPresenceEpoch: number): boolean;
+  openLink(deviceId: string): PresenceTrackedRehydrateStep;
   subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
   onDeviceUnavailable?(deviceId: string): void;
@@ -44,13 +51,16 @@ export async function rehydrateDeviceLinkTopics(
   let transientFailures = 0;
   const track = async (
     deviceId: string,
+    capturedPresenceEpoch: number,
     step: Promise<unknown>,
   ): Promise<'continue' | 'unavailable'> => {
     try {
       await step;
       return 'continue';
     } catch (err) {
-      const unavailable = isDeviceOfflineError(err);
+      const offlineVerdict = isDeviceOfflineError(err);
+      const unavailable = offlineVerdict
+        && deps.isPresenceEpochCurrent(deviceId, capturedPresenceEpoch);
       if (unavailable) {
         deps.onDeviceUnavailable?.(deviceId);
       }
@@ -60,17 +70,26 @@ export async function rehydrateDeviceLinkTopics(
   };
 
   for (const plan of plans) {
-    if (
-      plan.openLink
-      && await track(plan.deviceId, deps.openLink(plan.deviceId)) === 'unavailable'
-    ) {
-      continue;
+    if (plan.openLink) {
+      // openLink 可能与页面请求共用一条在途请求;它必须连同底层请求真正创建时
+      // 捕获的 epoch 一起复用,不能在 dedupe 时补拍一个更新的 epoch。
+      const openLinkStep = deps.openLink(plan.deviceId);
+      if (await track(
+        plan.deviceId,
+        openLinkStep.capturedPresenceEpoch,
+        openLinkStep.request,
+      ) === 'unavailable') {
+        continue;
+      }
     }
 
     if (plan.topics.length === 0) continue;
     if (
-      await track(plan.deviceId, deps.subscribe(plan.deviceId, plan.topics))
-      === 'unavailable'
+      await track(
+        plan.deviceId,
+        deps.capturePresenceEpoch(plan.deviceId),
+        deps.subscribe(plan.deviceId, plan.topics),
+      ) === 'unavailable'
     ) {
       continue;
     }
@@ -84,9 +103,13 @@ export async function rehydrateDeviceLinkTopics(
       if (sessionId) {
         // 每个 session snapshot 自身包含四路 Promise.allSettled fan-out;只把
         // 同一批真正并发的请求合并,不要把多个串行 session 的超时压成一次观测。
-        if (await track(plan.deviceId, deps.rebuildSessionSnapshot(plan.deviceId, sessionId, {
-          responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
-        })) === 'unavailable') {
+        if (await track(
+          plan.deviceId,
+          deps.capturePresenceEpoch(plan.deviceId),
+          deps.rebuildSessionSnapshot(plan.deviceId, sessionId, {
+            responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
+          }),
+        ) === 'unavailable') {
           break;
         }
       }

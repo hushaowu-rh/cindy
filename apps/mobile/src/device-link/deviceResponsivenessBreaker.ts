@@ -115,7 +115,6 @@ export function createDeviceResponsivenessBreaker(
   const generationOf = (deviceId: string): number => generations.get(deviceId) ?? 0;
   const bumpGeneration = (deviceId: string): void => {
     generations.set(deviceId, generationOf(deviceId) + 1);
-    nextCohorts.delete(deviceId);
     countedTimeoutCohorts.delete(deviceId);
   };
   const newCohort = (deviceId: string): number => {

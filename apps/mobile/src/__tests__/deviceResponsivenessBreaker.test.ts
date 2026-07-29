@@ -111,6 +111,19 @@ describe('deviceResponsivenessBreaker', () => {
     expect(h.breaker.isOpen(DEV)).toBe(true);
   });
 
+  it('preserves cohort id uniqueness after a generation bump', () => {
+    const h = harness();
+    const first = h.breaker.createCohort(DEV);
+    const stale = h.breaker.acquire(DEV, first);
+    timeoutOnce(h.breaker);
+    h.breaker.settle(DEV, stale, 'responded');
+
+    const next = h.breaker.acquire(DEV);
+    expect(next.cohort).not.toBe(first);
+    h.breaker.settle(DEV, next, 'timeout');
+    expect(h.breaker.isOpen(DEV)).toBe(false);
+  });
+
   it('真实回包(即使是业务错误应答)重置连续计数', () => {
     const h = harness();
     timeoutOnce(h.breaker);

@@ -168,15 +168,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const [connectionEpoch, setConnectionEpoch] = useState(0);
   const [lastPresenceSnapshot, setLastPresenceSnapshot] = useState<PresenceSnapshot | null>(null);
 
-  const sendOpenLinkOnce = useCallback((
-    client: DeviceLinkClient,
-    deviceId: string,
-    opts?: DeviceLinkRehydrateSendOptions,
-  ) => {
+  const sendOpenLinkOnce = useCallback((client: DeviceLinkClient, deviceId: string) => {
     const existing = openLinkInFlightRef.current.get(deviceId);
     if (existing) return existing;
 
-    const request = sendOpenLinkWithAccessHandling(client, deviceId, opts);
+    const request = sendOpenLinkWithAccessHandling(client, deviceId);
     openLinkInFlightRef.current.set(deviceId, request);
     const cleanup = (): void => {
       if (openLinkInFlightRef.current.get(deviceId) === request) {
@@ -191,11 +187,10 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     client: DeviceLinkClient,
     deviceId: string,
     topics: readonly Topic[],
-    opts?: DeviceLinkRehydrateSendOptions,
   ) => {
     const toSend = topicsMissingRemoteAck(remoteSubscribedTopicsRef.current, deviceId, topics);
     if (toSend.length === 0) return;
-    await sendSubscribeWithAccessHandling(client, deviceId, toSend, opts);
+    await sendSubscribeWithAccessHandling(client, deviceId, toSend);
     markHeldRemoteTopicsSubscribed(remoteSubscribedTopicsRef.current, registryRef.current, deviceId, toSend);
   }, []);
 
@@ -326,8 +321,8 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
             })();
             const result = await rehydrateDeviceLinkTopics(plans, {
               createDeviceSendCohort: (deviceId) => createDeviceSendCohort(deviceId),
-              openLink: (deviceId, opts) => sendOpenLinkOnce(client, deviceId, opts),
-              subscribe: (deviceId, topics, opts) => sendTrackedSubscribe(client, deviceId, topics, opts),
+              openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
+              subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
               requestSessionsReseed: (deviceId) => remoteSessionStore.requestReseed(deviceId),
               rebuildSessionSnapshot: (deviceId, sessionId, opts) => rebuildSessionSnapshot(client, deviceId, sessionId, opts),
             });
@@ -749,7 +744,10 @@ async function rebuildSessionSnapshot(
 ): Promise<void> {
   // 这四个并发请求是同一轮补齐:一次路由抖动可能让它们同时等满超时,但这只
   // 代表一个独立故障观测。共享显式 cohort,避免单轮 fan-out 直接凑满 3 次阈值。
-  const sendOpts = opts ?? { responsivenessCohort: createDeviceSendCohort(deviceId) };
+  const sendOpts: SendInvokeOptions = {
+    responsivenessCohort:
+      opts?.responsivenessCohort ?? createDeviceSendCohort(deviceId),
+  };
   // 四路快照独立拉取、独立落库:断连补齐窗口本就脆弱,一个子请求失败不应拖垮
   // 其余(旧实现共用一个 catch,任一失败三份快照全丢)。goal 覆盖断连窗口内
   // 丢失的 maker:goal:status-changed push;model-pref / turn-cost 无对应查询通道,

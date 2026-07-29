@@ -3,18 +3,14 @@ import type { RehydratePlan } from '@/device-link/topicRegistry';
 import { isTransientRemoteError } from '@/device-link/remoteRetry';
 
 export interface DeviceLinkRehydrateSendOptions {
-  /** 同一设备的一轮补齐共享一个响应性观测 cohort。 */
+  /** 同一设备的一轮快照 fan-out 共享一个响应性观测 cohort。 */
   responsivenessCohort?: number;
 }
 
 export interface DeviceLinkRehydrateDeps {
   createDeviceSendCohort(deviceId: string): number;
-  openLink(deviceId: string, opts?: DeviceLinkRehydrateSendOptions): Promise<unknown>;
-  subscribe(
-    deviceId: string,
-    topics: readonly Topic[],
-    opts?: DeviceLinkRehydrateSendOptions,
-  ): Promise<unknown>;
+  openLink(deviceId: string): Promise<unknown>;
+  subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
   rebuildSessionSnapshot(
     deviceId: string,
@@ -54,15 +50,12 @@ export async function rehydrateDeviceLinkTopics(
   };
 
   for (const plan of plans) {
-    const sendOpts: DeviceLinkRehydrateSendOptions = {
-      responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
-    };
     if (plan.openLink) {
-      await track(deps.openLink(plan.deviceId, sendOpts));
+      await track(deps.openLink(plan.deviceId));
     }
 
     if (plan.topics.length === 0) continue;
-    await track(deps.subscribe(plan.deviceId, plan.topics, sendOpts));
+    await track(deps.subscribe(plan.deviceId, plan.topics));
 
     for (const topic of plan.topics) {
       if (topic === 'sessions') {
@@ -71,7 +64,11 @@ export async function rehydrateDeviceLinkTopics(
       }
       const sessionId = readSessionTopic(topic);
       if (sessionId) {
-        await track(deps.rebuildSessionSnapshot(plan.deviceId, sessionId, sendOpts));
+        // 每个 session snapshot 自身包含四路 Promise.allSettled fan-out;只把
+        // 同一批真正并发的请求合并,不要把多个串行 session 的超时压成一次观测。
+        await track(deps.rebuildSessionSnapshot(plan.deviceId, sessionId, {
+          responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
+        }));
       }
     }
   }

@@ -66,6 +66,7 @@ import { toDeviceListItems } from '@/device-link/devices';
 import {
   collectFreshPresenceDeviceIds,
   createPresenceFreshnessTracker,
+  deviceMirrorCleanupDisposition,
   markPresenceFresh,
   mergeDeviceViewsWithFreshPresence,
   patchDeviceViewsWithPresence,
@@ -263,7 +264,9 @@ export default function HomeScreen() {
   }, []);
 
   const markDeviceOffline = useCallback((deviceId: string) => {
-    remoteSessionStore.removeDevice(deviceId);
+    // 普通离线是可恢复的传输状态:保留 session/messages,只清 live 投影并失效
+    // message marker。恢复后会话立即显示 last-known 内容,后台 reopen 再补最新窗口。
+    remoteSessionStore.markDeviceOffline(deviceId);
     setDevices((current) => {
       const next = reconcileDeviceViews(markDeviceViewsOffline(current, new Set([deviceId]))).devices;
       devicesRef.current = next;
@@ -400,11 +403,16 @@ export default function HomeScreen() {
         current,
         new Set(availableRows.map((item) => item.device.deviceId)),
       ));
-      const unavailableDeviceIds = new Set(deviceRows.filter((item) => !item.canOpen).map((item) => item.device.deviceId));
-      for (const deviceId of unavailableDeviceIds) remoteSessionStore.removeDevice(deviceId);
-      // 整表对账:REST 全量清单是权威。unavailableDeviceIds 只覆盖「在清单里但不可用」,
-      // 冷启动从缓存种入、随后被解绑(完全不在清单里)的设备不会出现在其中,不对账
-      // 就成了无法消除的幽灵项;快照回写也会把它一直续进缓存。按差集清 shard。
+      // 单次 REST 快照里的 offline 只是可恢复状态,不能硬删刚同步的会话/消息;
+      // 显式关闭远控或撤权才是权限终态,继续清敏感镜像。
+      for (const item of deviceRows) {
+        const disposition = deviceMirrorCleanupDisposition(item.state);
+        if (disposition === 'soft') remoteSessionStore.markDeviceOffline(item.device.deviceId);
+        if (disposition === 'hard') remoteSessionStore.removeDevice(item.device.deviceId);
+      }
+      // 整表对账:REST 全量清单对“设备是否仍绑定”是权威。冷启动从缓存种入、
+      // 随后被解绑(完全不在清单里)的设备不会出现在状态分类里,按差集硬清 shard;
+      // 这与短暂 offline 不同,否则幽灵项会被快照回写无限续存。
       const knownDeviceIds = new Set(deviceRows.map((item) => item.device.deviceId));
       const ghostDeviceIds = new Set<string>();
       for (const session of remoteSessionStore.getSessions()) {

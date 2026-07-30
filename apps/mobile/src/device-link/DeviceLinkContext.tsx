@@ -1255,6 +1255,17 @@ function requireClient(client: DeviceLinkClient | null): DeviceLinkClient {
   return client;
 }
 
+function markOfflineDeviceMirror(deviceId: string): void {
+  // 普通离线只清依赖在线连接的 live 投影,保留 session/messages。这样用户切回
+  // 刚看过的会话时先看到 last-known 内容,恢复后 marker 失效会触发后台窗口对账。
+  remoteSessionStore.markDeviceOffline(deviceId);
+  remoteScheduleEventStore.clearDevice(deviceId);
+  evictDeviceProviders(deviceId);
+  evictDeviceModelMeta(deviceId);
+  evictAgentCapabilitiesForDevice(deviceId);
+  evictComposerPaletteCacheForDevice(deviceId);
+}
+
 function wipeUnavailableDeviceMirror(deviceId: string): void {
   remoteSessionStore.removeDevice(deviceId);
   remoteScheduleEventStore.clearDevice(deviceId);
@@ -1273,7 +1284,7 @@ const basePresenceWipeTimerDeps = {
   setTimer: (callback: () => void, delayMs: number) =>
     setTimeout(callback, delayMs),
   clearTimer: clearTimeout,
-  wipe: wipeUnavailableDeviceMirror,
+  wipe: markOfflineDeviceMirror,
 };
 
 function scheduleUnavailableDeviceMirrorWipe(

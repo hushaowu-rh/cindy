@@ -2082,6 +2082,34 @@ export const remoteSessionStore = {
     if (textFlushed || reconnectCleared) emit();
   },
 
+  /**
+   * 短暂离线只失效依赖实时连接的投影,保留 shard / session / messages / 路由索引。
+   * 恢复后会话页因此走 reopen(旧内容立即可见),而 marker 已删除会强制后台核对
+   * 最新消息窗口,不会把断线前缓存误判为 fresh。
+   */
+  markDeviceOffline(deviceId: string): void {
+    let changed = false;
+    for (const [sessionId, indexedDeviceId] of sessionDeviceIndex) {
+      if (indexedDeviceId !== deviceId) continue;
+      sessionMessageSyncMarkers.delete(sessionId);
+      livePlanSnapshots.delete(sessionId);
+      pendingRefreshSessions.delete(sessionId);
+      changed = pendingInteractions.delete(sessionId) || changed;
+      changed = inputProjections.delete(sessionId) || changed;
+      changed = sessionLiveActivity.delete(sessionId) || changed;
+      changed = sessionGoalStatus.delete(sessionId) || changed;
+      changed = sessionTaskUpdates.delete(sessionId) || changed;
+      changed = sessionParkedTaskUpdates.delete(sessionId) || changed;
+      sessionMakerActivityEpochs.delete(sessionId);
+      changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
+      streamingAssistantClientIds.delete(sessionId);
+      pendingLiveAssistantClientIds.delete(sessionId);
+      changed = writeMakerTurnRunning(sessionId, false) || changed;
+      changed = writeSessionRunStatus(sessionId, EMPTY_SESSION_RUN_STATUS) || changed;
+    }
+    if (changed) emit();
+  },
+
   removeDevice(deviceId: string): void {
     const hadShard = shards.delete(deviceId);
     // Sweep per-session maps for this device regardless of whether the shard still exists, and

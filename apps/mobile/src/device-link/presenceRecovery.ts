@@ -89,9 +89,11 @@ export interface PresenceWipeTimerDeps {
   setTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
   clearTimer(timer: ReturnType<typeof setTimeout>): void;
   wipe(deviceId: string): void;
+  isConfirmationInFlight?(deviceId: string): boolean;
 }
 
 export const PRESENCE_WIPE_MAX_LIFETIME_MS = 30_000;
+const PRESENCE_WIPE_CONFIRMATION_POLL_MS = 1_000;
 
 export function schedulePresenceWipeTimer(
   timers: Map<string, PresenceWipeTimerEntry>,
@@ -171,6 +173,17 @@ function schedulePresenceWipeAt(
     firstScheduledAt,
     timer: deps.setTimer(() => {
       if (timers.get(deviceId) !== entry) return;
+      if (deps.isConfirmationInFlight?.(deviceId)) {
+        schedulePresenceWipeAt(
+          timers,
+          availabilityByDevice,
+          deviceId,
+          firstScheduledAt,
+          deps.now() + PRESENCE_WIPE_CONFIRMATION_POLL_MS,
+          deps,
+        );
+        return;
+      }
       timers.delete(deviceId);
       if (shouldWipeUnavailableDeviceMirror(availabilityByDevice, deviceId)) {
         deps.wipe(deviceId);

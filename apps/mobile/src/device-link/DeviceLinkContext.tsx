@@ -205,6 +205,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const openLinkInFlightRef = useRef(
     new Map<string, PresenceTrackedRequest<LinkAcceptPayload>>(),
   );
+  const presenceWipeTimerDeps = useMemo(() => ({
+    ...basePresenceWipeTimerDeps,
+    isConfirmationInFlight: (deviceId: string) =>
+      openLinkInFlightRef.current.has(deviceId),
+  }), []);
   const presenceAvailableByDeviceRef = useRef(new Map<string, boolean>());
   const presenceAvailabilityEpochsRef = useRef(createPresenceAvailabilityEpochs());
   const presencePendingRecoveryDeviceIdsRef = useRef(new Set<string>());
@@ -214,6 +219,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   // 后台释放 heavy session 订阅期间仍保留 registry 所有权;此时 unsubscribe ack
   // 可以修正 stale offline verdict,但不能顺带触发 rehydrate 把刚释放的订阅加回来。
   const backgroundReleaseInFlightRef = useRef(false);
+  // 每次后台释放都翻代。subscribe 即使跨 background→active 才收到 ACK,也只能在
+  // 发起代仍为当前代时登记远端 ACK,避免迟到成功覆盖较新的 unsubscribe。
+  const backgroundReleaseGenerationRef = useRef(0);
   const [status, setStatus] = useState<DeviceLinkStatus>('stopped');
   const [connectionIssue, setConnectionIssue] = useState<DeviceLinkConnectionIssue | null>(null);
   const [presenceVersion, setPresenceVersion] = useState(0);
@@ -235,9 +243,21 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     deviceId: string,
     topics: readonly Topic[],
   ) => {
+    if (backgroundReleaseInFlightRef.current) return;
+    const releaseGeneration = backgroundReleaseGenerationRef.current;
     const toSend = topicsMissingRemoteAck(remoteSubscribedTopicsRef.current, deviceId, topics);
     if (toSend.length === 0) return;
-    await sendSubscribeWithAccessHandling(client, deviceId, toSend);
+    const sent = await sendSubscribeWithAccessHandling(
+      client,
+      deviceId,
+      toSend,
+      () => !backgroundReleaseInFlightRef.current,
+    );
+    if (
+      !sent
+      || backgroundReleaseInFlightRef.current
+      || backgroundReleaseGenerationRef.current !== releaseGeneration
+    ) return;
     markHeldRemoteTopicsSubscribed(remoteSubscribedTopicsRef.current, registryRef.current, deviceId, toSend);
   }, []);
 
@@ -446,6 +466,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                   presenceWipeTimersRef.current,
                   presenceAvailableByDeviceRef.current,
                   deviceId,
+                  presenceWipeTimerDeps,
                 );
               },
               rebuildSessionSnapshot: (deviceId, sessionId, opts) => rebuildSessionSnapshot(client, deviceId, sessionId, opts),
@@ -627,6 +648,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
           wipeTimers,
           presenceAvailableByDeviceRef.current,
           snap.deviceId,
+          presenceWipeTimerDeps,
         );
         return;
       }
@@ -739,6 +761,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       }
       if (next === 'background') {
         backgroundReleaseInFlightRef.current = true;
+        backgroundReleaseGenerationRef.current += 1;
         // 立即释放重量级 session:<id> 订阅(趁 socket 还活着、iOS 尚未挂起 JS):
         // 被控桌面以「有人订阅该会话流」为防打扰信号压制手机系统推送,锁屏/切后台
         // 后若订阅残留(宽限窗、挂起延迟最长可拖到 server 60s 空闲清扫),恰好在
@@ -1116,19 +1139,41 @@ async function sendInvoke<T>(
   return unwrapInvoke<T>(result);
 }
 
-function sendSubscribeWithAccessHandling(
+async function sendSubscribeWithAccessHandling(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
-): Promise<void> {
-  return withAccessRevokedHandling(deviceId, () => sendSubscribe(client, deviceId, topics));
+  shouldSend?: () => boolean,
+): Promise<boolean> {
+  if (!shouldSend) {
+    await withAccessRevokedHandling(
+      deviceId,
+      () => sendSubscribe(client, deviceId, topics),
+    );
+    return true;
+  }
+
+  // 本地取消不能穿过 withAccessRevokedHandling 的成功路径:该 wrapper 会把任何
+  // fulfilled operation 当作目标端可达证据并清掉 revoked。用不属于协议错误的
+  // sentinel 退出 wrapper,只有实际 invoke 的结果才允许更新撤权状态。
+  const notSent = Symbol('subscribe-not-sent');
+  try {
+    await withAccessRevokedHandling(deviceId, async () => {
+      if (!await sendSubscribe(client, deviceId, topics, shouldSend)) throw notSent;
+    });
+    return true;
+  } catch (err) {
+    if (err === notSent) return false;
+    throw err;
+  }
 }
 
 async function sendSubscribe(
   client: DeviceLinkClient,
   deviceId: string,
   topics: readonly string[],
-): Promise<void> {
+  shouldSend?: () => boolean,
+): Promise<boolean> {
   // subscribe 同样走隧道请求超时等待(默认 15s),一样计入并受熔断限制(见 sendInvoke 注释)。
   const slot = acquireDeviceSendSlot(deviceId);
   try {
@@ -1136,6 +1181,12 @@ async function sendSubscribe(
   } catch (err) {
     settleDeviceSend(deviceId, slot, 'inconclusive');
     throw err;
+  }
+  // ensureOnlineForRequest 最长等待 1.5s;期间 App 可能已退后台并开始释放
+  // heavy topics。真正 invoke 前再检查一次,避免迟到 subscribe 覆盖 unsubscribe。
+  if (shouldSend && !shouldSend()) {
+    settleDeviceSend(deviceId, slot, 'inconclusive');
+    return false;
   }
   let result: InvokeResultPayload;
   try {
@@ -1160,6 +1211,7 @@ async function sendSubscribe(
     markRemoteResponseEvidence(deviceId);
   }
   unwrapInvoke(result);
+  return true;
 }
 
 async function sendUnsubscribe(
@@ -1216,7 +1268,7 @@ function wipeUnavailableDeviceMirror(deviceId: string): void {
   evictComposerPaletteCacheForDevice(deviceId);
 }
 
-const presenceWipeTimerDeps = {
+const basePresenceWipeTimerDeps = {
   now: Date.now,
   setTimer: (callback: () => void, delayMs: number) =>
     setTimeout(callback, delayMs),
@@ -1228,13 +1280,14 @@ function scheduleUnavailableDeviceMirrorWipe(
   timers: Map<string, PresenceWipeTimerEntry>,
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,
+  deps: typeof basePresenceWipeTimerDeps,
 ): void {
   schedulePresenceWipeTimer(
     timers,
     availabilityByDevice,
     deviceId,
     PRESENCE_OFFLINE_WIPE_GRACE_MS,
-    presenceWipeTimerDeps,
+    deps,
   );
 }
 

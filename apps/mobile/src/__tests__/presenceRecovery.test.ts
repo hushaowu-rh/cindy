@@ -119,6 +119,7 @@ describe('unavailable mirror wipe timer', () => {
       setTimer: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
       clearTimer: clearTimeout,
       wipe,
+      isConfirmationInFlight: undefined as (() => boolean) | undefined,
     };
     schedulePresenceWipeTimer(timers, states, 'dev-1', 5_000, deps);
     return { deps, states, timers, wipe };
@@ -185,6 +186,39 @@ describe('unavailable mirror wipe timer', () => {
     vi.advanceTimersByTime(2_000);
 
     expect(wipe).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('defers cleanup past the reconnect floor while confirmation is in flight', () => {
+    const { deps, states, timers, wipe } = timerHarness();
+    let confirming = true;
+    deps.isConfirmationInFlight = () => confirming;
+    vi.advanceTimersByTime(4_900);
+    resetPresenceAvailabilityForConnection(states, new Set());
+    extendPresenceWipeTimerFloor(timers, states, 'dev-1', 3_000, deps);
+
+    vi.advanceTimersByTime(3_000);
+    expect(wipe).not.toHaveBeenCalled();
+    confirming = false;
+    clearPresenceWipeTimer(timers, 'dev-1', deps.clearTimer);
+    vi.advanceTimersByTime(1_000);
+
+    expect(wipe).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('allows only an active confirmation to cross the maximum lifetime', () => {
+    const { deps, states, timers, wipe } = timerHarness();
+    let confirming = true;
+    deps.isConfirmationInFlight = () => confirming;
+    resetPresenceAvailabilityForConnection(states, new Set());
+
+    vi.advanceTimersByTime(PRESENCE_WIPE_MAX_LIFETIME_MS);
+    expect(wipe).not.toHaveBeenCalled();
+    confirming = false;
+    vi.advanceTimersByTime(1_000);
+
+    expect(wipe).toHaveBeenCalledWith('dev-1');
     vi.useRealTimers();
   });
 });

@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   capturePresenceAvailabilityEpoch,
+  clearPresenceWipeTimer,
   createPresenceAvailabilityEpochs,
   getOrCreatePresenceTrackedRequest,
   isPresenceAvailabilityEpochCurrent,
@@ -8,6 +9,7 @@ import {
   markPresenceAvailabilityEpoch,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
+  schedulePresenceWipeTimer,
   updatePresenceAvailability,
 } from '@/device-link/presenceRecovery';
 
@@ -96,6 +98,48 @@ describe('updatePresenceAvailability', () => {
       recovered: true,
     });
     expect(pendingRecovery.size).toBe(0);
+  });
+});
+
+describe('unavailable mirror wipe timer', () => {
+  function timerHarness() {
+    vi.useFakeTimers();
+    const timers = new Map<string, ReturnType<typeof setTimeout>>();
+    const states = new Map<string, boolean>([['dev-1', false]]);
+    const wipe = vi.fn();
+    const deps = {
+      setTimer: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
+      clearTimer: clearTimeout,
+      wipe,
+    };
+    schedulePresenceWipeTimer(timers, states, 'dev-1', 5_000, deps);
+    return { deps, states, timers, wipe };
+  }
+
+  it('preserves the original deadline across reconnect and then cleans an unconfirmed device', () => {
+    const { states, wipe } = timerHarness();
+    vi.advanceTimersByTime(2_000);
+
+    resetPresenceAvailabilityForConnection(states, new Set());
+    expect(wipe).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2_999);
+    expect(wipe).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(wipe).toHaveBeenCalledWith('dev-1');
+    vi.useRealTimers();
+  });
+
+  it('cancels the original cleanup when the new connection proves the device reachable', () => {
+    const { deps, states, timers, wipe } = timerHarness();
+    vi.advanceTimersByTime(2_000);
+    resetPresenceAvailabilityForConnection(states, new Set());
+
+    clearPresenceWipeTimer(timers, 'dev-1', deps.clearTimer);
+    vi.advanceTimersByTime(3_000);
+
+    expect(wipe).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 });
 

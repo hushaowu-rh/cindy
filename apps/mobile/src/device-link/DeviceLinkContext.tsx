@@ -77,6 +77,8 @@ import { remoteScheduleEventStore } from '@/scheduler/remoteScheduleEvents';
 import { buildMobileDeviceName } from '@/device-link/mobileDeviceIdentity';
 import {
   capturePresenceAvailabilityEpoch,
+  clearPresenceWipeTimer,
+  clearPresenceWipeTimers,
   createPresenceAvailabilityEpochs,
   getOrCreatePresenceTrackedRequest,
   isPresenceAvailabilityEpochCurrent,
@@ -85,6 +87,7 @@ import {
   type PresenceTrackedRequest,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
+  schedulePresenceWipeTimer,
   updatePresenceAvailability,
 } from '@/device-link/presenceRecovery';
 import type { InputProjection, PendingInteraction, RemoteMessage } from '@/session/types';
@@ -339,6 +342,12 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
               subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
               requestSessionsReseed: (deviceId) => remoteSessionStore.requestReseed(deviceId),
+              onDeviceReachable: (deviceId) => {
+                // 重连后 presence 是 unknown 且 server 不重放全量快照。补齐步骤已收到
+                // 目标端真实应答即可证明设备可达,取消上一代 unavailable 留下的宽限清理;
+                // 不伪造 presence=true,后续权威 false delta 仍可照常过滤并重新计时。
+                clearOnePresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
+              },
               onDeviceUnavailable: (deviceId) => {
                 // 新连接按 unknown 乐观探测一次;relay 明确回 DEVICE_OFFLINE 后恢复
                 // 当前代 false verdict,让退避重跑过滤该设备而不是持续重放整套计划。
@@ -394,7 +403,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       rehydrateStateRef.current.inFlight = null;
       rehydrateStateRef.current.rerun = false;
       clearRehydrateRetry(true);
-      clearPresenceWipeTimers(presenceWipeTimersRef.current);
+      clearAllPresenceWipeTimers(presenceWipeTimersRef.current);
       openLinkInFlightRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
       resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
@@ -459,17 +468,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       }
       // presence 是当前在线控制端收到的 delta,server 不会在 hello-ack 后重放
       // 全量快照。进入新连接代际先丢弃旧 verdict:后台期间若设备从 unavailable
-      // 恢复,旧 false 不能永久挡住本轮 rehydrate。上一代仍 pending 的离线镜像
-      // 清理在清空 verdict 前立即结算,否则其 timer 随后看到 undefined 会静默跳过,
-      // 真离线设备的 stale mirror 将永久残留。已恢复设备由紧随其后的 rehydrate 重建。
-      const staleUnavailableDeviceIds = resetPresenceAvailabilityForConnection(
+      // 恢复,旧 false 不能永久挡住本轮 rehydrate。上一代仍 pending 的镜像清理
+      // 保留原宽限截止点:计时器把新连接尚无 verdict 的 unknown 当作未确认恢复,
+      // 只有当前代明确 available=true 才取消,避免重连瞬间按旧 false 提前清空镜像。
+      resetPresenceAvailabilityForConnection(
         presenceAvailableByDeviceRef.current,
         presencePendingRecoveryDeviceIdsRef.current,
       );
-      for (const deviceId of staleUnavailableDeviceIds) {
-        clearPresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
-        wipeUnavailableDeviceMirror(deviceId);
-      }
       setConnectionEpoch((n) => n + 1);
       void rehydrateWithClient(client);
     });
@@ -497,7 +502,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         remoteSubscribedTopicsRef.current.delete(snap.deviceId);
         if (snap.online && !snap.remoteControlEnabled) {
           // 用户在桌面端显式关闭了远控:立即清,镜像不该多留一秒
-          clearPresenceWipeTimer(wipeTimers, snap.deviceId);
+          clearOnePresenceWipeTimer(wipeTimers, snap.deviceId);
           wipeUnavailableDeviceMirror(snap.deviceId);
           return;
         }
@@ -511,7 +516,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         );
         return;
       }
-      clearPresenceWipeTimer(wipeTimers, snap.deviceId);
+      clearOnePresenceWipeTimer(wipeTimers, snap.deviceId);
       // 每个「可用」快照都清该设备的 DEVICE_OFFLINE 负缓存(review P1 ×2):
       // 主机在手机连上 relay 之前就离线时,presence 只在变化时广播,首个在线
       // 快照 recovered=false——只挂 recovered 会漏掉这次恢复,徽标停留到无关
@@ -623,7 +628,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       client.stop();
       rehydrateStateRef.current.rerun = false;
       clearRehydrateRetry(true);
-      clearPresenceWipeTimers(presenceWipeTimersRef.current);
+      clearAllPresenceWipeTimers(presenceWipeTimersRef.current);
       openLinkInFlightRef.current.clear();
       remoteSubscribedTopicsRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
@@ -1044,30 +1049,30 @@ function scheduleUnavailableDeviceMirrorWipe(
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,
 ): void {
-  if (timers.has(deviceId)) return;
-  timers.set(deviceId, setTimeout(() => {
-    timers.delete(deviceId);
-    // 宽限到点仍不可用才真正清(期间可能已恢复又再次离线,以 ref 里的现值为准)
-    if (availabilityByDevice.get(deviceId) === false) {
-      wipeUnavailableDeviceMirror(deviceId);
-    }
-  }, PRESENCE_OFFLINE_WIPE_GRACE_MS));
+  schedulePresenceWipeTimer(
+    timers,
+    availabilityByDevice,
+    deviceId,
+    PRESENCE_OFFLINE_WIPE_GRACE_MS,
+    {
+      setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+      clearTimer: clearTimeout,
+      wipe: wipeUnavailableDeviceMirror,
+    },
+  );
 }
 
-function clearPresenceWipeTimer(
+function clearOnePresenceWipeTimer(
   timers: Map<string, ReturnType<typeof setTimeout>>,
   deviceId: string,
 ): void {
-  const timer = timers.get(deviceId);
-  if (timer) {
-    clearTimeout(timer);
-    timers.delete(deviceId);
-  }
+  clearPresenceWipeTimer(timers, deviceId, clearTimeout);
 }
 
-function clearPresenceWipeTimers(timers: Map<string, ReturnType<typeof setTimeout>>): void {
-  for (const timer of timers.values()) clearTimeout(timer);
-  timers.clear();
+function clearAllPresenceWipeTimers(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+): void {
+  clearPresenceWipeTimers(timers, clearTimeout);
 }
 
 function isDeviceLinkTopic(topic: string): boolean {

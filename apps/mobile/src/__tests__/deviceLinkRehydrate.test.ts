@@ -73,6 +73,31 @@ describe('rehydrateDeviceLinkTopics', () => {
     expect(dev2).not.toBe(dev1Second);
   });
 
+  it('reports a successful remote step as reachable so stale cleanup can be cancelled', async () => {
+    const { harness } = deps();
+    const onDeviceReachable = vi.fn();
+    harness.onDeviceReachable = onDeviceReachable;
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceReachable).toHaveBeenCalledWith('dev-1');
+  });
+
+  it('ignores stale reachable evidence after a newer offline presence delta', async () => {
+    const { harness } = deps();
+    const onDeviceReachable = vi.fn();
+    harness.onDeviceReachable = onDeviceReachable;
+    vi.mocked(harness.isPresenceEpochCurrent).mockReturnValue(false);
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: [] },
+    ], harness);
+
+    expect(onDeviceReachable).not.toHaveBeenCalled();
+  });
+
   it('restores unavailable state after an authoritative offline failure', async () => {
     const { harness } = deps();
     const onDeviceUnavailable = vi.fn();

@@ -72,6 +72,56 @@ export function getOrCreatePresenceTrackedRequest<T>(
   return tracked;
 }
 
+export interface PresenceWipeTimerDeps {
+  setTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
+  clearTimer(timer: ReturnType<typeof setTimeout>): void;
+  wipe(deviceId: string): void;
+}
+
+export function schedulePresenceWipeTimer(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+  availabilityByDevice: ReadonlyMap<string, boolean>,
+  deviceId: string,
+  delayMs: number,
+  deps: PresenceWipeTimerDeps,
+): void {
+  if (timers.has(deviceId)) return;
+  timers.set(deviceId, deps.setTimer(() => {
+    timers.delete(deviceId);
+    if (shouldWipeUnavailableDeviceMirror(availabilityByDevice, deviceId)) {
+      deps.wipe(deviceId);
+    }
+  }, delayMs));
+}
+
+export function clearPresenceWipeTimer(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+  deviceId: string,
+  clearTimer: PresenceWipeTimerDeps['clearTimer'],
+): void {
+  const timer = timers.get(deviceId);
+  if (!timer) return;
+  clearTimer(timer);
+  timers.delete(deviceId);
+}
+
+export function clearPresenceWipeTimers(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+  clearTimer: PresenceWipeTimerDeps['clearTimer'],
+): void {
+  for (const timer of timers.values()) clearTimer(timer);
+  timers.clear();
+}
+
+export function shouldWipeUnavailableDeviceMirror(
+  availabilityByDevice: ReadonlyMap<string, boolean>,
+  deviceId: string,
+): boolean {
+  // 新连接不会重放全量 presence,因此 reconnect 清掉旧 verdict 后的 unknown
+  // 仍需让原宽限计时器按期回收;只有当前代已明确 available 才取消清理。
+  return availabilityByDevice.get(deviceId) !== true;
+}
+
 export function isPresenceEligibleForRemoteRequest(
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,

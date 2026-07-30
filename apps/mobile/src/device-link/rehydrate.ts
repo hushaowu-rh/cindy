@@ -19,6 +19,7 @@ export interface DeviceLinkRehydrateDeps {
   openLink(deviceId: string): PresenceTrackedRehydrateStep;
   subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
+  onDeviceReachable?(deviceId: string): void;
   onDeviceUnavailable?(deviceId: string): void;
   rebuildSessionSnapshot(
     deviceId: string,
@@ -56,6 +57,9 @@ export async function rehydrateDeviceLinkTopics(
   ): Promise<'continue' | 'unavailable'> => {
     try {
       await step;
+      if (deps.isPresenceEpochCurrent(deviceId, capturedPresenceEpoch)) {
+        deps.onDeviceReachable?.(deviceId);
+      }
       return 'continue';
     } catch (err) {
       const offlineVerdict = isDeviceOfflineError(err);

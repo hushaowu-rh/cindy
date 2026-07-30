@@ -2025,6 +2025,24 @@ describe('remoteSessionStore', () => {
     expect(remoteSessionStore.getMessages('s1')).toHaveLength(2);
   });
 
+  it('emits when soft offline only clears pending-refresh metadata', () => {
+    remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
+    remoteSessionStore.applyRemotePush('dev-1', 'local-db:session:error-persisted', {
+      sessionId: 's1',
+    });
+    expect(remoteSessionStore.hasPendingRefresh('s1')).toBe(true);
+
+    const notify = vi.fn();
+    const unsubscribe = remoteSessionStore.subscribe(notify);
+    try {
+      remoteSessionStore.markDeviceOffline('dev-1');
+      expect(remoteSessionStore.hasPendingRefresh('s1')).toBe(false);
+      expect(notify).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it('removes a device shard with its messages and pending interactions', () => {
     remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
     remoteSessionStore.setDeviceSessions('dev-2', 'Windows', [session('s2')]);

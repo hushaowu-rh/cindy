@@ -3,6 +3,7 @@ import type { MobileMakerTransport } from '@/device-link/mobileMakerTransport';
 import { unresponsiveDevicesStore } from '@/device-link/unresponsiveDevicesStore';
 import {
   invalidateOfflineScheduleIndexFailureFor,
+  invalidateRunningSessionScheduleEntries,
   invalidateTransientScheduleIndexFailures,
   loadSessionScheduleIndex,
   loadSessionScheduleIndexThrottled,
@@ -220,6 +221,35 @@ describe('scheduleIndex', () => {
       allSchedulesStopped: false,
       unreadCount: 0,
     });
+  });
+
+  it('clears running only for soft-offline device sessions', () => {
+    const current = new Map<string, RemoteSessionScheduleInfo>([
+      ['session-1', { scheduleId: 'sched-1', scheduleName: 'Daily', scheduleStatus: 'active', allSchedulesStopped: false, unreadRunIds: ['run-1'], unreadCount: 1, running: true, latestRunAt: 2 }],
+      ['session-2', { scheduleId: 'sched-2', scheduleName: 'Weekly', scheduleStatus: 'active', allSchedulesStopped: false, unreadRunIds: [], unreadCount: 0, running: false, latestRunAt: 3 }],
+      ['other-device-session', { scheduleId: 'keep', scheduleName: 'Keep', scheduleStatus: 'paused', allSchedulesStopped: true, unreadRunIds: ['keep-run'], unreadCount: 1, running: true, latestRunAt: 4 }],
+    ]);
+
+    const next = invalidateRunningSessionScheduleEntries(current, ['session-1', 'session-2']);
+
+    expect(next).not.toBe(current);
+    expect(next.get('session-1')).toEqual({
+      ...current.get('session-1'),
+      running: false,
+    });
+    expect(next.get('session-2')).toBe(current.get('session-2'));
+    expect(next.get('other-device-session')).toBe(current.get('other-device-session'));
+  });
+
+  it('keeps the existing map reference when no selected schedule is running', () => {
+    const current = new Map<string, RemoteSessionScheduleInfo>([
+      ['session-1', { scheduleId: 'sched-1', scheduleName: 'Daily', scheduleStatus: 'active', allSchedulesStopped: false, unreadRunIds: [], unreadCount: 0, running: false, latestRunAt: 2 }],
+      ['other-device-session', { scheduleId: 'keep', scheduleName: 'Keep', scheduleStatus: 'active', allSchedulesStopped: false, unreadRunIds: [], unreadCount: 0, running: true, latestRunAt: 1 }],
+    ]);
+
+    const next = invalidateRunningSessionScheduleEntries(current, ['session-1', 'missing']);
+
+    expect(next).toBe(current);
   });
 
   it('replaces only entries for the refreshed device sessions', () => {

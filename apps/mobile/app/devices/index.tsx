@@ -120,6 +120,7 @@ import { dataPropsEqual, mapContentEqual } from '@/utils/valueEquality';
 import { useStableValue } from '@/utils/useStableValue';
 import { useMinuteNow } from '@/utils/useMinuteNow';
 import {
+  invalidateRunningSessionScheduleEntries,
   loadDeviceSessionScheduleIndex,
   loadSessionScheduleIndexThrottled,
   replaceSessionScheduleIndexEntries,
@@ -263,16 +264,24 @@ export default function HomeScreen() {
     return result;
   }, []);
 
+  const softInvalidateDeviceMirror = useCallback((deviceId: string) => {
+    const sessionIds = remoteSessionStore.getSessions()
+      .filter((session) => session.deviceLinkDeviceId === deviceId)
+      .map((session) => session.id);
+    remoteSessionStore.markDeviceOffline(deviceId);
+    setScheduleIndex((current) => invalidateRunningSessionScheduleEntries(current, sessionIds));
+  }, []);
+
   const markDeviceOffline = useCallback((deviceId: string) => {
     // 普通离线是可恢复的传输状态:保留 session/messages,只清 live 投影并失效
     // message marker。恢复后会话立即显示 last-known 内容,后台 reopen 再补最新窗口。
-    remoteSessionStore.markDeviceOffline(deviceId);
+    softInvalidateDeviceMirror(deviceId);
     setDevices((current) => {
       const next = reconcileDeviceViews(markDeviceViewsOffline(current, new Set([deviceId]))).devices;
       devicesRef.current = next;
       return next;
     });
-  }, [reconcileDeviceViews]);
+  }, [reconcileDeviceViews, softInvalidateDeviceMirror]);
 
   const refreshDeviceScheduleIndex = useCallback((
     deviceId: string,
@@ -407,7 +416,7 @@ export default function HomeScreen() {
       // 显式关闭远控或撤权才是权限终态,继续清敏感镜像。
       for (const item of deviceRows) {
         const disposition = deviceMirrorCleanupDisposition(item.state);
-        if (disposition === 'soft') remoteSessionStore.markDeviceOffline(item.device.deviceId);
+        if (disposition === 'soft') softInvalidateDeviceMirror(item.device.deviceId);
         if (disposition === 'hard') remoteSessionStore.removeDevice(item.device.deviceId);
       }
       // 整表对账:REST 全量清单对“设备是否仍绑定”是权威。冷启动从缓存种入、
@@ -455,7 +464,7 @@ export default function HomeScreen() {
     return task.finally(() => {
       if (visible) setRefreshing(false);
     });
-  }, [apiFetch, deviceIdentityCacheReady, homeCacheUserId, hydrateDeviceSessions, reconcileDeviceViews, revokedDevices]);
+  }, [apiFetch, deviceIdentityCacheReady, homeCacheUserId, hydrateDeviceSessions, reconcileDeviceViews, revokedDevices, softInvalidateDeviceMirror]);
 
   // 冷启动先画缓存:上次 loadHome 成功的设备+会话快照种入 store,先把列表画出来(消除首屏强制
   // spinner);loadHome 返回后由 setDeviceSessions / removeDevice 正常覆盖收敛。缓存为空时列表

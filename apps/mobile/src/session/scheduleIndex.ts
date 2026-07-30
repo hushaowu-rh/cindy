@@ -215,6 +215,20 @@ export function loadDeviceSessionScheduleIndex(
   });
 }
 
+export function invalidateRunningSessionScheduleEntries(
+  current: Map<string, RemoteSessionScheduleInfo>,
+  sessionIds: Iterable<string>,
+): Map<string, RemoteSessionScheduleInfo> {
+  let next: Map<string, RemoteSessionScheduleInfo> | null = null;
+  for (const sessionId of sessionIds) {
+    const info = current.get(sessionId);
+    if (!info?.running) continue;
+    next ??= new Map(current);
+    next.set(sessionId, { ...info, running: false });
+  }
+  return next ?? current;
+}
+
 export function replaceSessionScheduleIndexEntries(
   current: Map<string, RemoteSessionScheduleInfo>,
   sessionIds: Iterable<string>,

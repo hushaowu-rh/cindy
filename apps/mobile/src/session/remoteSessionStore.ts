@@ -2091,19 +2091,19 @@ export const remoteSessionStore = {
     let changed = false;
     for (const [sessionId, indexedDeviceId] of sessionDeviceIndex) {
       if (indexedDeviceId !== deviceId) continue;
-      sessionMessageSyncMarkers.delete(sessionId);
-      livePlanSnapshots.delete(sessionId);
-      pendingRefreshSessions.delete(sessionId);
+      changed = sessionMessageSyncMarkers.delete(sessionId) || changed;
+      changed = livePlanSnapshots.delete(sessionId) || changed;
+      changed = pendingRefreshSessions.delete(sessionId) || changed;
       changed = pendingInteractions.delete(sessionId) || changed;
       changed = inputProjections.delete(sessionId) || changed;
       changed = sessionLiveActivity.delete(sessionId) || changed;
       changed = sessionGoalStatus.delete(sessionId) || changed;
       changed = sessionTaskUpdates.delete(sessionId) || changed;
       changed = sessionParkedTaskUpdates.delete(sessionId) || changed;
-      sessionMakerActivityEpochs.delete(sessionId);
+      changed = sessionMakerActivityEpochs.delete(sessionId) || changed;
       changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
-      streamingAssistantClientIds.delete(sessionId);
-      pendingLiveAssistantClientIds.delete(sessionId);
+      changed = streamingAssistantClientIds.delete(sessionId) || changed;
+      changed = pendingLiveAssistantClientIds.delete(sessionId) || changed;
       changed = writeMakerTurnRunning(sessionId, false) || changed;
       changed = writeSessionRunStatus(sessionId, EMPTY_SESSION_RUN_STATUS) || changed;
     }

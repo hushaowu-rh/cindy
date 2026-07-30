@@ -209,6 +209,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const presenceUnavailableVerdictsRef = useRef(
     new Map<string, PresenceUnavailableVerdict>(),
   );
+  // 后台释放 heavy session 订阅期间仍保留 registry 所有权;此时 unsubscribe ack
+  // 可以修正 stale offline verdict,但不能顺带触发 rehydrate 把刚释放的订阅加回来。
+  const backgroundReleaseInFlightRef = useRef(false);
   const [status, setStatus] = useState<DeviceLinkStatus>('stopped');
   const [connectionIssue, setConnectionIssue] = useState<DeviceLinkConnectionIssue | null>(null);
   const [presenceVersion, setPresenceVersion] = useState(0);
@@ -293,6 +296,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const rehydrateWithClient = useCallback(
     (client: DeviceLinkClient): Promise<void> => {
       if (client.getStatus() !== 'online') return Promise.resolve();
+      // 退后台时 unsubscribe 的 ack 仍可作为可达性证据修正 stale offline,
+      // 但宽限 socket 尚在线期间禁止自动补齐,否则会立即订回刚释放的 heavy topics。
+      if (backgroundReleaseInFlightRef.current) return Promise.resolve();
       const state = rehydrateStateRef.current;
       if (state.inFlight) {
         state.rerun = true;
@@ -485,6 +491,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       presenceUnavailableVerdictsRef.current.clear();
+      backgroundReleaseInFlightRef.current = false;
       setStatus('stopped');
       setConnectionIssue(null);
       remoteSessionStore.clear();
@@ -697,6 +704,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     };
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') {
+        backgroundReleaseInFlightRef.current = false;
         const heldConnection = backgroundState.stopTimer !== null;
         clearBackgroundStopTimer();
         const backgroundedForMs = backgroundState.backgroundAt > 0 ? Date.now() - backgroundState.backgroundAt : 0;
@@ -714,6 +722,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         void rehydrateWithClient(client);
       }
       if (next === 'background') {
+        backgroundReleaseInFlightRef.current = true;
         // 立即释放重量级 session:<id> 订阅(趁 socket 还活着、iOS 尚未挂起 JS):
         // 被控桌面以「有人订阅该会话流」为防打扰信号压制手机系统推送,锁屏/切后台
         // 后若订阅残留(宽限窗、挂起延迟最长可拖到 server 60s 空闲清扫),恰好在
@@ -759,6 +768,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       presenceUnavailableVerdictsRef.current.clear();
+      backgroundReleaseInFlightRef.current = false;
       if (clientRef.current === client) clientRef.current = null;
     };
   }, [auth.getAccessToken, auth.isAuthenticated, clearRehydrateRetry, rehydrateWithClient]);

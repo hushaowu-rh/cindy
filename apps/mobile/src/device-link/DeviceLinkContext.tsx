@@ -165,6 +165,8 @@ const REHYDRATE_RETRY_MAX_MS = 30_000;
  * 断连 → 重连 → 补齐,弱网下这套循环的代价远高于让 socket 多活两秒。
  */
 const BACKGROUND_STOP_GRACE_MS = 2_500;
+/** 断开前最多等最后一轮 heavy unsubscribe 应答;超时仍停止,避免后台 socket 久留。 */
+const BACKGROUND_FINAL_UNSUBSCRIBE_WAIT_MS = 1_000;
 /**
  * 回前台时若「宽限计时器还挂着」但后台时长已超过此阈值,说明 JS 在计时器触发前
  * 被 iOS 挂起——socket 大概率已被系统回收,但状态机还认为 online。此时主动换新
@@ -315,6 +317,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
           invalidateTransientScheduleIndexFailures();
           do {
             state.rerun = false;
+            if (backgroundReleaseInFlightRef.current) break;
             if (client.getStatus() !== 'online') return;
             const allPlans = registryRef.current.snapshot();
             // 撤权设备直接出局(review P1):撤权是终态,openLink 只会等来
@@ -368,6 +371,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
               }
             })();
             const result = await rehydrateDeviceLinkTopics(plans, {
+              isCancelled: () => backgroundReleaseInFlightRef.current,
               capturePresenceEpoch: (deviceId) =>
                 capturePresenceAvailabilityEpoch(
                   presenceAvailabilityEpochsRef.current,
@@ -702,6 +706,18 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         backgroundState.stopTimer = null;
       }
     };
+    const releaseHeavyTopics = (): Promise<void>[] => {
+      const releases: Promise<void>[] = [];
+      for (const plan of registryRef.current.snapshot()) {
+        const heavy = plan.topics.filter((topic) => topic.startsWith('session:'));
+        if (heavy.length === 0) continue;
+        markRemoteTopicsUnsubscribed(remoteSubscribedTopicsRef.current, plan.deviceId, heavy);
+        if (client.getStatus() === 'online') {
+          releases.push(sendUnsubscribe(client, plan.deviceId, heavy));
+        }
+      }
+      return releases;
+    };
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') {
         backgroundReleaseInFlightRef.current = false;
@@ -728,14 +744,8 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         // 后若订阅残留(宽限窗、挂起延迟最长可拖到 server 60s 空闲清扫),恰好在
         // 用户离开的瞬间完成的任务就永远收不到通知。只动远端订阅与 ack 簿记,
         // registry 所有权保留 —— 回前台的 rehydrate 会因 ack 已清而重新订阅。
-        const registrySnapshot = registryRef.current.snapshot();
-        for (const plan of registrySnapshot) {
-          const heavy = plan.topics.filter((topic) => topic.startsWith('session:'));
-          if (heavy.length === 0) continue;
-          markRemoteTopicsUnsubscribed(remoteSubscribedTopicsRef.current, plan.deviceId, heavy);
-          if (client.getStatus() === 'online') {
-            void sendUnsubscribe(client, plan.deviceId, heavy).catch(() => undefined);
-          }
+        for (const release of releaseHeavyTopics()) {
+          void release.catch(() => undefined);
         }
         // 短暂宽限再断:几秒内切回的快速 App 切换不触发整套断连/重连/补齐。
         // iOS 挂起后计时器不再运行,恢复时由上面的 active 分支收拾残局。
@@ -743,7 +753,16 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         clearBackgroundStopTimer();
         backgroundState.stopTimer = setTimeout(() => {
           backgroundState.stopTimer = null;
-          if (AppState.currentState === 'background') client.stop();
+          if (AppState.currentState !== 'background') return;
+          // 已发出的 stale subscribe 无法撤回;断开前再幂等释放一次并等待已发出的
+          // unsubscribe 收尾,确保最后落到桌面端的 session topic 状态仍是释放。
+          const finalRelease = Promise.allSettled(releaseHeavyTopics());
+          const boundedWait = new Promise<void>((resolve) => {
+            setTimeout(resolve, BACKGROUND_FINAL_UNSUBSCRIBE_WAIT_MS);
+          });
+          void Promise.race([finalRelease, boundedWait]).finally(() => {
+            if (AppState.currentState === 'background') client.stop();
+          });
         }, BACKGROUND_STOP_GRACE_MS);
       }
     });

@@ -51,6 +51,31 @@ describe('rehydrateDeviceLinkTopics', () => {
     ]);
   });
 
+  it('stops the remaining sweep when background release cancels it', async () => {
+    const { calls, harness } = deps();
+    let cancelled = false;
+    harness.isCancelled = vi.fn(() => cancelled);
+    vi.mocked(harness.openLink).mockImplementationOnce((deviceId: string) => {
+      calls.push(`open:${deviceId}`);
+      cancelled = true;
+      return {
+        capturedPresenceEpoch: 0,
+        capturedResponseEvidenceEpoch: 0,
+        request: Promise.resolve(),
+      };
+    });
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['session:s1'] },
+      { deviceId: 'dev-2', openLink: true, topics: ['session:s2'] },
+    ], harness);
+
+    expect(calls).toEqual(['open:dev-1']);
+    expect(harness.subscribe).not.toHaveBeenCalled();
+    expect(harness.rebuildSessionSnapshot).not.toHaveBeenCalled();
+    expect(result.transientFailures).toBe(0);
+  });
+
   it('uses independent cohorts for each concurrent snapshot batch', async () => {
     const { harness } = deps();
 

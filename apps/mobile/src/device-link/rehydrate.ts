@@ -14,6 +14,7 @@ export interface PresenceTrackedRehydrateStep {
 }
 
 export interface DeviceLinkRehydrateDeps {
+  isCancelled?(): boolean;
   createDeviceSendCohort(deviceId: string): number;
   capturePresenceEpoch(deviceId: string): number;
   captureResponseEvidenceEpoch(deviceId: string): number;
@@ -104,6 +105,7 @@ export async function rehydrateDeviceLinkTopics(
   };
 
   for (const plan of plans) {
+    if (deps.isCancelled?.()) return { transientFailures };
     if (plan.openLink) {
       // openLink 可能与页面请求共用一条在途请求;它必须连同底层请求真正创建时
       // 捕获的 epoch 一起复用,不能在 dedupe 时补拍一个更新的 epoch。
@@ -119,6 +121,7 @@ export async function rehydrateDeviceLinkTopics(
     }
 
     if (plan.topics.length === 0) continue;
+    if (deps.isCancelled?.()) return { transientFailures };
     if (
       await track(
         plan.deviceId,
@@ -131,6 +134,7 @@ export async function rehydrateDeviceLinkTopics(
     }
 
     for (const topic of plan.topics) {
+      if (deps.isCancelled?.()) return { transientFailures };
       if (topic === 'sessions') {
         deps.requestSessionsReseed(plan.deviceId);
         continue;

@@ -43,6 +43,7 @@ import { clearAllDeviceModelMeta, evictDeviceModelMeta } from '@/device-link/dev
 import { dispatchFileBrowserWatchEvent } from '@/device-link/fileBrowserWatch';
 import { resolveMobileInvokeTimeoutMs } from '@/device-link/invokeTimeouts';
 import {
+  classifySnapshotBatchFailure,
   rehydrateDeviceLinkTopics,
   type DeviceLinkRehydrateSendOptions,
 } from '@/device-link/rehydrate';
@@ -80,11 +81,13 @@ import {
   clearPresenceWipeTimer,
   clearPresenceWipeTimers,
   createPresenceAvailabilityEpochs,
+  extendPresenceWipeTimerFloor,
   getOrCreatePresenceTrackedRequest,
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
   type PresenceTrackedRequest,
+  type PresenceWipeTimerEntry,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
   schedulePresenceWipeTimer,
@@ -152,6 +155,12 @@ const BACKGROUND_SUSPEND_SUSPECT_MS = 10_000;
 /** 桌面端 presence 闪断宽限:短暂离线不立刻清空该设备的会话镜像与能力缓存。 */
 const PRESENCE_OFFLINE_WIPE_GRACE_MS = 5_000;
 
+/**
+ * 重连刚 online 时给乐观补齐留出的最小确认窗:覆盖连接就绪等待(1.5s)与
+ * 一次普通 invoke 往返,但只在旧 timer 剩余时间更短时向后延,不随抖动无限重置。
+ */
+const RECONNECT_MIN_WIPE_GRACE_MS = 3_000;
+
 export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   if (MOBILE_VISUAL_MOCK_ENABLED) {
     return <VisualMockDeviceLinkProvider>{children}</VisualMockDeviceLinkProvider>;
@@ -168,7 +177,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const rehydrateRetryRef = useRef<RehydrateRetryState>({ timer: null, attempt: 0 });
   // 供退避计时器回调拿到最新的 rehydrateWithClient(二者互相引用,用 ref 解环)
   const rehydrateFnRef = useRef<(client: DeviceLinkClient) => Promise<void>>(() => Promise.resolve());
-  const presenceWipeTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const presenceWipeTimersRef = useRef(
+    new Map<string, PresenceWipeTimerEntry>(),
+  );
   const openLinkInFlightRef = useRef(
     new Map<string, PresenceTrackedRequest<LinkAcceptPayload>>(),
   );
@@ -348,6 +359,19 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                 // 不伪造 presence=true,后续权威 false delta 仍可照常过滤并重新计时。
                 clearOnePresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
               },
+              onDeviceRemoteDisabled: (deviceId) => {
+                // 被控端实时设置已明确关闭远控:这是当前 epoch 的权威终态,
+                // 与 presence 的 remoteControlEnabled=false 一样立即清理,不留宽限。
+                clearOnePresenceWipeTimer(
+                  presenceWipeTimersRef.current,
+                  deviceId,
+                );
+                presenceAvailableByDeviceRef.current.set(deviceId, false);
+                presencePendingRecoveryDeviceIdsRef.current.add(deviceId);
+                clearDeviceResponsivenessTrackingFor(deviceId);
+                remoteSubscribedTopicsRef.current.delete(deviceId);
+                wipeUnavailableDeviceMirror(deviceId);
+              },
               onDeviceUnavailable: (deviceId) => {
                 // 新连接按 unknown 乐观探测一次;relay 明确回 DEVICE_OFFLINE 后恢复
                 // 当前代 false verdict,让退避重跑过滤该设备而不是持续重放整套计划。
@@ -471,10 +495,19 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       // 恢复,旧 false 不能永久挡住本轮 rehydrate。上一代仍 pending 的镜像清理
       // 保留原宽限截止点:计时器把新连接尚无 verdict 的 unknown 当作未确认恢复,
       // 只有当前代明确 available=true 才取消,避免重连瞬间按旧 false 提前清空镜像。
-      resetPresenceAvailabilityForConnection(
+      const staleUnavailableDeviceIds = resetPresenceAvailabilityForConnection(
         presenceAvailableByDeviceRef.current,
         presencePendingRecoveryDeviceIdsRef.current,
       );
+      for (const deviceId of staleUnavailableDeviceIds) {
+        extendPresenceWipeTimerFloor(
+          presenceWipeTimersRef.current,
+          presenceAvailableByDeviceRef.current,
+          deviceId,
+          RECONNECT_MIN_WIPE_GRACE_MS,
+          presenceWipeTimerDeps,
+        );
+      }
       setConnectionEpoch((n) => n + 1);
       void rehydrateWithClient(client);
     });
@@ -828,12 +861,20 @@ async function rebuildSessionSnapshot(
     remoteSessionStore.setGoalStatus(sessionId, goal.value);
   }
   // 任一子快照瞬时失败 → 上抛让 rehydrate 计入重试;永久失败(老被控端无 goal
-  // 通道的 CHANNEL_NOT_ALLOWED、权限撤销等)吞掉,重试没有意义。
-  const results = [history, pending, projection, goal] as const;
-  const transient = results.find(
-    (r): r is PromiseRejectedResult => r.status === 'rejected' && isTransientRemoteError(r.reason),
-  );
-  if (transient) throw transient.reason;
+  // 通道的 CHANNEL_NOT_ALLOWED、权限撤销等)吞掉,重试没有意义。同批若已有
+  // fulfilled 目标应答,兄弟 unavailable 只能算局部瞬态,不能升级为整机 verdict。
+  const batchFailure = classifySnapshotBatchFailure([
+    history,
+    pending,
+    projection,
+    goal,
+  ]);
+  if (batchFailure.kind === 'partial-transient') {
+    throw Object.assign(new Error('partial snapshot needs retry'), {
+      code: 'INVOKE_TIMEOUT',
+    });
+  }
+  if (batchFailure.kind === 'reject') throw batchFailure.error;
 }
 
 // 掉线/重连窗口里发起请求时,先有界等待连接就绪的上限。够一次健康重连握手完成
@@ -1044,8 +1085,16 @@ function wipeUnavailableDeviceMirror(deviceId: string): void {
   evictComposerPaletteCacheForDevice(deviceId);
 }
 
+const presenceWipeTimerDeps = {
+  now: Date.now,
+  setTimer: (callback: () => void, delayMs: number) =>
+    setTimeout(callback, delayMs),
+  clearTimer: clearTimeout,
+  wipe: wipeUnavailableDeviceMirror,
+};
+
 function scheduleUnavailableDeviceMirrorWipe(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,
 ): void {
@@ -1054,23 +1103,19 @@ function scheduleUnavailableDeviceMirrorWipe(
     availabilityByDevice,
     deviceId,
     PRESENCE_OFFLINE_WIPE_GRACE_MS,
-    {
-      setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
-      clearTimer: clearTimeout,
-      wipe: wipeUnavailableDeviceMirror,
-    },
+    presenceWipeTimerDeps,
   );
 }
 
 function clearOnePresenceWipeTimer(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
   deviceId: string,
 ): void {
   clearPresenceWipeTimer(timers, deviceId, clearTimeout);
 }
 
 function clearAllPresenceWipeTimers(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
 ): void {
   clearPresenceWipeTimers(timers, clearTimeout);
 }

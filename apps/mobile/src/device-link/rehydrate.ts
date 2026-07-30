@@ -20,6 +20,7 @@ export interface DeviceLinkRehydrateDeps {
   subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
   onDeviceReachable?(deviceId: string): void;
+  onDeviceRemoteDisabled?(deviceId: string): void;
   onDeviceUnavailable?(deviceId: string): void;
   rebuildSessionSnapshot(
     deviceId: string,
@@ -62,11 +63,21 @@ export async function rehydrateDeviceLinkTopics(
       }
       return 'continue';
     } catch (err) {
+      const epochCurrent = deps.isPresenceEpochCurrent(
+        deviceId,
+        capturedPresenceEpoch,
+      );
       const offlineVerdict = isDeviceOfflineError(err);
-      const unavailable = offlineVerdict
-        && deps.isPresenceEpochCurrent(deviceId, capturedPresenceEpoch);
+      const remoteDisabledVerdict = isRemoteDisabledError(err);
+      const unavailable = epochCurrent && (
+        offlineVerdict || remoteDisabledVerdict
+      );
       if (unavailable) {
-        deps.onDeviceUnavailable?.(deviceId);
+        if (remoteDisabledVerdict) {
+          deps.onDeviceRemoteDisabled?.(deviceId);
+        } else {
+          deps.onDeviceUnavailable?.(deviceId);
+        }
       }
       if (!unavailable && isTransientRemoteError(err)) transientFailures += 1;
       return unavailable ? 'unavailable' : 'continue';
@@ -122,13 +133,70 @@ export async function rehydrateDeviceLinkTopics(
   return { transientFailures };
 }
 
-function isDeviceOfflineError(error: unknown): boolean {
-  if (typeof error === 'string') return error.includes('DEVICE_OFFLINE');
+export function hasDeviceLinkErrorCode(
+  error: unknown,
+  expectedCode: string,
+): boolean {
+  if (typeof error === 'string') return error.includes(expectedCode);
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: unknown }).code;
-  if (code === 'DEVICE_OFFLINE') return true;
+  if (code === expectedCode) return true;
   const message = error instanceof Error ? error.message : '';
-  return message.includes('DEVICE_OFFLINE');
+  return message.includes(expectedCode);
+}
+
+function isDeviceOfflineError(error: unknown): boolean {
+  return hasDeviceLinkErrorCode(error, 'DEVICE_OFFLINE');
+}
+
+function isRemoteDisabledError(error: unknown): boolean {
+  return hasDeviceLinkErrorCode(error, 'REMOTE_DISABLED');
+}
+
+export type SnapshotBatchFailure =
+  | { kind: 'none' }
+  | { kind: 'partial-transient' }
+  | { kind: 'reject'; error: unknown };
+
+export function classifySnapshotBatchFailure(
+  results: readonly PromiseSettledResult<unknown>[],
+): SnapshotBatchFailure {
+  const rejections = results.filter(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  );
+  const availabilityRejections = rejections.filter(
+    (result) =>
+      isDeviceOfflineError(result.reason)
+      || isRemoteDisabledError(result.reason),
+  );
+  const otherTransient = rejections.find(
+    (result) =>
+      isTransientRemoteError(result.reason)
+      && !isDeviceOfflineError(result.reason)
+      && !isRemoteDisabledError(result.reason),
+  );
+  if (availabilityRejections.length === 0) {
+    return otherTransient
+      ? { kind: 'reject', error: otherTransient.reason }
+      : { kind: 'none' };
+  }
+
+  const hasTargetResponse = results.some((result) => result.status === 'fulfilled');
+  if (hasTargetResponse) {
+    // 同批已有目标端应答时,兄弟请求的 unavailable 不能升级为整机 verdict;
+    // 仍作为普通瞬时失败退避重试,补齐缺失的子快照。
+    return { kind: 'partial-transient' };
+  }
+
+  // 无任何目标应答时保留 unavailable verdict;两种标记混合时优先被控端
+  // 实时返回的 REMOTE_DISABLED,而不是可能来自 relay 路由窗口的 DEVICE_OFFLINE。
+  const remoteDisabled = availabilityRejections.find(
+    (result) => isRemoteDisabledError(result.reason),
+  );
+  return {
+    kind: 'reject',
+    error: (remoteDisabled ?? availabilityRejections[0]).reason,
+  };
 }
 
 function readSessionTopic(topic: Topic): string | null {

@@ -3,10 +3,12 @@ import {
   capturePresenceAvailabilityEpoch,
   clearPresenceWipeTimer,
   createPresenceAvailabilityEpochs,
+  extendPresenceWipeTimerFloor,
   getOrCreatePresenceTrackedRequest,
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
+  type PresenceWipeTimerEntry,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
   schedulePresenceWipeTimer,
@@ -104,10 +106,12 @@ describe('updatePresenceAvailability', () => {
 describe('unavailable mirror wipe timer', () => {
   function timerHarness() {
     vi.useFakeTimers();
-    const timers = new Map<string, ReturnType<typeof setTimeout>>();
+    vi.setSystemTime(0);
+    const timers = new Map<string, PresenceWipeTimerEntry>();
     const states = new Map<string, boolean>([['dev-1', false]]);
     const wipe = vi.fn();
     const deps = {
+      now: Date.now,
       setTimer: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
       clearTimer: clearTimeout,
       wipe,
@@ -116,12 +120,12 @@ describe('unavailable mirror wipe timer', () => {
     return { deps, states, timers, wipe };
   }
 
-  it('preserves the original deadline across reconnect and then cleans an unconfirmed device', () => {
-    const { states, wipe } = timerHarness();
+  it('keeps the original deadline when reconnect leaves enough confirmation time', () => {
+    const { deps, states, timers, wipe } = timerHarness();
     vi.advanceTimersByTime(2_000);
 
     resetPresenceAvailabilityForConnection(states, new Set());
-    expect(wipe).not.toHaveBeenCalled();
+    extendPresenceWipeTimerFloor(timers, states, 'dev-1', 3_000, deps);
 
     vi.advanceTimersByTime(2_999);
     expect(wipe).not.toHaveBeenCalled();
@@ -130,13 +134,31 @@ describe('unavailable mirror wipe timer', () => {
     vi.useRealTimers();
   });
 
-  it('cancels the original cleanup when the new connection proves the device reachable', () => {
+  it('extends a near-expiry deadline to leave reconnect time for reachability proof', () => {
     const { deps, states, timers, wipe } = timerHarness();
-    vi.advanceTimersByTime(2_000);
+    vi.advanceTimersByTime(4_900);
+
     resetPresenceAvailabilityForConnection(states, new Set());
+    extendPresenceWipeTimerFloor(timers, states, 'dev-1', 3_000, deps);
+
+    vi.advanceTimersByTime(100);
+    expect(wipe).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_899);
+    expect(wipe).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(wipe).toHaveBeenCalledWith('dev-1');
+    vi.useRealTimers();
+  });
+
+  it('cancels cleanup after a near-expiry reconnect proves the device reachable', () => {
+    const { deps, states, timers, wipe } = timerHarness();
+    vi.advanceTimersByTime(4_900);
+    resetPresenceAvailabilityForConnection(states, new Set());
+    extendPresenceWipeTimerFloor(timers, states, 'dev-1', 3_000, deps);
+    vi.advanceTimersByTime(1_000);
 
     clearPresenceWipeTimer(timers, 'dev-1', deps.clearTimer);
-    vi.advanceTimersByTime(3_000);
+    vi.advanceTimersByTime(2_000);
 
     expect(wipe).not.toHaveBeenCalled();
     vi.useRealTimers();

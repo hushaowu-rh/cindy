@@ -214,12 +214,53 @@ describe('rehydrateDeviceLinkTopics', () => {
     expect(result.transientFailures).toBe(2);
   });
 
-  it('does not count permanent failures (retrying them is pointless)', async () => {
+  it('treats remote-disabled as authoritative and stops the device plan', async () => {
     const { harness } = deps();
+    const onDeviceRemoteDisabled = vi.fn();
+    harness.onDeviceRemoteDisabled = onDeviceRemoteDisabled;
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
+      ),
+    });
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['session:s1'] },
+    ], harness);
+
+    expect(onDeviceRemoteDisabled).toHaveBeenCalledWith('dev-1');
+    expect(harness.subscribe).not.toHaveBeenCalled();
+    expect(harness.rebuildSessionSnapshot).not.toHaveBeenCalled();
+    expect(result.transientFailures).toBe(0);
+  });
+
+  it('ignores stale remote-disabled after a newer presence delta', async () => {
+    const { harness } = deps();
+    const onDeviceRemoteDisabled = vi.fn();
+    harness.onDeviceRemoteDisabled = onDeviceRemoteDisabled;
+    vi.mocked(harness.isPresenceEpochCurrent).mockReturnValue(false);
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
+      ),
+    });
+
+    await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceRemoteDisabled).not.toHaveBeenCalled();
+    expect(harness.subscribe).toHaveBeenCalledOnce();
+  });
+
+  it('does not count other permanent failures (retrying them is pointless)', async () => {
+    const { harness } = deps();
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('unsupported'), { code: 'CHANNEL_NOT_ALLOWED' }),
       ),
     });
     vi.mocked(harness.rebuildSessionSnapshot).mockRejectedValueOnce(new Error('unexpected'));

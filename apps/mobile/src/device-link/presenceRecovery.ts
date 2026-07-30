@@ -72,45 +72,95 @@ export function getOrCreatePresenceTrackedRequest<T>(
   return tracked;
 }
 
+export interface PresenceWipeTimerEntry {
+  timer: ReturnType<typeof setTimeout>;
+  deadlineAt: number;
+}
+
 export interface PresenceWipeTimerDeps {
+  now(): number;
   setTimer(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
   clearTimer(timer: ReturnType<typeof setTimeout>): void;
   wipe(deviceId: string): void;
 }
 
 export function schedulePresenceWipeTimer(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,
   delayMs: number,
   deps: PresenceWipeTimerDeps,
 ): void {
   if (timers.has(deviceId)) return;
-  timers.set(deviceId, deps.setTimer(() => {
-    timers.delete(deviceId);
-    if (shouldWipeUnavailableDeviceMirror(availabilityByDevice, deviceId)) {
-      deps.wipe(deviceId);
-    }
-  }, delayMs));
+  schedulePresenceWipeAt(
+    timers,
+    availabilityByDevice,
+    deviceId,
+    deps.now() + delayMs,
+    deps,
+  );
+}
+
+export function extendPresenceWipeTimerFloor(
+  timers: Map<string, PresenceWipeTimerEntry>,
+  availabilityByDevice: ReadonlyMap<string, boolean>,
+  deviceId: string,
+  minimumDelayMs: number,
+  deps: PresenceWipeTimerDeps,
+): void {
+  const entry = timers.get(deviceId);
+  if (!entry) return;
+  const minimumDeadlineAt = deps.now() + minimumDelayMs;
+  if (entry.deadlineAt >= minimumDeadlineAt) return;
+
+  deps.clearTimer(entry.timer);
+  schedulePresenceWipeAt(
+    timers,
+    availabilityByDevice,
+    deviceId,
+    minimumDeadlineAt,
+    deps,
+  );
 }
 
 export function clearPresenceWipeTimer(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
   deviceId: string,
   clearTimer: PresenceWipeTimerDeps['clearTimer'],
 ): void {
-  const timer = timers.get(deviceId);
-  if (!timer) return;
-  clearTimer(timer);
+  const entry = timers.get(deviceId);
+  if (!entry) return;
+  clearTimer(entry.timer);
   timers.delete(deviceId);
 }
 
 export function clearPresenceWipeTimers(
-  timers: Map<string, ReturnType<typeof setTimeout>>,
+  timers: Map<string, PresenceWipeTimerEntry>,
   clearTimer: PresenceWipeTimerDeps['clearTimer'],
 ): void {
-  for (const timer of timers.values()) clearTimer(timer);
+  for (const entry of timers.values()) clearTimer(entry.timer);
   timers.clear();
+}
+
+function schedulePresenceWipeAt(
+  timers: Map<string, PresenceWipeTimerEntry>,
+  availabilityByDevice: ReadonlyMap<string, boolean>,
+  deviceId: string,
+  deadlineAt: number,
+  deps: PresenceWipeTimerDeps,
+): void {
+  const delayMs = Math.max(0, deadlineAt - deps.now());
+  const entry: PresenceWipeTimerEntry = {
+    deadlineAt,
+    timer: deps.setTimer(() => {
+      if (timers.get(deviceId) !== entry) return;
+      timers.delete(deviceId);
+      if (shouldWipeUnavailableDeviceMirror(availabilityByDevice, deviceId)) {
+        deps.wipe(deviceId);
+      }
+    }, delayMs),
+  };
+  timers.set(deviceId, entry);
 }
 
 export function shouldWipeUnavailableDeviceMirror(

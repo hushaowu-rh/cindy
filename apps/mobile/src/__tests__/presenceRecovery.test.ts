@@ -5,6 +5,7 @@ import {
   createPresenceAvailabilityEpochs,
   extendPresenceWipeTimerFloor,
   getOrCreatePresenceTrackedRequest,
+  isInvokeResultReachabilityEvidence,
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
@@ -185,6 +186,34 @@ describe('unavailable mirror wipe timer', () => {
 
     expect(wipe).not.toHaveBeenCalled();
     vi.useRealTimers();
+  });
+});
+
+describe('invoke reachability evidence', () => {
+  it('counts successful and non-availability error results as target responses', () => {
+    expect(isInvokeResultReachabilityEvidence({
+      ok: true,
+      result: null,
+    })).toBe(true);
+    expect(isInvokeResultReachabilityEvidence({
+      ok: false,
+      error: { code: 'IPC_ERROR', message: 'boom' },
+    })).toBe(true);
+    expect(isInvokeResultReachabilityEvidence({
+      ok: false,
+      error: { code: 'CHANNEL_NOT_ALLOWED', message: 'unsupported' },
+    })).toBe(true);
+  });
+
+  it('does not count disabled or revoked results as reachability', () => {
+    expect(isInvokeResultReachabilityEvidence({
+      ok: false,
+      error: { code: 'REMOTE_DISABLED', message: 'disabled' },
+    })).toBe(false);
+    expect(isInvokeResultReachabilityEvidence({
+      ok: false,
+      error: { code: 'ACCESS_REVOKED', message: 'revoked' },
+    })).toBe(false);
   });
 });
 

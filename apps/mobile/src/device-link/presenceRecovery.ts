@@ -1,4 +1,4 @@
-import type { PresenceSnapshot } from '@cindy/device-link';
+import type { InvokeResultPayload, PresenceSnapshot } from '@cindy/device-link';
 
 type PresenceAvailabilitySnapshot = Pick<PresenceSnapshot, 'deviceId' | 'online' | 'remoteControlEnabled'>;
 
@@ -194,6 +194,16 @@ export type PresenceUnavailableVerdictKind = 'offline' | 'disabled' | 'presence'
 export interface PresenceUnavailableVerdict {
   kind: PresenceUnavailableVerdictKind;
   responseEvidenceEpoch: number;
+}
+
+export function isInvokeResultReachabilityEvidence(
+  result: InvokeResultPayload,
+): boolean {
+  return result.ok
+    || (
+      result.error.code !== 'REMOTE_DISABLED'
+      && result.error.code !== 'ACCESS_REVOKED'
+    );
 }
 
 export function reconcileOfflineVerdictAfterResponse(

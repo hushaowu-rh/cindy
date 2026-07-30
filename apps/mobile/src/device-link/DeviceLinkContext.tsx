@@ -83,6 +83,7 @@ import {
   createPresenceAvailabilityEpochs,
   extendPresenceWipeTimerFloor,
   getOrCreatePresenceTrackedRequest,
+  isInvokeResultReachabilityEvidence,
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
@@ -1080,9 +1081,10 @@ async function sendInvoke<T>(
   // 只有指定探测通道能关熔断(纯内存 IPC handler 的回包不算)——按通道 +
   // 席位分类收尾(review P1 多轮收敛,见 classifyDeviceSendSuccess)。
   settleDeviceSend(deviceId, slot, classifyDeviceSendSuccess(channel, slot.decision === 'probe'));
-  const value = unwrapInvoke<T>(result);
-  markRemoteResponseEvidence(deviceId);
-  return value;
+  if (isInvokeResultReachabilityEvidence(result)) {
+    markRemoteResponseEvidence(deviceId);
+  }
+  return unwrapInvoke<T>(result);
 }
 
 function sendSubscribeWithAccessHandling(
@@ -1125,8 +1127,10 @@ async function sendSubscribe(
   // 到点时页面卸载恰好发的一条控制帧会抢占探测席位并误关熔断。与 openLink
   // 同语义:成功按不定论,超时仍计失败(连控制帧都不应答 = 彻底无响应)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
+  if (isInvokeResultReachabilityEvidence(result)) {
+    markRemoteResponseEvidence(deviceId);
+  }
   unwrapInvoke(result);
-  markRemoteResponseEvidence(deviceId);
 }
 
 async function sendUnsubscribe(
@@ -1153,8 +1157,10 @@ async function sendUnsubscribe(
   }
   // 控制帧成功按不定论,不作熔断恢复证据(同 sendSubscribe,review P1)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
+  if (isInvokeResultReachabilityEvidence(result)) {
+    markRemoteResponseEvidence(deviceId);
+  }
   unwrapInvoke(result);
-  markRemoteResponseEvidence(deviceId);
 }
 
 function unwrapInvoke<T = unknown>(result: InvokeResultPayload): T {

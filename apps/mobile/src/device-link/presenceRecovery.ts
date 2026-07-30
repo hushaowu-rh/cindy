@@ -48,12 +48,14 @@ export function resetPresenceAvailabilityEpochs(
 
 export interface PresenceTrackedRequest<T> {
   capturedPresenceEpoch: number;
+  capturedResponseEvidenceEpoch: number;
   request: Promise<T>;
 }
 
 export function getOrCreatePresenceTrackedRequest<T>(
   inFlight: Map<string, PresenceTrackedRequest<T>>,
   epochs: PresenceAvailabilityEpochs,
+  responseEvidenceEpochs: PresenceAvailabilityEpochs,
   deviceId: string,
   createRequest: () => Promise<T>,
 ): PresenceTrackedRequest<T> {
@@ -62,6 +64,10 @@ export function getOrCreatePresenceTrackedRequest<T>(
 
   const tracked = {
     capturedPresenceEpoch: capturePresenceAvailabilityEpoch(epochs, deviceId),
+    capturedResponseEvidenceEpoch: capturePresenceAvailabilityEpoch(
+      responseEvidenceEpochs,
+      deviceId,
+    ),
     request: createRequest(),
   };
   inFlight.set(deviceId, tracked);

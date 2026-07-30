@@ -7,12 +7,15 @@ function deps() {
   let nextCohort = 0;
   const harness: DeviceLinkRehydrateDeps = {
     capturePresenceEpoch: vi.fn(() => 0),
+    captureResponseEvidenceEpoch: vi.fn(() => 0),
     isPresenceEpochCurrent: vi.fn(() => true),
+    isResponseEvidenceEpochCurrent: vi.fn(() => true),
     createDeviceSendCohort: vi.fn(() => ++nextCohort),
     openLink: vi.fn((deviceId: string) => {
       calls.push(`open:${deviceId}`);
       return {
         capturedPresenceEpoch: 0,
+        capturedResponseEvidenceEpoch: 0,
         request: Promise.resolve(),
       };
     }),
@@ -104,6 +107,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     harness.onDeviceUnavailable = onDeviceUnavailable;
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
       ),
@@ -143,6 +147,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     vi.mocked(harness.isPresenceEpochCurrent).mockReturnValue(false);
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
       ),
@@ -153,6 +158,50 @@ describe('rehydrateDeviceLinkTopics', () => {
     ], harness);
 
     expect(onDeviceUnavailable).not.toHaveBeenCalled();
+    expect(harness.subscribe).toHaveBeenCalledOnce();
+    expect(result.transientFailures).toBe(1);
+  });
+
+  it('downgrades offline after a concurrent send proves the device reachable', async () => {
+    const { harness } = deps();
+    const onDeviceUnavailable = vi.fn();
+    harness.onDeviceUnavailable = onDeviceUnavailable;
+    vi.mocked(harness.isResponseEvidenceEpochCurrent).mockReturnValue(false);
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('target offline'), { code: 'DEVICE_OFFLINE' }),
+      ),
+    });
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceUnavailable).not.toHaveBeenCalled();
+    expect(harness.subscribe).toHaveBeenCalledOnce();
+    expect(result.transientFailures).toBe(1);
+  });
+
+  it('downgrades remote-disabled after a concurrent send proves reachability', async () => {
+    const { harness } = deps();
+    const onDeviceRemoteDisabled = vi.fn();
+    harness.onDeviceRemoteDisabled = onDeviceRemoteDisabled;
+    vi.mocked(harness.isResponseEvidenceEpochCurrent).mockReturnValue(false);
+    vi.mocked(harness.openLink).mockReturnValueOnce({
+      capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
+      request: Promise.reject(
+        Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
+      ),
+    });
+
+    const result = await rehydrateDeviceLinkTopics([
+      { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
+    ], harness);
+
+    expect(onDeviceRemoteDisabled).not.toHaveBeenCalled();
     expect(harness.subscribe).toHaveBeenCalledOnce();
     expect(result.transientFailures).toBe(1);
   });
@@ -176,6 +225,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     const { calls, harness } = deps();
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(new Error('open failed')),
     });
     vi.mocked(harness.subscribe).mockRejectedValueOnce(new Error('subscribe failed'));
@@ -220,6 +270,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     harness.onDeviceRemoteDisabled = onDeviceRemoteDisabled;
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
       ),
@@ -242,6 +293,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     vi.mocked(harness.isPresenceEpochCurrent).mockReturnValue(false);
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('disabled'), { code: 'REMOTE_DISABLED' }),
       ),
@@ -259,6 +311,7 @@ describe('rehydrateDeviceLinkTopics', () => {
     const { harness } = deps();
     vi.mocked(harness.openLink).mockReturnValueOnce({
       capturedPresenceEpoch: 0,
+      capturedResponseEvidenceEpoch: 0,
       request: Promise.reject(
         Object.assign(new Error('unsupported'), { code: 'CHANNEL_NOT_ALLOWED' }),
       ),

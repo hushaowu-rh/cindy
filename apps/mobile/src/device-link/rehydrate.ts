@@ -9,13 +9,19 @@ export interface DeviceLinkRehydrateSendOptions {
 
 export interface PresenceTrackedRehydrateStep {
   capturedPresenceEpoch: number;
+  capturedResponseEvidenceEpoch: number;
   request: Promise<unknown>;
 }
 
 export interface DeviceLinkRehydrateDeps {
   createDeviceSendCohort(deviceId: string): number;
   capturePresenceEpoch(deviceId: string): number;
+  captureResponseEvidenceEpoch(deviceId: string): number;
   isPresenceEpochCurrent(deviceId: string, capturedPresenceEpoch: number): boolean;
+  isResponseEvidenceEpochCurrent(
+    deviceId: string,
+    capturedResponseEvidenceEpoch: number,
+  ): boolean;
   openLink(deviceId: string): PresenceTrackedRehydrateStep;
   subscribe(deviceId: string, topics: readonly Topic[]): Promise<unknown>;
   requestSessionsReseed(deviceId: string): void;
@@ -54,6 +60,7 @@ export async function rehydrateDeviceLinkTopics(
   const track = async (
     deviceId: string,
     capturedPresenceEpoch: number,
+    capturedResponseEvidenceEpoch: number,
     step: Promise<unknown>,
   ): Promise<'continue' | 'unavailable'> => {
     try {
@@ -69,9 +76,16 @@ export async function rehydrateDeviceLinkTopics(
       );
       const offlineVerdict = isDeviceOfflineError(err);
       const remoteDisabledVerdict = isRemoteDisabledError(err);
-      const unavailable = epochCurrent && (
-        offlineVerdict || remoteDisabledVerdict
-      );
+      const availabilityVerdict = offlineVerdict || remoteDisabledVerdict;
+      const supersededByConcurrentResponse = epochCurrent
+        && availabilityVerdict
+        && !deps.isResponseEvidenceEpochCurrent(
+          deviceId,
+          capturedResponseEvidenceEpoch,
+        );
+      const unavailable = epochCurrent
+        && availabilityVerdict
+        && !supersededByConcurrentResponse;
       if (unavailable) {
         if (remoteDisabledVerdict) {
           deps.onDeviceRemoteDisabled?.(deviceId);
@@ -79,7 +93,12 @@ export async function rehydrateDeviceLinkTopics(
           deps.onDeviceUnavailable?.(deviceId);
         }
       }
-      if (!unavailable && isTransientRemoteError(err)) transientFailures += 1;
+      if (
+        !unavailable
+        && (isTransientRemoteError(err) || supersededByConcurrentResponse)
+      ) {
+        transientFailures += 1;
+      }
       return unavailable ? 'unavailable' : 'continue';
     }
   };
@@ -92,6 +111,7 @@ export async function rehydrateDeviceLinkTopics(
       if (await track(
         plan.deviceId,
         openLinkStep.capturedPresenceEpoch,
+        openLinkStep.capturedResponseEvidenceEpoch,
         openLinkStep.request,
       ) === 'unavailable') {
         continue;
@@ -103,6 +123,7 @@ export async function rehydrateDeviceLinkTopics(
       await track(
         plan.deviceId,
         deps.capturePresenceEpoch(plan.deviceId),
+        deps.captureResponseEvidenceEpoch(plan.deviceId),
         deps.subscribe(plan.deviceId, plan.topics),
       ) === 'unavailable'
     ) {
@@ -121,6 +142,7 @@ export async function rehydrateDeviceLinkTopics(
         if (await track(
           plan.deviceId,
           deps.capturePresenceEpoch(plan.deviceId),
+          deps.captureResponseEvidenceEpoch(plan.deviceId),
           deps.rebuildSessionSnapshot(plan.deviceId, sessionId, {
             responsivenessCohort: deps.createDeviceSendCohort(plan.deviceId),
           }),

@@ -177,8 +177,9 @@ describe('presence availability epochs', () => {
     expect(isPresenceAvailabilityEpochCurrent(epochs, 'dev-2', dev2ProbeEpoch)).toBe(true);
   });
 
-  it('keeps the request-creation epoch when callers share an in-flight request', async () => {
+  it('keeps both request-creation epochs when callers share an in-flight request', async () => {
     const epochs = createPresenceAvailabilityEpochs();
+    const responseEvidenceEpochs = createPresenceAvailabilityEpochs();
     const inFlight = new Map();
     let resolveRequest!: () => void;
     const request = new Promise<void>((resolve) => {
@@ -188,23 +189,32 @@ describe('presence availability epochs', () => {
     const first = getOrCreatePresenceTrackedRequest(
       inFlight,
       epochs,
+      responseEvidenceEpochs,
       'dev-1',
       () => request,
     );
     markPresenceAvailabilityEpoch(epochs, 'dev-1');
+    markPresenceAvailabilityEpoch(responseEvidenceEpochs, 'dev-1');
     const deduped = getOrCreatePresenceTrackedRequest(
       inFlight,
       epochs,
+      responseEvidenceEpochs,
       'dev-1',
       () => Promise.resolve(),
     );
 
     expect(deduped).toBe(first);
     expect(deduped.capturedPresenceEpoch).toBe(0);
+    expect(deduped.capturedResponseEvidenceEpoch).toBe(0);
     expect(isPresenceAvailabilityEpochCurrent(
       epochs,
       'dev-1',
       deduped.capturedPresenceEpoch,
+    )).toBe(false);
+    expect(isPresenceAvailabilityEpochCurrent(
+      responseEvidenceEpochs,
+      'dev-1',
+      deduped.capturedResponseEvidenceEpoch,
     )).toBe(false);
 
     resolveRequest();

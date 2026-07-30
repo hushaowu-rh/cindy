@@ -126,6 +126,10 @@ export interface DeviceLinkContextValue {
 
 const DeviceLinkContext = createContext<DeviceLinkContextValue | null>(null);
 
+// 任意目标端真实应答的独立时序证据。它不等同于 presence verdict,也不参与 IPC/DB
+// 响应性熔断;只用于判定并发返回的 unavailable 是否已被更晚目标应答推翻。
+const remoteResponseEvidenceEpochs = createPresenceAvailabilityEpochs();
+
 interface RehydrateState {
   inFlight: Promise<void> | null;
   rerun: boolean;
@@ -196,6 +200,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     return getOrCreatePresenceTrackedRequest(
       openLinkInFlightRef.current,
       presenceAvailabilityEpochsRef.current,
+      remoteResponseEvidenceEpochs,
       deviceId,
       () => sendOpenLinkWithAccessHandling(client, deviceId),
     );
@@ -343,12 +348,25 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                   presenceAvailabilityEpochsRef.current,
                   deviceId,
                 ),
+              captureResponseEvidenceEpoch: (deviceId) =>
+                capturePresenceAvailabilityEpoch(
+                  remoteResponseEvidenceEpochs,
+                  deviceId,
+                ),
               isPresenceEpochCurrent: (deviceId, capturedPresenceEpoch) =>
                 isPresenceAvailabilityEpochCurrent(
                   presenceAvailabilityEpochsRef.current,
                   deviceId,
                   capturedPresenceEpoch,
                 ),
+              isResponseEvidenceEpochCurrent: (
+                deviceId,
+                capturedResponseEvidenceEpoch,
+              ) => isPresenceAvailabilityEpochCurrent(
+                remoteResponseEvidenceEpochs,
+                deviceId,
+                capturedResponseEvidenceEpoch,
+              ),
               createDeviceSendCohort: (deviceId) => createDeviceSendCohort(deviceId),
               openLink: (deviceId) => sendOpenLinkOnce(client, deviceId),
               subscribe: (deviceId, topics) => sendTrackedSubscribe(client, deviceId, topics),
@@ -431,6 +449,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       openLinkInFlightRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
       resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
+      resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       setStatus('stopped');
       setConnectionIssue(null);
@@ -666,6 +685,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       remoteSubscribedTopicsRef.current.clear();
       presenceAvailableByDeviceRef.current.clear();
       resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
+      resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
       if (clientRef.current === client) clientRef.current = null;
     };
@@ -922,6 +942,7 @@ async function sendOpenLink(
     // openLink 若是探测,单飞席位随之释放、退避窗口不动,紧随其后的 subscribe
     // (真实 invoke 通道)会立即接棒成为新探测,由它的回包决定开合。
     settleDeviceSend(deviceId, slot, 'inconclusive');
+    markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
     return accepted;
   } catch (err) {
     // 超时仍计失败:link-open 都等不到回包说明被控端连链路层都没在应答。
@@ -988,6 +1009,7 @@ async function sendInvoke<T>(
   // 只有指定探测通道能关熔断(纯内存 IPC handler 的回包不算)——按通道 +
   // 席位分类收尾(review P1 多轮收敛,见 classifyDeviceSendSuccess)。
   settleDeviceSend(deviceId, slot, classifyDeviceSendSuccess(channel, slot.decision === 'probe'));
+  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
   return unwrapInvoke<T>(result);
 }
 
@@ -1031,6 +1053,7 @@ async function sendSubscribe(
   // 到点时页面卸载恰好发的一条控制帧会抢占探测席位并误关熔断。与 openLink
   // 同语义:成功按不定论,超时仍计失败(连控制帧都不应答 = 彻底无响应)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
+  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
   unwrapInvoke(result);
 }
 
@@ -1058,6 +1081,7 @@ async function sendUnsubscribe(
   }
   // 控制帧成功按不定论,不作熔断恢复证据(同 sendSubscribe,review P1)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
+  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
   unwrapInvoke(result);
 }
 

@@ -94,10 +94,13 @@ describe('reconnect host-authoritative healing', () => {
 
     await rehydrateDeviceLinkTopics(registry.snapshot(), {
       capturePresenceEpoch: vi.fn(() => 0),
+      captureResponseEvidenceEpoch: vi.fn(() => 0),
       isPresenceEpochCurrent: vi.fn(() => true),
+      isResponseEvidenceEpochCurrent: vi.fn(() => true),
       createDeviceSendCohort: vi.fn(() => 1),
       openLink: vi.fn(() => ({
         capturedPresenceEpoch: 0,
+        capturedResponseEvidenceEpoch: 0,
         request: Promise.resolve(),
       })),
       subscribe: vi.fn(async () => undefined),

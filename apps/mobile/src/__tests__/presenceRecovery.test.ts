@@ -8,6 +8,9 @@ import {
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
+  PRESENCE_WIPE_MAX_LIFETIME_MS,
+  reconcileOfflineVerdictAfterResponse,
+  type PresenceUnavailableVerdict,
   type PresenceWipeTimerEntry,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
@@ -150,6 +153,26 @@ describe('unavailable mirror wipe timer', () => {
     vi.useRealTimers();
   });
 
+  it('caps repeated reconnect extensions at the first-offline lifetime', () => {
+    const { deps, states, timers, wipe } = timerHarness();
+    resetPresenceAvailabilityForConnection(states, new Set());
+
+    for (let step = 2_500; step < PRESENCE_WIPE_MAX_LIFETIME_MS; step += 2_500) {
+      const advanceBy = Math.min(
+        2_500,
+        PRESENCE_WIPE_MAX_LIFETIME_MS - Date.now() - 1,
+      );
+      if (advanceBy <= 0) break;
+      vi.advanceTimersByTime(advanceBy);
+      extendPresenceWipeTimerFloor(timers, states, 'dev-1', 3_000, deps);
+      expect(wipe).not.toHaveBeenCalled();
+    }
+
+    vi.advanceTimersByTime(PRESENCE_WIPE_MAX_LIFETIME_MS - Date.now());
+    expect(wipe).toHaveBeenCalledWith('dev-1');
+    vi.useRealTimers();
+  });
+
   it('cancels cleanup after a near-expiry reconnect proves the device reachable', () => {
     const { deps, states, timers, wipe } = timerHarness();
     vi.advanceTimersByTime(4_900);
@@ -163,6 +186,64 @@ describe('unavailable mirror wipe timer', () => {
     expect(wipe).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
+});
+
+describe('late response verdict reconciliation', () => {
+  function harness(kind: PresenceUnavailableVerdict['kind'], responseEvidenceEpoch: number) {
+    const states = new Map<string, boolean>([['dev-1', false]]);
+    const pendingRecovery = new Set<string>();
+    const verdicts = new Map<string, PresenceUnavailableVerdict>([[
+      'dev-1',
+      { kind, responseEvidenceEpoch },
+    ]]);
+    return { pendingRecovery, states, verdicts };
+  }
+
+  it('returns a superseded rehydrate-offline verdict to unknown', () => {
+    const { pendingRecovery, states, verdicts } = harness('offline', 3);
+
+    expect(reconcileOfflineVerdictAfterResponse(
+      states,
+      pendingRecovery,
+      verdicts,
+      'dev-1',
+      4,
+    )).toBe(true);
+    expect(states.has('dev-1')).toBe(false);
+    expect(pendingRecovery).toEqual(new Set(['dev-1']));
+    expect(verdicts.has('dev-1')).toBe(false);
+  });
+
+  it('keeps an offline verdict when response evidence is not newer', () => {
+    const { pendingRecovery, states, verdicts } = harness('offline', 3);
+
+    expect(reconcileOfflineVerdictAfterResponse(
+      states,
+      pendingRecovery,
+      verdicts,
+      'dev-1',
+      3,
+    )).toBe(false);
+    expect(states.get('dev-1')).toBe(false);
+    expect(pendingRecovery.size).toBe(0);
+  });
+
+  it.each(['disabled', 'presence'] as const)(
+    'does not let a raw response clear an authoritative %s verdict',
+    (kind) => {
+      const { pendingRecovery, states, verdicts } = harness(kind, 3);
+
+      expect(reconcileOfflineVerdictAfterResponse(
+        states,
+        pendingRecovery,
+        verdicts,
+        'dev-1',
+        4,
+      )).toBe(false);
+      expect(states.get('dev-1')).toBe(false);
+      expect(verdicts.get('dev-1')?.kind).toBe(kind);
+    },
+  );
 });
 
 describe('presence availability epochs', () => {

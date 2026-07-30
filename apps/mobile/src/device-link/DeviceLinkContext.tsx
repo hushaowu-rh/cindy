@@ -86,7 +86,9 @@ import {
   isPresenceAvailabilityEpochCurrent,
   isPresenceEligibleForRemoteRequest,
   markPresenceAvailabilityEpoch,
+  reconcileOfflineVerdictAfterResponse,
   type PresenceTrackedRequest,
+  type PresenceUnavailableVerdict,
   type PresenceWipeTimerEntry,
   resetPresenceAvailabilityEpochs,
   resetPresenceAvailabilityForConnection,
@@ -129,6 +131,19 @@ const DeviceLinkContext = createContext<DeviceLinkContextValue | null>(null);
 // 任意目标端真实应答的独立时序证据。它不等同于 presence verdict,也不参与 IPC/DB
 // 响应性熔断;只用于判定并发返回的 unavailable 是否已被更晚目标应答推翻。
 const remoteResponseEvidenceEpochs = createPresenceAvailabilityEpochs();
+const remoteResponseEvidenceListeners = new Set<(deviceId: string) => void>();
+
+function markRemoteResponseEvidence(deviceId: string): void {
+  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
+  for (const listener of remoteResponseEvidenceListeners) listener(deviceId);
+}
+
+function subscribeRemoteResponseEvidence(
+  listener: (deviceId: string) => void,
+): () => void {
+  remoteResponseEvidenceListeners.add(listener);
+  return () => remoteResponseEvidenceListeners.delete(listener);
+}
 
 interface RehydrateState {
   inFlight: Promise<void> | null;
@@ -190,6 +205,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const presenceAvailableByDeviceRef = useRef(new Map<string, boolean>());
   const presenceAvailabilityEpochsRef = useRef(createPresenceAvailabilityEpochs());
   const presencePendingRecoveryDeviceIdsRef = useRef(new Set<string>());
+  const presenceUnavailableVerdictsRef = useRef(
+    new Map<string, PresenceUnavailableVerdict>(),
+  );
   const [status, setStatus] = useState<DeviceLinkStatus>('stopped');
   const [connectionIssue, setConnectionIssue] = useState<DeviceLinkConnectionIssue | null>(null);
   const [presenceVersion, setPresenceVersion] = useState(0);
@@ -385,6 +403,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                   deviceId,
                 );
                 presenceAvailableByDeviceRef.current.set(deviceId, false);
+                presenceUnavailableVerdictsRef.current.set(deviceId, {
+                  kind: 'disabled',
+                  responseEvidenceEpoch: capturePresenceAvailabilityEpoch(
+                    remoteResponseEvidenceEpochs,
+                    deviceId,
+                  ),
+                });
                 presencePendingRecoveryDeviceIdsRef.current.add(deviceId);
                 clearDeviceResponsivenessTrackingFor(deviceId);
                 remoteSubscribedTopicsRef.current.delete(deviceId);
@@ -396,6 +421,13 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                 // rehydrate 已按请求发起时的 presence epoch 丢弃旧路由离线回包,
                 // 因此这里不会覆盖更晚的 available=true。
                 presenceAvailableByDeviceRef.current.set(deviceId, false);
+                presenceUnavailableVerdictsRef.current.set(deviceId, {
+                  kind: 'offline',
+                  responseEvidenceEpoch: capturePresenceAvailabilityEpoch(
+                    remoteResponseEvidenceEpochs,
+                    deviceId,
+                  ),
+                });
                 presencePendingRecoveryDeviceIdsRef.current.add(deviceId);
                 clearDeviceResponsivenessTrackingFor(deviceId);
                 remoteSubscribedTopicsRef.current.delete(deviceId);
@@ -451,6 +483,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
       resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
+      presenceUnavailableVerdictsRef.current.clear();
       setStatus('stopped');
       setConnectionIssue(null);
       remoteSessionStore.clear();
@@ -518,6 +551,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         presenceAvailableByDeviceRef.current,
         presencePendingRecoveryDeviceIdsRef.current,
       );
+      // 上一连接代的 rehydrate verdict 已被降为 unknown;新连接的 late response
+      // 不能再借旧 verdict 清理当前代状态。权威 presence 会在 delta 到达时重建。
+      for (const deviceId of staleUnavailableDeviceIds) {
+        presenceUnavailableVerdictsRef.current.delete(deviceId);
+      }
       for (const deviceId of staleUnavailableDeviceIds) {
         extendPresenceWipeTimerFloor(
           presenceWipeTimersRef.current,
@@ -539,6 +577,18 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         snap,
         presencePendingRecoveryDeviceIdsRef.current,
       );
+      if (presence.available) {
+        presenceUnavailableVerdictsRef.current.delete(snap.deviceId);
+      } else {
+        // Relay presence 是权威 availability verdict,普通目标应答不能推翻。
+        presenceUnavailableVerdictsRef.current.set(snap.deviceId, {
+          kind: 'presence',
+          responseEvidenceEpoch: capturePresenceAvailabilityEpoch(
+            remoteResponseEvidenceEpochs,
+            snap.deviceId,
+          ),
+        });
+      }
       const wipeTimers = presenceWipeTimersRef.current;
       if (!presence.available) {
         // Relay 的权威 presence 已说明目标离线或关闭远控:此前 INVOKE_TIMEOUT
@@ -595,6 +645,25 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       },
     }));
     client.start();
+
+    const offResponseEvidence = subscribeRemoteResponseEvidence((deviceId) => {
+      const currentEpoch = capturePresenceAvailabilityEpoch(
+        remoteResponseEvidenceEpochs,
+        deviceId,
+      );
+      if (!reconcileOfflineVerdictAfterResponse(
+        presenceAvailableByDeviceRef.current,
+        presencePendingRecoveryDeviceIdsRef.current,
+        presenceUnavailableVerdictsRef.current,
+        deviceId,
+        currentEpoch,
+      )) {
+        return;
+      }
+
+      clearOnePresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
+      void rehydrateWithClient(client);
+    });
 
     // 熔断状态变化触发 rehydrate:unresponsive 集合的新增与移除都各触发一次
     // (review P1 + 注释勘误):
@@ -673,6 +742,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       sub.remove();
       clearBackgroundStopTimer();
       offUnresponsive();
+      offResponseEvidence();
       offFrame();
       offPresence();
       offStatus();
@@ -687,6 +757,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       resetPresenceAvailabilityEpochs(presenceAvailabilityEpochsRef.current);
       resetPresenceAvailabilityEpochs(remoteResponseEvidenceEpochs);
       presencePendingRecoveryDeviceIdsRef.current.clear();
+      presenceUnavailableVerdictsRef.current.clear();
       if (clientRef.current === client) clientRef.current = null;
     };
   }, [auth.getAccessToken, auth.isAuthenticated, clearRehydrateRetry, rehydrateWithClient]);
@@ -942,7 +1013,7 @@ async function sendOpenLink(
     // openLink 若是探测,单飞席位随之释放、退避窗口不动,紧随其后的 subscribe
     // (真实 invoke 通道)会立即接棒成为新探测,由它的回包决定开合。
     settleDeviceSend(deviceId, slot, 'inconclusive');
-    markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
+    markRemoteResponseEvidence(deviceId);
     return accepted;
   } catch (err) {
     // 超时仍计失败:link-open 都等不到回包说明被控端连链路层都没在应答。
@@ -1010,7 +1081,7 @@ async function sendInvoke<T>(
   // 席位分类收尾(review P1 多轮收敛,见 classifyDeviceSendSuccess)。
   settleDeviceSend(deviceId, slot, classifyDeviceSendSuccess(channel, slot.decision === 'probe'));
   const value = unwrapInvoke<T>(result);
-  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
+  markRemoteResponseEvidence(deviceId);
   return value;
 }
 
@@ -1055,7 +1126,7 @@ async function sendSubscribe(
   // 同语义:成功按不定论,超时仍计失败(连控制帧都不应答 = 彻底无响应)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
   unwrapInvoke(result);
-  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
+  markRemoteResponseEvidence(deviceId);
 }
 
 async function sendUnsubscribe(
@@ -1083,7 +1154,7 @@ async function sendUnsubscribe(
   // 控制帧成功按不定论,不作熔断恢复证据(同 sendSubscribe,review P1)。
   settleDeviceSend(deviceId, slot, 'inconclusive');
   unwrapInvoke(result);
-  markPresenceAvailabilityEpoch(remoteResponseEvidenceEpochs, deviceId);
+  markRemoteResponseEvidence(deviceId);
 }
 
 function unwrapInvoke<T = unknown>(result: InvokeResultPayload): T {

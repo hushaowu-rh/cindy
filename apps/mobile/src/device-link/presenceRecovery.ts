@@ -81,6 +81,7 @@ export function getOrCreatePresenceTrackedRequest<T>(
 export interface PresenceWipeTimerEntry {
   timer: ReturnType<typeof setTimeout>;
   deadlineAt: number;
+  firstScheduledAt: number;
 }
 
 export interface PresenceWipeTimerDeps {
@@ -90,6 +91,8 @@ export interface PresenceWipeTimerDeps {
   wipe(deviceId: string): void;
 }
 
+export const PRESENCE_WIPE_MAX_LIFETIME_MS = 30_000;
+
 export function schedulePresenceWipeTimer(
   timers: Map<string, PresenceWipeTimerEntry>,
   availabilityByDevice: ReadonlyMap<string, boolean>,
@@ -98,11 +101,13 @@ export function schedulePresenceWipeTimer(
   deps: PresenceWipeTimerDeps,
 ): void {
   if (timers.has(deviceId)) return;
+  const now = deps.now();
   schedulePresenceWipeAt(
     timers,
     availabilityByDevice,
     deviceId,
-    deps.now() + delayMs,
+    now,
+    now + delayMs,
     deps,
   );
 }
@@ -116,7 +121,10 @@ export function extendPresenceWipeTimerFloor(
 ): void {
   const entry = timers.get(deviceId);
   if (!entry) return;
-  const minimumDeadlineAt = deps.now() + minimumDelayMs;
+  const minimumDeadlineAt = Math.min(
+    deps.now() + minimumDelayMs,
+    entry.firstScheduledAt + PRESENCE_WIPE_MAX_LIFETIME_MS,
+  );
   if (entry.deadlineAt >= minimumDeadlineAt) return;
 
   deps.clearTimer(entry.timer);
@@ -124,6 +132,7 @@ export function extendPresenceWipeTimerFloor(
     timers,
     availabilityByDevice,
     deviceId,
+    entry.firstScheduledAt,
     minimumDeadlineAt,
     deps,
   );
@@ -152,12 +161,14 @@ function schedulePresenceWipeAt(
   timers: Map<string, PresenceWipeTimerEntry>,
   availabilityByDevice: ReadonlyMap<string, boolean>,
   deviceId: string,
+  firstScheduledAt: number,
   deadlineAt: number,
   deps: PresenceWipeTimerDeps,
 ): void {
   const delayMs = Math.max(0, deadlineAt - deps.now());
   const entry: PresenceWipeTimerEntry = {
     deadlineAt,
+    firstScheduledAt,
     timer: deps.setTimer(() => {
       if (timers.get(deviceId) !== entry) return;
       timers.delete(deviceId);
@@ -176,6 +187,36 @@ export function shouldWipeUnavailableDeviceMirror(
   // 新连接不会重放全量 presence,因此 reconnect 清掉旧 verdict 后的 unknown
   // 仍需让原宽限计时器按期回收;只有当前代已明确 available 才取消清理。
   return availabilityByDevice.get(deviceId) !== true;
+}
+
+export type PresenceUnavailableVerdictKind = 'offline' | 'disabled' | 'presence';
+
+export interface PresenceUnavailableVerdict {
+  kind: PresenceUnavailableVerdictKind;
+  responseEvidenceEpoch: number;
+}
+
+export function reconcileOfflineVerdictAfterResponse(
+  availabilityByDevice: Map<string, boolean>,
+  pendingRecoveryDeviceIds: Set<string>,
+  verdicts: Map<string, PresenceUnavailableVerdict>,
+  deviceId: string,
+  currentResponseEvidenceEpoch: number,
+): boolean {
+  const verdict = verdicts.get(deviceId);
+  if (
+    verdict?.kind !== 'offline'
+    || currentResponseEvidenceEpoch <= verdict.responseEvidenceEpoch
+  ) {
+    return false;
+  }
+
+  // 真实目标应答只推翻 rehydrate 的路由离线推断,回到 unknown 乐观补齐;
+  // 显式 disabled verdict 永远不在此清除,只能由权威 presence 恢复。
+  availabilityByDevice.delete(deviceId);
+  pendingRecoveryDeviceIds.add(deviceId);
+  verdicts.delete(deviceId);
+  return true;
 }
 
 export function isPresenceEligibleForRemoteRequest(

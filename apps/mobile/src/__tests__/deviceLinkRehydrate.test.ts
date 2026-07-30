@@ -324,12 +324,13 @@ describe('rehydrateDeviceLinkTopics', () => {
       ),
     });
 
-    await rehydrateDeviceLinkTopics([
+    const result = await rehydrateDeviceLinkTopics([
       { deviceId: 'dev-1', openLink: true, topics: ['sessions'] },
     ], harness);
 
     expect(onDeviceRemoteDisabled).not.toHaveBeenCalled();
     expect(harness.subscribe).toHaveBeenCalledOnce();
+    expect(result.transientFailures).toBe(1);
   });
 
   it('does not count other permanent failures (retrying them is pointless)', async () => {

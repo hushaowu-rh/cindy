@@ -78,6 +78,7 @@ export async function rehydrateDeviceLinkTopics(
       const offlineVerdict = isDeviceOfflineError(err);
       const remoteDisabledVerdict = isRemoteDisabledError(err);
       const availabilityVerdict = offlineVerdict || remoteDisabledVerdict;
+      const staleAvailabilityVerdict = availabilityVerdict && !epochCurrent;
       const supersededByConcurrentResponse = epochCurrent
         && availabilityVerdict
         && !deps.isResponseEvidenceEpochCurrent(
@@ -96,7 +97,11 @@ export async function rehydrateDeviceLinkTopics(
       }
       if (
         !unavailable
-        && (isTransientRemoteError(err) || supersededByConcurrentResponse)
+        && (
+          isTransientRemoteError(err)
+          || staleAvailabilityVerdict
+          || supersededByConcurrentResponse
+        )
       ) {
         transientFailures += 1;
       }

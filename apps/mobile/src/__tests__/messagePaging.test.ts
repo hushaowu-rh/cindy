@@ -223,7 +223,6 @@ describe('messagePaging', () => {
       const result = await collectCompleteIncrementalMessages({
         initialPage: { messages: [message('m1', '2026-01-01T00:00:01.000Z'), message('m2', '2026-01-01T00:00:02.000Z')], limit: 2, reducedByPayloadTooLarge: false },
         afterMessage: anchor,
-        expectedNewRows: 4,
         fetchAfter: async (cursor) => pages.get(cursor) ?? { messages: [], limit: 2, reducedByPayloadTooLarge: false },
         fetchLatest: async () => { throw new Error('tail fallback should not run'); },
         fetchBefore: async () => { throw new Error('before fallback should not run'); },
@@ -236,7 +235,6 @@ describe('messagePaging', () => {
       const result = await collectCompleteIncrementalMessages({
         initialPage: { messages: [message('m4', '2026-01-01T00:00:04.000Z'), message('m5', '2026-01-01T00:00:05.000Z')], limit: 2, reducedByPayloadTooLarge: false },
         afterMessage: anchor,
-        expectedNewRows: 4,
         fetchAfter: async () => ({ messages: [message('m4', '2026-01-01T00:00:04.000Z'), message('m5', '2026-01-01T00:00:05.000Z')], limit: 2, reducedByPayloadTooLarge: false }),
         fetchLatest: async () => ({ messages: [message('m4', '2026-01-01T00:00:04.000Z'), message('m5', '2026-01-01T00:00:05.000Z')], limit: 2, reducedByPayloadTooLarge: false }),
         fetchBefore: async (before) => before === 'm4'
@@ -246,6 +244,24 @@ describe('messagePaging', () => {
             : { messages: [], limit: 2, reducedByPayloadTooLarge: false },
       });
       expect(result?.map((item) => item.id)).toEqual(['m2', 'm3', 'm4', 'm5']);
+    });
+    it('keeps paging until a short page even when a net delta would be smaller', async () => {
+      const anchor = message('m0', '2026-01-01T00:00:00.000Z');
+      const calls: string[] = [];
+      const result = await collectCompleteIncrementalMessages({
+        initialPage: { messages: [message('m1', '2026-01-01T00:00:01.000Z'), message('m2', '2026-01-01T00:00:02.000Z')], limit: 2, reducedByPayloadTooLarge: false },
+        afterMessage: anchor,
+        fetchAfter: async (cursor) => {
+          calls.push(cursor);
+          return cursor === 'm2'
+            ? { messages: [message('m3', '2026-01-01T00:00:03.000Z'), message('m4', '2026-01-01T00:00:04.000Z')], limit: 2, reducedByPayloadTooLarge: false }
+            : { messages: [message('m5', '2026-01-01T00:00:05.000Z')], limit: 2, reducedByPayloadTooLarge: false };
+        },
+        fetchLatest: async () => { throw new Error('tail fallback should not run'); },
+        fetchBefore: async () => { throw new Error('before fallback should not run'); },
+      });
+      expect(calls).toEqual(['m2', 'm4']);
+      expect(result?.map((item) => item.id)).toEqual(['m1', 'm2', 'm3', 'm4', 'm5']);
     });
   });
 

@@ -2941,8 +2941,6 @@ export default function SessionScreen() {
           if (syncRun.isStale()) return;
           const historyPage: RemoteMessage[] = Array.isArray(history.messages) ? history.messages : [];
           if (after) {
-            remoteSessionStore.mergeMessages(sessionId, historyPage);
-            const mergedMessages = remoteSessionStore.getMessages(sessionId);
             const previousCount = storedSessionAtStart?._count?.messages;
             const afterMessage = storedMessagesAtStart.find((message) => message.id === after) ?? null;
             if (incrementalMessagePageNeedsFallback({
@@ -2957,10 +2955,6 @@ export default function SessionScreen() {
                 ? await collectCompleteIncrementalMessages({
                     initialPage: history,
                     afterMessage,
-                    expectedNewRows:
-                      typeof freshCount === 'number' && typeof previousCount === 'number'
-                        ? freshCount - previousCount
-                        : undefined,
                     fetchAfter: async (cursor) => withTransientRemoteRetry(() =>
                       listMessagesWithPayloadRetry(
                         (limit) => maker.listMessages(sessionId, { limit, after: cursor }),
@@ -2982,23 +2976,22 @@ export default function SessionScreen() {
                     maxPages: 256,
                   })
                 : null;
-              if (completeDelta) {
-                remoteSessionStore.mergeMessages(sessionId, completeDelta);
-                setHasOlderMessages(
-                  hasOlderMessagesAfterReopen(
-                    freshCount,
-                    remoteSessionStore.getMessages(sessionId),
-                  ),
-                );
-              } else {
-                // No bounded request sequence proved completeness. Keep the existing
-                // cache and leave the window unsynced so a later reopen retries safely.
+              if (!completeDelta) {
+                // Do not advance the store cursor until completeness is proven.
+                // A later reopen can safely retry from the original cached tail.
                 setHasOlderMessages(true);
                 return;
               }
+              remoteSessionStore.mergeMessages(sessionId, completeDelta);
             } else {
-              setHasOlderMessages(hasOlderMessagesAfterReopen(freshCount, mergedMessages));
+              remoteSessionStore.mergeMessages(sessionId, historyPage);
             }
+            setHasOlderMessages(
+              hasOlderMessagesAfterReopen(
+                freshCount,
+                remoteSessionStore.getMessages(sessionId),
+              ),
+            );
           } else {
             remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
             setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));

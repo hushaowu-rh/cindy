@@ -150,6 +150,7 @@ export function incrementalMessagePageNeedsFallback(input: {
     // the client cursor proves this is not a contiguous incremental page.
     return true;
   }
+  if (page.messages.length >= page.limit) return true;
   if (
     typeof totalCount === 'number'
     && Number.isFinite(totalCount)
@@ -159,13 +160,12 @@ export function incrementalMessagePageNeedsFallback(input: {
     const expectedNewRows = totalCount - previousTotalCount;
     return expectedNewRows < 0 || page.messages.length !== expectedNewRows;
   }
-  return page.messages.length >= page.limit;
+  return false;
 }
 
 export interface CompleteIncrementalMessageCollectionInput {
   initialPage: MessagePageRetryResult;
   afterMessage: RemoteMessage;
-  expectedNewRows?: number;
   fetchAfter: (after: string) => Promise<MessagePageRetryResult>;
   fetchLatest: () => Promise<MessagePageRetryResult>;
   fetchBefore: (before: string) => Promise<MessagePageRetryResult>;
@@ -182,13 +182,6 @@ export async function collectCompleteIncrementalMessages(
   input: CompleteIncrementalMessageCollectionInput,
 ): Promise<RemoteMessage[] | null> {
   const maxPages = input.maxPages ?? 256;
-  const rawExpectedNewRows = input.expectedNewRows;
-  if (typeof rawExpectedNewRows === 'number' && (!Number.isFinite(rawExpectedNewRows) || rawExpectedNewRows < 0)) {
-    return null;
-  }
-  const expectedNewRows = typeof rawExpectedNewRows === 'number'
-    ? rawExpectedNewRows
-    : undefined;
   const anchor = input.afterMessage;
   const collected = new Map<string, RemoteMessage>();
   const addRowsAfterAnchor = (rows: readonly RemoteMessage[]): boolean => {
@@ -206,11 +199,6 @@ export async function collectCompleteIncrementalMessages(
   const ordered = (): RemoteMessage[] => [...collected.values()].sort(compareMessageOrder);
   const hasTrimmedRows = (page: MessagePageRetryResult): boolean =>
     page.messages.some((message) => message.agentMeta?.remoteRowsTrimmed === true);
-  const reachedExpectedCount = (): boolean =>
-    expectedNewRows !== undefined && collected.size >= expectedNewRows;
-
-  if (expectedNewRows === 0) return [];
-
   // New hosts support cursor pagination. Every subsequent page must be strictly
   // after the last cursor; otherwise the host is treated as legacy and we switch
   // to the authoritative tail walk below.
@@ -218,11 +206,9 @@ export async function collectCompleteIncrementalMessages(
   let forwardValid = addRowsAfterAnchor(page.messages);
   let cursor = latestMessageCursor(page.messages);
   for (let pageIndex = 0; forwardValid && pageIndex < maxPages; pageIndex += 1) {
-    if (reachedExpectedCount()) return ordered();
     if (!cursor) break;
     if (
-      expectedNewRows === undefined
-      && page.messages.length < page.limit
+      page.messages.length < page.limit
       && !page.reducedByPayloadTooLarge
       && !hasTrimmedRows(page)
     ) return ordered();
@@ -238,14 +224,7 @@ export async function collectCompleteIncrementalMessages(
     page = next;
     cursor = nextCursor;
   }
-  if (forwardValid && reachedExpectedCount()) return ordered();
-  if (
-    forwardValid
-    && expectedNewRows === undefined
-    && page.messages.length < page.limit
-    && !page.reducedByPayloadTooLarge
-    && !hasTrimmedRows(page)
-  ) return ordered();
+  if (forwardValid) return ordered();
 
   // A latest-window fallback must be paged backwards; using only its tail can
   // silently omit the middle of a delta larger than the window size.
@@ -253,28 +232,16 @@ export async function collectCompleteIncrementalMessages(
   page = await input.fetchLatest();
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
     const reachedAnchor = !addRowsAfterAnchor(page.messages);
-    if (reachedAnchor) {
-      return expectedNewRows === undefined || reachedExpectedCount()
-        ? ordered()
-        : null;
-    }
+    if (reachedAnchor) return ordered();
     if (
       page.messages.length < page.limit
       && !page.reducedByPayloadTooLarge
       && !hasTrimmedRows(page)
-    ) {
-      return expectedNewRows === undefined || reachedExpectedCount()
-        ? ordered()
-        : null;
-    }
+    ) return ordered();
     const before = oldestMessageCursor(page.messages);
     if (!before) return null;
     page = await input.fetchBefore(before);
-    if (page.messages.length === 0) {
-      return expectedNewRows === undefined || reachedExpectedCount()
-        ? ordered()
-        : null;
-    }
+    if (page.messages.length === 0) return null;
   }
   return null;
 }

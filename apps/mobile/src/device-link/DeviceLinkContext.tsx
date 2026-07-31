@@ -235,6 +235,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
       remoteResponseEvidenceEpochs,
       deviceId,
       () => sendOpenLinkWithAccessHandling(client, deviceId),
+      { retainSuccessful: true },
     );
   }, []);
 
@@ -603,6 +604,9 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     });
     const offPresence = client.onPresenceChanged((snap) => {
       markPresenceAvailabilityEpoch(presenceAvailabilityEpochsRef.current, snap.deviceId);
+      // presence 变化代表目标链路代际变化(offline / remote-disabled / 恢复都一样):
+      // 上一代成功 link 不能跨代复用,下一次请求必须重新 link-open 确认。
+      openLinkInFlightRef.current.delete(snap.deviceId);
       setLastPresenceSnapshot(snap);
       setPresenceVersion((n) => n + 1);
       const presence = updatePresenceAvailability(

@@ -35,6 +35,8 @@ export interface ActiveController {
 }
 
 const registry = new Map<string, ControllerEntry>();
+/** 当前进程曾成功建立过 link 的控制端；短时断线 push 队列据此按设备隔离补发。 */
+const knownControllerIds = new Set<string>();
 
 /**
  * topic 生命周期监听(fs-watch 档消费:订阅驱动被控端文件 watch 启停)。
@@ -105,6 +107,7 @@ export function subscribe(
 ): void {
   // Empty/fully-filtered subscribe frames must not create a phantom remote viewer.
   if (topics.length === 0) return;
+  knownControllerIds.add(deviceId);
   const e = getOrCreate(deviceId, name);
   if (capabilities) {
     e.capabilities = new Set(capabilities.filter((value) => typeof value === 'string'));
@@ -152,6 +155,7 @@ export function clearAll(): void {
   const held = new Set<StoredTopic>();
   for (const e of registry.values()) for (const t of e.topics) held.add(t);
   registry.clear();
+  knownControllerIds.clear();
   held.delete(LEGACY_TOPIC);
   notifyReleased([...held]);
 }
@@ -163,6 +167,11 @@ export function isEmpty(): boolean {
 /** 当前所有订阅控制端 deviceId(dropAllControllers 逐个 closeLink 用)。 */
 export function getControllerIds(): string[] {
   return [...registry.keys()];
+}
+
+/** 当前进程曾成功建立 link 的控制端；登出/停服务时由 clearAll 一起清空。 */
+export function getKnownControllerIds(): string[] {
+  return [...knownControllerIds];
 }
 
 /** 持有该 topic(或 legacy `'*'`)的控制端 deviceId 列表 —— topic-scoped fan-out 依据。 */
@@ -212,6 +221,7 @@ export function getUpdateRelaunchControllers(): ActiveController[] {
 export const __testing = {
   reset(): void {
     registry.clear();
+    knownControllerIds.clear();
   },
   /** 测试用:查某控制端当前订阅的 topic 集合。 */
   topicsOf(deviceId: string): string[] {

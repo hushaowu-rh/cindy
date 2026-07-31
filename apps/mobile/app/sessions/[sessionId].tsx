@@ -365,6 +365,7 @@ import {
 import {
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
+  latestMessageCursor,
   listMessagesWithPayloadRetry,
   oldestMessageCursor,
   shouldRefreshLatestMessageWindowOnReopen,
@@ -2928,17 +2929,19 @@ export default function SessionScreen() {
           activeSessionSnapshot.activityEpochAtFetchStart,
         );
         if (metaChanged) {
+          const after = latestMessageCursor(storedMessagesAtStart);
           const history = await withTransientRemoteRetry(() =>
             listMessagesWithPayloadRetry(
-              (limit) => maker.listMessages(sessionId, { limit }),
+              (limit) => maker.listMessages(sessionId, { limit, ...(after ? { after } : {}) }),
               REOPEN_MESSAGE_WINDOW_LIMITS,
             ),
           );
           if (syncRun.isStale()) return;
           const historyPage: RemoteMessage[] = Array.isArray(history.messages) ? history.messages : [];
-          remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
+          if (after) remoteSessionStore.mergeMessages(sessionId, historyPage);
+          else remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
           remoteSessionStore.markSessionMessagesSynced(sessionId, sessionMeta);
-          setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
+          if (!after) setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
         } else {
           // 回归修复:没新内容也要补设 hasOlderMessages —— 屏幕重开把该 state 重置为 false,跳过整窗
           // 重拉时若不补设,「加载更早」入口会消失、往上拖刷不出老消息。用服务端总数 vs in-store 已加载

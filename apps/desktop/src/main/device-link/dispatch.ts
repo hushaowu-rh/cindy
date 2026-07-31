@@ -63,6 +63,7 @@ import { transcribeRemoteVoiceInput } from './voiceTranscribe';
 import { adviseAndRecordVoiceInputDictionaryLearning } from '../voice-input/index.js';
 import { readDictionaryProjectionForMobile } from '../voice-input/dictionarySyncDriver.js';
 import { setBroadcastTapListener } from './broadcast-tap';
+import { createOfflinePushQueue } from './offlinePushQueue';
 import * as subscriptions from './subscriptions';
 import { LEGACY_TOPIC, type ActiveController } from './subscriptions';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
@@ -115,6 +116,22 @@ const UPDATE_RELAUNCH_NON_BLOCKING_INVOKE_CHANNELS: ReadonlySet<string> = new Se
   'local-db:sessions:list',
 ]);
 const textEncoder = new TextEncoder();
+const offlinePushQueue = createOfflinePushQueue();
+
+/** 只排队可由 session snapshot 对账、且不携带权限终态的会话域事件。 */
+const OFFLINE_QUEUEABLE_PUSH_CHANNELS: ReadonlySet<string> = new Set([
+  'local-db:messages:created',
+  'local-db:messages:deleted',
+  'local-db:session:error-persisted',
+  'maker:event',
+  'maker:status-changed',
+  'maker:interaction-request',
+  'maker:interaction-dismissed',
+  'maker:input:projection',
+  'maker:goal:status-changed',
+  'usage:message-turn-cost',
+  'usage:message-model-mismatch',
+]);
 
 /** wire 输入 fail-closed：未知形状视为空能力集，并限制数量/长度避免撑大常驻 registry。 */
 function sanitizeControllerCapabilities(value: unknown): string[] {
@@ -506,6 +523,11 @@ function forwardPush(channel: string, payload: unknown): void {
         }
       : payload;
   const dsts = subscriptions.getControllersForTopic(topic);
+  if (dsts.length === 0 && OFFLINE_QUEUEABLE_PUSH_CHANNELS.has(channel)) {
+    for (const dst of subscriptions.getKnownControllerIds()) {
+      offlinePushQueue.enqueue(dst, { channel, payload: remotePayload });
+    }
+  }
   for (const dst of dsts) {
     // 转发是尽力而为的旁路:单个控制端的帧超限(PAYLOAD_TOO_LARGE,如大 tool 输出)/ 连接异常
     // 绝不能冒泡——它会经 tapWindowBroadcast 回到 broadcastToAllWindows,让被控端**本机** renderer
@@ -766,6 +788,9 @@ function handleLinkOpen(
   }
   syncForwarding();
   flushRemoteInvokeResultOutbox(src);
+  for (const queued of offlinePushQueue.drain(src)) {
+    sendPushBestEffort(src, queued.channel, queued.payload);
+  }
   log.info(`control link opened by ${shortId(src)} (${name})`);
 }
 
@@ -1625,6 +1650,11 @@ function handleSubscriptionFrame(src: string, payload: InvokePayload): InvokeRes
   if (isSub && topics.includes('sessions')) {
     notifySessionsSubscribed(src);
   }
+  if (isSub && topics.length > 0) {
+    for (const queued of offlinePushQueue.drain(src)) {
+      sendPushBestEffort(src, queued.channel, queued.payload);
+    }
+  }
   return { ok: true, result: { ok: true } };
 }
 
@@ -1866,6 +1896,7 @@ export const __testing = {
     topicSubscriptionControllers.clear();
     onSessionsSubscribed = null;
     activeClient = null;
+    offlinePushQueue.clear();
     setBroadcastTapListener(null);
   },
   getActiveControllers,

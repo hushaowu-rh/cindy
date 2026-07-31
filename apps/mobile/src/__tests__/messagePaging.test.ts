@@ -3,6 +3,7 @@ import {
   hasMoreOlderMessages,
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
+  latestMessageCursor,
   listMessagesWithPayloadRetry,
   MESSAGE_PAGE_SIZE,
   oldestMessageCursor,
@@ -39,6 +40,14 @@ describe('messagePaging', () => {
       message('m1', '2026-01-01T00:00:01.000Z'),
       message('m2', '2026-01-01T00:00:02.000Z'),
     ])).toBe('m1');
+  });
+
+  it('finds the latest host cursor and skips local system cards', () => {
+    expect(latestMessageCursor([
+      message('m1', '2026-01-01T00:00:01.000Z'),
+      message('mobile-system-context-1', '2026-01-01T00:00:03.000Z'),
+      message('m2', '2026-01-01T00:00:02.000Z'),
+    ])).toBe('m2');
   });
 
   it('returns null when no stable message id exists', () => {

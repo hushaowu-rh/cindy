@@ -365,6 +365,75 @@ describe('presence availability epochs', () => {
     await request;
   });
 
+  it('retains a successful tracked request for link reuse until the owner invalidates it', async () => {
+    const epochs = createPresenceAvailabilityEpochs();
+    const responseEvidenceEpochs = createPresenceAvailabilityEpochs();
+    const tracked = new Map();
+    const create = vi.fn(async () => 'accepted');
+
+    const first = getOrCreatePresenceTrackedRequest(
+      tracked,
+      epochs,
+      responseEvidenceEpochs,
+      'dev-1',
+      create,
+      { retainSuccessful: true },
+    );
+    await expect(first.request).resolves.toBe('accepted');
+    const reused = getOrCreatePresenceTrackedRequest(
+      tracked,
+      epochs,
+      responseEvidenceEpochs,
+      'dev-1',
+      create,
+      { retainSuccessful: true },
+    );
+
+    expect(reused).toBe(first);
+    expect(create).toHaveBeenCalledTimes(1);
+    tracked.delete('dev-1');
+    const reopened = getOrCreatePresenceTrackedRequest(
+      tracked,
+      epochs,
+      responseEvidenceEpochs,
+      'dev-1',
+      create,
+      { retainSuccessful: true },
+    );
+    await reopened.request;
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retain failed requests when successful reuse is enabled', async () => {
+    const epochs = createPresenceAvailabilityEpochs();
+    const responseEvidenceEpochs = createPresenceAvailabilityEpochs();
+    const tracked = new Map();
+    const create = vi.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce('accepted');
+
+    const failed = getOrCreatePresenceTrackedRequest(
+      tracked,
+      epochs,
+      responseEvidenceEpochs,
+      'dev-1',
+      create,
+      { retainSuccessful: true },
+    );
+    await expect(failed.request).rejects.toThrow('offline');
+    await Promise.resolve();
+    const retried = getOrCreatePresenceTrackedRequest(
+      tracked,
+      epochs,
+      responseEvidenceEpochs,
+      'dev-1',
+      create,
+      { retainSuccessful: true },
+    );
+    await expect(retried.request).resolves.toBe('accepted');
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
   it('resets epochs on logout or account change', () => {
     const epochs = createPresenceAvailabilityEpochs();
     markPresenceAvailabilityEpoch(epochs, 'dev-1');

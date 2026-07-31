@@ -3,6 +3,15 @@ import type { RemoteMessage, RemoteSession } from '@/session/types';
 export const MESSAGE_PAGE_SIZE = 80;
 export const MESSAGE_PAGE_RETRY_LIMITS = [80, 40, 20, 10, 5, 1] as const;
 
+export function latestMessageCursor(messages: readonly RemoteMessage[]): string | null {
+  let latest: RemoteMessage | null = null;
+  for (const message of messages) {
+    if (!message.id || message.id.startsWith('mobile-system-')) continue;
+    if (!latest || compareMessageOrder(message, latest) > 0) latest = message;
+  }
+  return latest?.id ?? null;
+}
+
 export function oldestMessageCursor(messages: readonly RemoteMessage[]): string | null {
   let oldest: RemoteMessage | null = null;
   for (const message of messages) {

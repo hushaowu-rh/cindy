@@ -81,7 +81,10 @@ import {
 import { withTransientRemoteRetry } from '@/device-link/remoteRetry';
 import { revokedDevicesStore, useRevokedDevices } from '@/device-link/revokedDevicesStore';
 import { useUnresponsiveDevices } from '@/device-link/unresponsiveDevicesStore';
-import { remoteScheduleEventStore } from '@/scheduler/remoteScheduleEvents';
+import {
+  remoteScheduleEventStore,
+  useRemoteScheduleMirrorInvalidations,
+} from '@/scheduler/remoteScheduleEvents';
 import {
   buildMobileHomePresentation,
   excludeOrcaWorkerSessions,
@@ -120,7 +123,9 @@ import { dataPropsEqual, mapContentEqual } from '@/utils/valueEquality';
 import { useStableValue } from '@/utils/useStableValue';
 import { useMinuteNow } from '@/utils/useMinuteNow';
 import {
+  getScheduleIndexInvalidationVersion,
   invalidateRunningSessionScheduleEntries,
+  invalidateScheduleIndexForDevice,
   loadDeviceSessionScheduleIndex,
   loadSessionScheduleIndexThrottled,
   replaceSessionScheduleIndexEntries,
@@ -252,6 +257,7 @@ export default function HomeScreen() {
     return merged;
   }, [rawDeviceConnectionStates, unresponsiveDevices]);
   const [scheduleIndex, setScheduleIndex] = useState<Map<string, RemoteSessionScheduleInfo>>(() => new Map());
+  const scheduleMirrorInvalidations = useRemoteScheduleMirrorInvalidations();
 
   const updateDeviceConnectionState = useCallback((deviceId: string, state: HomeDeviceConnectionState) => {
     setDeviceConnectionStates((current) => updateHomeDeviceConnectionState(current, deviceId, state));
@@ -268,6 +274,8 @@ export default function HomeScreen() {
     const sessionIds = remoteSessionStore.getSessions()
       .filter((session) => session.deviceLinkDeviceId === deviceId)
       .map((session) => session.id);
+    invalidateScheduleIndexForDevice(deviceId);
+    remoteScheduleEventStore.invalidateDeviceMirror(deviceId);
     remoteSessionStore.markDeviceOffline(deviceId);
     setScheduleIndex((current) => invalidateRunningSessionScheduleEntries(current, sessionIds));
   }, []);
@@ -292,12 +300,14 @@ export default function HomeScreen() {
     // 重放 1+N×listRuns 会拥塞 device-link 管道、拖慢会话打开的关键读(见 scheduleIndex 注释)。
     // force = 已读类权威信号(read / all-read 推送),必须绕过 TTL 立即重拉——否则「看完
     // 返回首页」这个最常见路径永远命中 30s 内的陈旧缓存,未读徽标清不掉(review P1)。
+    const invalidationVersion = getScheduleIndexInvalidationVersion(deviceId);
     void loadSessionScheduleIndexThrottled(
       deviceId,
       () => loadDeviceSessionScheduleIndex(deviceId, invoke),
       { force: options?.force },
     )
       .then((nextIndex) => {
+        if (getScheduleIndexInvalidationVersion(deviceId) !== invalidationVersion) return;
         setScheduleIndex((current) => replaceSessionScheduleIndexEntries(
           current,
           sessionIds,
@@ -417,7 +427,12 @@ export default function HomeScreen() {
       for (const item of deviceRows) {
         const disposition = deviceMirrorCleanupDisposition(item.state);
         if (disposition === 'soft') softInvalidateDeviceMirror(item.device.deviceId);
-        if (disposition === 'hard') remoteSessionStore.removeDevice(item.device.deviceId);
+        if (disposition === 'hard') {
+          invalidateScheduleIndexForDevice(item.device.deviceId);
+          remoteScheduleEventStore.clearDevice(item.device.deviceId);
+          remoteScheduleEventStore.clearDeviceMirrorInvalidation(item.device.deviceId);
+          remoteSessionStore.removeDevice(item.device.deviceId);
+        }
       }
       // 整表对账:REST 全量清单对“设备是否仍绑定”是权威。冷启动从缓存种入、
       // 随后被解绑(完全不在清单里)的设备不会出现在状态分类里,按差集硬清 shard;
@@ -428,7 +443,12 @@ export default function HomeScreen() {
         const shardId = session.deviceLinkDeviceId;
         if (shardId && !knownDeviceIds.has(shardId)) ghostDeviceIds.add(shardId);
       }
-      for (const deviceId of ghostDeviceIds) remoteSessionStore.removeDevice(deviceId);
+      for (const deviceId of ghostDeviceIds) {
+        invalidateScheduleIndexForDevice(deviceId);
+        remoteScheduleEventStore.clearDevice(deviceId);
+        remoteScheduleEventStore.clearDeviceMirrorInvalidation(deviceId);
+        remoteSessionStore.removeDevice(deviceId);
+      }
 
       const failures: string[] = [];
       const offlineDeviceIds = new Set<string>();
@@ -533,6 +553,15 @@ export default function HomeScreen() {
       registry.cancelAll();
     };
   }, []);
+
+  useEffect(() => {
+    if (scheduleMirrorInvalidations.size === 0) return;
+    const invalidatedDeviceIds = new Set(scheduleMirrorInvalidations.keys());
+    const sessionIds = remoteSessionStore.getSessions()
+      .filter((session) => !!session.deviceLinkDeviceId && invalidatedDeviceIds.has(session.deviceLinkDeviceId))
+      .map((session) => session.id);
+    setScheduleIndex((current) => invalidateRunningSessionScheduleEntries(current, sessionIds));
+  }, [scheduleMirrorInvalidations]);
 
   useEffect(() => remoteScheduleEventStore.subscribe(() => {
     const deviceIds = new Set<string>();

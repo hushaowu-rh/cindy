@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { MobileMakerTransport } from '@/device-link/mobileMakerTransport';
 import { unresponsiveDevicesStore } from '@/device-link/unresponsiveDevicesStore';
 import {
+  getScheduleIndexInvalidationVersion,
   invalidateOfflineScheduleIndexFailureFor,
   invalidateRunningSessionScheduleEntries,
+  invalidateScheduleIndexForDevice,
   invalidateTransientScheduleIndexFailures,
   loadSessionScheduleIndex,
   loadSessionScheduleIndexThrottled,
@@ -333,6 +335,34 @@ describe('loadSessionScheduleIndexThrottled (单飞 + TTL 节流)', () => {
     await loadSessionScheduleIndexThrottled('dev-1', load, { now });
     await loadSessionScheduleIndexThrottled('dev-1', load, { now, force: true });
     expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('offline invalidation evicts success cache and increments generation', async () => {
+    resetScheduleIndexThrottleForTesting();
+    const load = vi.fn()
+      .mockResolvedValueOnce(new Map([['s1', { running: true } as RemoteSessionScheduleInfo]]))
+      .mockResolvedValueOnce(new Map([['s1', { running: false } as RemoteSessionScheduleInfo]]));
+    const now = () => 1000;
+    await loadSessionScheduleIndexThrottled('dev-1', load, { now });
+    const before = getScheduleIndexInvalidationVersion('dev-1');
+    invalidateScheduleIndexForDevice('dev-1');
+    expect(getScheduleIndexInvalidationVersion('dev-1')).toBe(before + 1);
+    const next = await loadSessionScheduleIndexThrottled('dev-1', load, { now });
+    expect(next.get('s1')?.running).toBe(false);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('stale in-flight completion cannot repopulate after offline invalidation', async () => {
+    resetScheduleIndexThrottleForTesting();
+    let resolveLoad!: (value: Map<string, RemoteSessionScheduleInfo>) => void;
+    const load = vi.fn(() => new Promise<Map<string, RemoteSessionScheduleInfo>>((resolve) => {
+      resolveLoad = resolve;
+    }));
+    const first = loadSessionScheduleIndexThrottled('dev-1', load);
+    invalidateScheduleIndexForDevice('dev-1');
+    resolveLoad(new Map([['s1', { running: true } as RemoteSessionScheduleInfo]]));
+    await first;
+    expect(getScheduleIndexInvalidationVersion('dev-1')).toBe(1);
   });
 
   it('失败负缓存:reject 后 TTL 内复用同一次失败不重放批次,过期后正常重试', async () => {

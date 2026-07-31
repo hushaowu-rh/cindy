@@ -625,15 +625,27 @@ describe('被控端控制链路生命周期', () => {
     )).toBe(false);
   });
 
-  it('legacy link-close keeps the tap alive for its remembered offline queue', () => {
+  it('link-close clears remembered routing and queued pushes', () => {
     remoteControlEnabled = true;
     const { client, feed } = makeFakeClient();
     wireInboundDispatch(client);
-    feed({ v: 1, kind: 'link-open', id: 'r3', src: 'ctrl-c', payload: { controllerName: 'C', protocolVersion: 1, appVersion: '1' } });
-    expect(getActiveControllers()).toHaveLength(1);
+    feed(subFrame('ctrl-c', SUB, ['session:s1'], 'C'));
+    handleControllerOffline('ctrl-c');
+    tapWindowBroadcast('local-db:messages:created', {
+      sessionId: 's1',
+      id: 'm-before-close',
+    });
+    expect(dispatchTesting.queuedPushesFor('ctrl-c')).toHaveLength(1);
+
     feed({ v: 1, kind: 'link-close', src: 'ctrl-c', payload: { reason: 'user' } });
+    tapWindowBroadcast('local-db:messages:created', {
+      sessionId: 's1',
+      id: 'm-after-close',
+    });
+
     expect(getActiveControllers()).toHaveLength(0);
-    expect(hasBroadcastTapListener()).toBe(true);
+    expect(dispatchTesting.queuedPushesFor('ctrl-c')).toEqual([]);
+    expect(hasBroadcastTapListener()).toBe(false);
   });
 
   it('非订阅 remote invoke 在结果发送前持有更新 busy lease', async () => {

@@ -749,10 +749,13 @@ async function handleFrame(client: DeviceLinkClient, env: Envelope): Promise<voi
     case 'link-close':
       if (!src) return;
       clearRemoteInvokeStateFor(src);
-      topicSubscriptionControllers.delete(src);
-      if (subscriptions.clearController(src)) {
-        syncForwarding();
-      }
+      offlinePushQueue.clear(src);
+      // Keep the protocol-capability marker, but discard all remembered routing.
+      // A modern controller must reconnect and explicitly subscribe; restoring the
+      // legacy wildcard here would silently re-enable broad delivery.
+      subscriptions.clearController(src);
+      subscriptions.forgetKnownController(src);
+      syncForwarding();
       log.info(`control link closed by ${shortId(src)}`);
       return;
     case 'invoke':

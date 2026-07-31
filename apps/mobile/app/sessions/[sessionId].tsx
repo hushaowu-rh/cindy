@@ -366,6 +366,7 @@ import {
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
   incrementalMessagePageNeedsFallback,
+  collectCompleteIncrementalMessages,
   latestMessageCursor,
   listMessagesWithPayloadRetry,
   oldestMessageCursor,
@@ -2950,23 +2951,51 @@ export default function SessionScreen() {
               previousTotalCount: previousCount,
               afterMessage,
             })) {
-              // Older Desktop hosts ignore `after`; a capped/reduced new-host page is likewise
-              // incomplete. One non-incremental tail fetch is finite and authoritative for both.
-              const authoritative = await withTransientRemoteRetry(() =>
-                listMessagesWithPayloadRetry(
-                  (limit) => maker.listMessages(sessionId, { limit }),
-                  REOPEN_MESSAGE_WINDOW_LIMITS,
-                ),
-              );
-              remoteSessionStore.setLatestMessageWindow(sessionId, authoritative.messages);
-              setHasOlderMessages(
-                typeof freshCount === 'number'
-                  ? hasOlderMessagesAfterReopen(
-                      freshCount,
-                      remoteSessionStore.getMessages(sessionId),
-                    )
-                  : shouldKeepOlderMessagesAffordance(authoritative),
-              );
+              // Older Desktop hosts may ignore `after`; a single latest-tail fallback
+              // cannot prove a large delta complete because it can skip the middle.
+              const completeDelta = afterMessage
+                ? await collectCompleteIncrementalMessages({
+                    initialPage: history,
+                    afterMessage,
+                    expectedNewRows:
+                      typeof freshCount === 'number' && typeof previousCount === 'number'
+                        ? freshCount - previousCount
+                        : undefined,
+                    fetchAfter: async (cursor) => withTransientRemoteRetry(() =>
+                      listMessagesWithPayloadRetry(
+                        (limit) => maker.listMessages(sessionId, { limit, after: cursor }),
+                        REOPEN_MESSAGE_WINDOW_LIMITS,
+                      ),
+                    ),
+                    fetchLatest: async () => withTransientRemoteRetry(() =>
+                      listMessagesWithPayloadRetry(
+                        (limit) => maker.listMessages(sessionId, { limit }),
+                        REOPEN_MESSAGE_WINDOW_LIMITS,
+                      ),
+                    ),
+                    fetchBefore: async (cursor) => withTransientRemoteRetry(() =>
+                      listMessagesWithPayloadRetry(
+                        (limit) => maker.listMessages(sessionId, { limit, before: cursor }),
+                        REOPEN_MESSAGE_WINDOW_LIMITS,
+                      ),
+                    ),
+                    maxPages: 256,
+                  })
+                : null;
+              if (completeDelta) {
+                remoteSessionStore.mergeMessages(sessionId, completeDelta);
+                setHasOlderMessages(
+                  hasOlderMessagesAfterReopen(
+                    freshCount,
+                    remoteSessionStore.getMessages(sessionId),
+                  ),
+                );
+              } else {
+                // No bounded request sequence proved completeness. Keep the existing
+                // cache and leave the window unsynced so a later reopen retries safely.
+                setHasOlderMessages(true);
+                return;
+              }
             } else {
               setHasOlderMessages(hasOlderMessagesAfterReopen(freshCount, mergedMessages));
             }

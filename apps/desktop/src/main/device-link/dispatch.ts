@@ -693,6 +693,7 @@ export function dropAllControllers(
   clearAllRemoteInvokeState();
   subscriptions.clearAll();
   topicSubscriptionControllers.clear();
+  offlinePushQueue.clear();
   syncForwarding();
 }
 

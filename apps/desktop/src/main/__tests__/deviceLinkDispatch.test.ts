@@ -513,6 +513,24 @@ describe('被控端控制链路生命周期', () => {
     expect(hasBroadcastTapListener()).toBe(false);
   });
 
+  it('显式 dropAll 清理断线期间已排队的 push', () => {
+    remoteControlEnabled = true;
+    const { client, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    feed(subFrame('ctrl-drop-queue', SUB, ['session:s1']));
+    handleControllerOffline('ctrl-drop-queue');
+    tapWindowBroadcast('local-db:messages:created', {
+      sessionId: 's1',
+      id: 'm-stale',
+    });
+    expect(dispatchTesting.queuedPushesFor('ctrl-drop-queue')).toHaveLength(1);
+
+    dropAllControllers(client, 'toggle-off');
+
+    expect(dispatchTesting.queuedPushesFor('ctrl-drop-queue')).toEqual([]);
+    expect(hasBroadcastTapListener()).toBe(false);
+  });
+
   it('link-open capability controls whether provider projection includes new logo kinds', async () => {
     const { client, feed } = makeFakeClient();
     wireInboundDispatch(client);

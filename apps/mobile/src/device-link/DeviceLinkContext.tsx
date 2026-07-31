@@ -430,6 +430,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                 // 不伪造 presence=true,后续权威 false delta 仍可照常过滤并重新计时。
                 clearOnePresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
                 remoteScheduleEventStore.clearDeviceMirrorInvalidation(deviceId);
+                invalidateOfflineScheduleIndexFailureFor(deviceId);
               },
               onDeviceRemoteDisabled: (deviceId) => {
                 // 被控端实时设置已明确关闭远控:这是当前 epoch 的权威终态,

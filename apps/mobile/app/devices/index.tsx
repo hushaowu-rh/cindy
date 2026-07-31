@@ -124,6 +124,7 @@ import { useStableValue } from '@/utils/useStableValue';
 import { useMinuteNow } from '@/utils/useMinuteNow';
 import {
   getScheduleIndexInvalidationVersion,
+  invalidateOfflineScheduleIndexFailureFor,
   invalidateRunningSessionScheduleEntries,
   invalidateScheduleIndexForDevice,
   loadDeviceSessionScheduleIndex,
@@ -462,6 +463,7 @@ export default function HomeScreen() {
           // presence was not replayed on this connection. Retire any prior offline marker
           // so unrelated device invalidations cannot re-clear this device's running badges.
           remoteScheduleEventStore.clearDeviceMirrorInvalidation(item.device.deviceId);
+          invalidateOfflineScheduleIndexFailureFor(item.device.deviceId);
         }
       }));
 

@@ -69,6 +69,30 @@ describe('subscriptions topic lifecycle listeners', () => {
     expect(new Set(releasedTopics)).toEqual(new Set(['fs-watch:/w1', 'fs-watch:/w2', 'sessions']));
   });
 
+  it('retains topic routing across ordinary disconnect and forgets it on revocation', () => {
+    subscriptions.subscribe('c1', ['sessions', 'session:s1']);
+    subscriptions.subscribe('c2', ['session:s2']);
+    subscriptions.clearController('c1');
+
+    expect(subscriptions.getKnownControllersForTopic('sessions')).toEqual(['c1']);
+    expect(subscriptions.getKnownControllersForTopic('session:s1')).toEqual(['c1']);
+    expect(subscriptions.getKnownControllersForTopic('session:s2')).toEqual(['c2']);
+
+    subscriptions.forgetKnownController('c1');
+    expect(subscriptions.getKnownControllerIds()).toEqual(['c2']);
+    expect(subscriptions.getKnownControllersForTopic('sessions')).toEqual([]);
+    expect(subscriptions.getKnownControllersForTopic('session:s1')).toEqual([]);
+  });
+
+  it('explicit unsubscribe removes remembered topics from offline routing', () => {
+    subscriptions.subscribe('c1', ['sessions', 'session:s1']);
+    subscriptions.unsubscribe('c1', ['session:s1']);
+    subscriptions.clearController('c1');
+
+    expect(subscriptions.getKnownControllersForTopic('sessions')).toEqual(['c1']);
+    expect(subscriptions.getKnownControllersForTopic('session:s1')).toEqual([]);
+  });
+
   it('listener exceptions never break subscription bookkeeping', () => {
     subscriptions.setTopicsReleasedListener(() => {
       throw new Error('boom');

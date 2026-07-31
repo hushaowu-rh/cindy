@@ -134,8 +134,43 @@ export function isPayloadTooLargeError(error: unknown): boolean {
   return code === 'PAYLOAD_TOO_LARGE' || message.includes('PAYLOAD_TOO_LARGE') || /frame exceeds \d+ bytes/i.test(message);
 }
 
-function compareMessageOrder(a: RemoteMessage, b: RemoteMessage): number {
+export function incrementalMessagePageNeedsFallback(input: {
+  page: MessagePageRetryResult;
+  totalCount?: number;
+  previousTotalCount?: number;
+  afterMessage?: RemoteMessage | null;
+}): boolean {
+  const { page, totalCount, previousTotalCount, afterMessage } = input;
+  if (page.reducedByPayloadTooLarge) return true;
+  if (
+    afterMessage
+    && page.messages.some((message) => compareMessageOrder(message, afterMessage) <= 0)
+  ) {
+    // An old host may ignore `after` and return the latest page. A row at or before
+    // the client cursor proves this is not a contiguous incremental page.
+    return true;
+  }
+  if (
+    typeof totalCount === 'number'
+    && Number.isFinite(totalCount)
+    && typeof previousTotalCount === 'number'
+    && Number.isFinite(previousTotalCount)
+  ) {
+    const expectedNewRows = totalCount - previousTotalCount;
+    return expectedNewRows < 0 || page.messages.length !== expectedNewRows;
+  }
+  return page.messages.length >= page.limit;
+}
+
+export function compareMessageOrder(a: RemoteMessage, b: RemoteMessage): number {
   const byTime = a.createdAt.localeCompare(b.createdAt);
   if (byTime !== 0) return byTime;
+  if (
+    typeof a.rowid === 'number'
+    && Number.isFinite(a.rowid)
+    && typeof b.rowid === 'number'
+    && Number.isFinite(b.rowid)
+    && a.rowid !== b.rowid
+  ) return a.rowid - b.rowid;
   return (a.id || a.clientId).localeCompare(b.id || b.clientId);
 }

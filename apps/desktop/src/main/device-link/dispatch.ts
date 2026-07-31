@@ -523,9 +523,16 @@ function forwardPush(channel: string, payload: unknown): void {
         }
       : payload;
   const dsts = subscriptions.getControllersForTopic(topic);
-  if (dsts.length === 0 && OFFLINE_QUEUEABLE_PUSH_CHANNELS.has(channel)) {
-    for (const dst of subscriptions.getKnownControllerIds()) {
-      offlinePushQueue.enqueue(dst, { channel, payload: remotePayload });
+  const offlineTargets = subscriptions
+    .getKnownControllersForTopic(topic)
+    .filter((dst) => !dsts.includes(dst));
+  for (const dst of offlineTargets) {
+    if (OFFLINE_QUEUEABLE_PUSH_CHANNELS.has(channel)) {
+      offlinePushQueue.enqueue(dst, {
+        channel,
+        payload: remotePayload,
+        topic,
+      });
     }
   }
   for (const dst of dsts) {
@@ -702,6 +709,14 @@ export function forgetControllerInvokeState(deviceId: string): void {
   clearRemoteInvokeStateFor(deviceId);
 }
 
+/** 显式撤销时清理短时离线队列与 remembered topic，避免恢复后重放撤权期间数据。 */
+export function purgeRevokedController(deviceId: string): void {
+  offlinePushQueue.clear(deviceId);
+  subscriptions.forgetKnownController(deviceId);
+  topicSubscriptionControllers.delete(deviceId);
+  syncForwarding();
+}
+
 /**
  * 接线被控端隧道。在 device-link host init 时调用一次。
  * 返回 unsubscribe(测试/重置用)。
@@ -765,6 +780,7 @@ function handleLinkOpen(
   // (legacy openLink 仍会超时,但控制端据此 link-close 标记「已撤销」),不接受其 link-open。
   if (isControllerRevoked(src)) {
     log.warn(`link-open from ${shortId(src)} rejected: access revoked`);
+    purgeRevokedController(src);
     client.closeLink(src, 'revoked');
     return;
   }
@@ -775,6 +791,7 @@ function handleLinkOpen(
   // 老控制端无 subscribe 能力:link-open 视作订阅 legacy '*'(全量转发 + 横幅),向后兼容。
   // 已在当前 link 上证明支持 topic 的客户端可能重复 open;不能重新装回兼容 wildcard。
   const capabilities = sanitizeControllerCapabilities(payload?.capabilities);
+  const rememberedModernTopics = subscriptions.hasRememberedModernTopics(src);
   // 先确认 link-accept 已经进入 socket/可靠层，再提交本地订阅状态。弱网背压下
   // accept 发送失败时不能留下“控制端未连上、被控端却显示已受控”的幽灵订阅。
   client.sendLinkAccept(src, requestId, {
@@ -784,12 +801,14 @@ function handleLinkOpen(
   if (topicSubscriptionControllers.has(src)) {
     subscriptions.updateControllerMetadata(src, name, capabilities);
   } else {
-    subscriptions.subscribe(src, [LEGACY_TOPIC], name, capabilities);
+    subscriptions.subscribe(src, rememberedModernTopics ? [] : [LEGACY_TOPIC], name, capabilities);
   }
   syncForwarding();
   flushRemoteInvokeResultOutbox(src);
-  for (const queued of offlinePushQueue.drain(src)) {
-    sendPushBestEffort(src, queued.channel, queued.payload);
+  if (!rememberedModernTopics) {
+    for (const queued of offlinePushQueue.drain(src, [LEGACY_TOPIC])) {
+      sendPushBestEffort(src, queued.channel, queued.payload);
+    }
   }
   log.info(`control link opened by ${shortId(src)} (${name})`);
 }
@@ -1638,10 +1657,11 @@ function handleSubscriptionFrame(src: string, payload: InvokePayload): InvokeRes
     // until disconnect. Empty/fully-filtered frames leave legacy compatibility intact.
     // Add the modern topics first so replacing the last legacy topic does not discard the
     // controller metadata (including negotiated capabilities) with the registry entry.
+    const hadLegacyTopic = subscriptions.controllerHasTopic(src, LEGACY_TOPIC);
     subscriptions.subscribe(src, topics, name, optionalControllerCapabilities(o));
     if (topics.length > 0) {
       topicSubscriptionControllers.add(src);
-      subscriptions.unsubscribe(src, [LEGACY_TOPIC]);
+      if (hadLegacyTopic) subscriptions.unsubscribe(src, [LEGACY_TOPIC]);
     }
   } else {
     subscriptions.unsubscribe(src, topics);
@@ -1651,7 +1671,7 @@ function handleSubscriptionFrame(src: string, payload: InvokePayload): InvokeRes
     notifySessionsSubscribed(src);
   }
   if (isSub && topics.length > 0) {
-    for (const queued of offlinePushQueue.drain(src)) {
+    for (const queued of offlinePushQueue.drain(src, topics)) {
       sendPushBestEffort(src, queued.channel, queued.payload);
     }
   }
@@ -1914,6 +1934,12 @@ export const __testing = {
   remoteInvokeResultOutboxSize: () => remoteInvokeResultOutbox.size,
   flushRemoteInvokeResultOutbox,
   forwardPush,
+  queuedPushesFor(deviceId: string) {
+    return offlinePushQueue.snapshot(deviceId);
+  },
+  handleLinkOpen,
+  handleSubscriptionFrame,
+  purgeRevokedController,
   setActiveClient(c: DeviceLinkClient | null): void {
     activeClient = c;
   },

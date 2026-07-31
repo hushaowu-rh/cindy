@@ -1725,6 +1725,8 @@ describe('被控端订阅 registry + topic 转发', () => {
         appVersion: '1.0.0',
       },
     });
+    expect(getUpdateRelaunchControllers()).toEqual([]);
+    feed(subFrame('ctrl-modern', SUB, ['session:s1'], 'Modern reconnect'));
     expect(getUpdateRelaunchControllers()).toEqual([
       { deviceId: 'ctrl-modern', name: 'Modern reconnect' },
     ]);

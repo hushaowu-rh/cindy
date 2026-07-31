@@ -132,6 +132,19 @@ function pending(kind: string, requestId?: string, persistId?: string): PendingI
 describe('remoteSessionStore', () => {
   beforeEach(() => remoteSessionStore.clear());
 
+  it('normalizes same-timestamp messages by host rowid', () => {
+    const createdAt = '2026-01-01T00:00:00.000Z';
+    remoteSessionStore.setMessages('s1', [
+      { ...message('a-newer', 's1'), createdAt, rowid: 5 },
+      { ...message('z-older', 's1'), createdAt, rowid: 4 },
+    ]);
+
+    expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
+      'z-older',
+      'a-newer',
+    ]);
+  });
+
   it('stamps sessions with device-link origin and indexes session ids', () => {
     remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
 

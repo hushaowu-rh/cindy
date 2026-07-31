@@ -365,6 +365,7 @@ import {
 import {
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
+  incrementalMessagePageNeedsFallback,
   latestMessageCursor,
   listMessagesWithPayloadRetry,
   oldestMessageCursor,
@@ -2938,10 +2939,42 @@ export default function SessionScreen() {
           );
           if (syncRun.isStale()) return;
           const historyPage: RemoteMessage[] = Array.isArray(history.messages) ? history.messages : [];
-          if (after) remoteSessionStore.mergeMessages(sessionId, historyPage);
-          else remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
+          if (after) {
+            remoteSessionStore.mergeMessages(sessionId, historyPage);
+            const mergedMessages = remoteSessionStore.getMessages(sessionId);
+            const previousCount = storedSessionAtStart?._count?.messages;
+            const afterMessage = storedMessagesAtStart.find((message) => message.id === after) ?? null;
+            if (incrementalMessagePageNeedsFallback({
+              page: history,
+              totalCount: freshCount,
+              previousTotalCount: previousCount,
+              afterMessage,
+            })) {
+              // Older Desktop hosts ignore `after`; a capped/reduced new-host page is likewise
+              // incomplete. One non-incremental tail fetch is finite and authoritative for both.
+              const authoritative = await withTransientRemoteRetry(() =>
+                listMessagesWithPayloadRetry(
+                  (limit) => maker.listMessages(sessionId, { limit }),
+                  REOPEN_MESSAGE_WINDOW_LIMITS,
+                ),
+              );
+              remoteSessionStore.setLatestMessageWindow(sessionId, authoritative.messages);
+              setHasOlderMessages(
+                typeof freshCount === 'number'
+                  ? hasOlderMessagesAfterReopen(
+                      freshCount,
+                      remoteSessionStore.getMessages(sessionId),
+                    )
+                  : shouldKeepOlderMessagesAffordance(authoritative),
+              );
+            } else {
+              setHasOlderMessages(hasOlderMessagesAfterReopen(freshCount, mergedMessages));
+            }
+          } else {
+            remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
+            setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
+          }
           remoteSessionStore.markSessionMessagesSynced(sessionId, sessionMeta);
-          if (!after) setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
         } else {
           // 回归修复:没新内容也要补设 hasOlderMessages —— 屏幕重开把该 state 重置为 false,跳过整窗
           // 重拉时若不补设,「加载更早」入口会消失、往上拖刷不出老消息。用服务端总数 vs in-store 已加载

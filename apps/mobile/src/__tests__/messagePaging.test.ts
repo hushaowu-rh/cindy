@@ -3,6 +3,7 @@ import {
   hasMoreOlderMessages,
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
+  incrementalMessagePageNeedsFallback,
   latestMessageCursor,
   listMessagesWithPayloadRetry,
   MESSAGE_PAGE_SIZE,
@@ -48,6 +49,14 @@ describe('messagePaging', () => {
       message('mobile-system-context-1', '2026-01-01T00:00:03.000Z'),
       message('m2', '2026-01-01T00:00:02.000Z'),
     ])).toBe('m2');
+  });
+
+  it('uses the host rowid to choose a same-timestamp cursor', () => {
+    const createdAt = '2026-01-01T00:00:01.000Z';
+    expect(latestMessageCursor([
+      { ...message('z-older', createdAt), rowid: 4 },
+      { ...message('a-newer', createdAt), rowid: 5 },
+    ])).toBe('a-newer');
   });
 
   it('returns null when no stable message id exists', () => {
@@ -120,6 +129,87 @@ describe('messagePaging', () => {
       limit: 1,
       reducedByPayloadTooLarge: true,
     })).toBe(false);
+  });
+
+  describe('incrementalMessagePageNeedsFallback', () => {
+    const page = {
+      messages: [message('m2', '2026-01-01T00:00:02.000Z')],
+      limit: 20,
+      reducedByPayloadTooLarge: false,
+    };
+
+    it('accepts a complete page when the fresh count delta matches it', () => {
+      expect(incrementalMessagePageNeedsFallback({
+        page,
+        totalCount: 2,
+        previousTotalCount: 1,
+      })).toBe(false);
+    });
+
+    it('falls back when the fresh count delta is larger than the returned page', () => {
+      expect(incrementalMessagePageNeedsFallback({
+        page,
+        totalCount: 3,
+        previousTotalCount: 1,
+      })).toBe(true);
+    });
+
+    it('falls back when the fresh count regresses', () => {
+      expect(incrementalMessagePageNeedsFallback({
+        page,
+        totalCount: 1,
+        previousTotalCount: 2,
+      })).toBe(true);
+    });
+
+    it('falls back when an older host ignores the after cursor', () => {
+      expect(incrementalMessagePageNeedsFallback({
+        page: {
+          ...page,
+          messages: [
+            message('m1', '2026-01-01T00:00:01.000Z'),
+            message('m2', '2026-01-01T00:00:02.000Z'),
+          ],
+        },
+        afterMessage: message('m1', '2026-01-01T00:00:01.000Z'),
+      })).toBe(true);
+    });
+
+    it('uses rowid when checking an incremental cursor with equal timestamps', () => {
+      const createdAt = '2026-01-01T00:00:01.000Z';
+      expect(incrementalMessagePageNeedsFallback({
+        page: {
+          ...page,
+          messages: [{ ...message('m2', createdAt), rowid: 5 }],
+        },
+        afterMessage: { ...message('m1', createdAt), rowid: 4 },
+      })).toBe(false);
+      expect(incrementalMessagePageNeedsFallback({
+        page: {
+          ...page,
+          messages: [{ ...message('m0', createdAt), rowid: 3 }],
+        },
+        afterMessage: { ...message('m1', createdAt), rowid: 4 },
+      })).toBe(true);
+    });
+
+    it('falls back for a full or payload-reduced page when the total is unknown', () => {
+      const fullPage = {
+        messages: Array.from({ length: 20 }, (_, index) =>
+          message(`m${index}`, `2026-01-01T00:00:${String(index).padStart(2, '0')}.000Z`)),
+        limit: 20,
+        reducedByPayloadTooLarge: false,
+      };
+      expect(incrementalMessagePageNeedsFallback({
+        page: fullPage,
+      })).toBe(true);
+      expect(incrementalMessagePageNeedsFallback({
+        page: { ...page, reducedByPayloadTooLarge: true },
+      })).toBe(true);
+      expect(incrementalMessagePageNeedsFallback({
+        page,
+      })).toBe(false);
+    });
   });
 
   describe('shouldRefreshLatestMessageWindowOnReopen', () => {

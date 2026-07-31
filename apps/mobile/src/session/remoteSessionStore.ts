@@ -22,6 +22,7 @@ import { cacheSessionMessages, getCachedSessionMessages } from '@/session/mobile
 import { contentToPreview } from '@/utils/contentPreview';
 import type { MobileSystemCardType } from '@/session/systemCard';
 import type { InputProjection, PendingInteraction, RemoteMessage, RemoteSession } from '@/session/types';
+import { compareMessageOrder } from '@/session/messagePaging';
 import { normalizeRemoteMoney } from '@/session/remoteMoney';
 
 interface DeviceShard {
@@ -329,7 +330,7 @@ function preserveSessionRuntimeFields(fresh: RemoteSession, local: RemoteSession
 }
 
 function normalizeMessages(list: readonly RemoteMessage[]): RemoteMessage[] {
-  return [...list].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return [...list].sort(compareMessageOrder);
 }
 
 function messageKey(message: RemoteMessage): string {

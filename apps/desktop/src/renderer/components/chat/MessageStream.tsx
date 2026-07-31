@@ -190,6 +190,7 @@ import {
 } from './viewportFillDetect';
 import {
   resolveNearBottomOnScroll,
+  resolveLastUserMessageObservation,
   resolveRenderPinDecision,
   shouldUnpinOnUpIntent,
   shouldUnpinOnWheel,
@@ -3018,14 +3019,19 @@ export function MessageStream({
     const lastItem = visibleRenderItems[visibleRenderItems.length - 1];
     const lastUserMsg =
       lastItem?.type === 'message' && lastItem.message.role === 'user' ? lastItem.message : null;
-    const isNewUserSend = lastUserMsg !== null && lastUserMsg.clientId !== lastUserMsgIdRef.current;
+    const userMessageObservation = resolveLastUserMessageObservation({
+      restoring: restoringRef.current,
+      tailUserMessageId: lastUserMsg?.clientId ?? null,
+      previousTailUserMessageId: lastUserMsgIdRef.current,
+    });
+    lastUserMsgIdRef.current = userMessageObservation.baselineUserMessageId;
     const decision = resolveRenderPinDecision({
       restoring: restoringRef.current,
-      newUserSend: isNewUserSend,
+      newUserSend: userMessageObservation.isNewUserSend,
       nearBottom: isNearBottomRef.current,
     });
 
-    if (isNewUserSend && lastUserMsg) {
+    if (userMessageObservation.isNewUserSend && lastUserMsg) {
       lastUserMsgIdRef.current = lastUserMsg.clientId;
     }
     if (decision.clearRestoring) {

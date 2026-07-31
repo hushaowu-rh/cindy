@@ -100,6 +100,44 @@ export interface ResolveRenderPinDecision {
   pinToBottom: boolean;
 }
 
+export interface ResolveLastUserMessageObservationArgs {
+  /** A saved non-bottom viewport is currently being restored. */
+  restoring: boolean;
+  /** The current render's tail user message, if any. */
+  tailUserMessageId: string | null;
+  /** The last tail user message already observed by the mounted stream. */
+  previousTailUserMessageId: string | null;
+}
+
+export interface ResolveLastUserMessageObservation {
+  /** Baseline to store after observing the current render. */
+  baselineUserMessageId: string | null;
+  /** Whether the current tail user message is a newly sent message. */
+  isNewUserSend: boolean;
+}
+
+/**
+ * Distinguish restored history hydration from a user send at the tail.
+ *
+ * A restored stream can mount before its first history batch arrives. If that
+ * batch ends in a user message, it must establish the baseline rather than
+ * taking ownership from the restored viewport as a new send.
+ */
+export function resolveLastUserMessageObservation({
+  restoring,
+  tailUserMessageId,
+  previousTailUserMessageId,
+}: ResolveLastUserMessageObservationArgs): ResolveLastUserMessageObservation {
+  const baselineUserMessageId =
+    restoring && previousTailUserMessageId === null && tailUserMessageId !== null
+      ? tailUserMessageId
+      : previousTailUserMessageId;
+  return {
+    baselineUserMessageId,
+    isNewUserSend: tailUserMessageId !== null && tailUserMessageId !== baselineUserMessageId,
+  };
+}
+
 /**
  * Resolve the render-time priority between a saved history anchor and auto-follow.
  * Reopening a session must preserve a real reading position, but a user message

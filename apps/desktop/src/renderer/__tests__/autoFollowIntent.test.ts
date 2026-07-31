@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  resolveLastUserMessageObservation,
   resolveNearBottomOnScroll,
   resolveRenderPinDecision,
   shouldUnpinOnUpIntent,
@@ -195,5 +196,33 @@ describe('resolveRenderPinDecision', () => {
       newUserSend: false,
       nearBottom: false,
     })).toEqual({ clearRestoring: false, pinToBottom: false });
+  });
+});
+
+describe('resolveLastUserMessageObservation', () => {
+  it('seeds a restored user tail hydrated after mount without treating it as a send', () => {
+    expect(
+      resolveLastUserMessageObservation({
+        restoring: true,
+        tailUserMessageId: 'historical-user',
+        previousTailUserMessageId: null,
+      }),
+    ).toEqual({
+      baselineUserMessageId: 'historical-user',
+      isNewUserSend: false,
+    });
+  });
+
+  it('still detects a later user send after the restored baseline', () => {
+    expect(
+      resolveLastUserMessageObservation({
+        restoring: true,
+        tailUserMessageId: 'new-user',
+        previousTailUserMessageId: 'historical-user',
+      }),
+    ).toEqual({
+      baselineUserMessageId: 'historical-user',
+      isNewUserSend: true,
+    });
   });
 });

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createRemoteSyncCoordinator, createRemoteSyncRunner } from '@/device-link/remoteSyncTask';
 
@@ -11,6 +13,10 @@ function deferred() {
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function readSessionScreenSource(): string {
+  return readFileSync(resolve(process.cwd(), 'app/sessions/[sessionId].tsx'), 'utf8').replace(/\r\n/g, '\n');
 }
 
 describe('remote sync task runner', () => {
@@ -157,5 +163,30 @@ describe('remote sync coordinator', () => {
 
     await expect(task).rejects.toThrow('first failed');
     expect(runs).toEqual([['first'], ['follow-up']]);
+  });
+
+  it('clears loading when a queued sync is blocked for a newly-created session', () => {
+    const source = readSessionScreenSource();
+    expect(source).toContain(
+      'if (shouldBlockSessionSync(sessionId)) {\n      if (!syncRun.isStale()) setLoading(false);\n      return;\n    }',
+    );
+  });
+
+  it('resets loading when the reused screen switches sessions', () => {
+    const source = readSessionScreenSource();
+    expect(source).toContain(
+      'setRewindState({ kind: \'idle\' });\n    setMessageActionBusy(null);\n    setLoading(false);',
+    );
+  });
+
+  it('applies coordinator context changes after render commits', () => {
+    const source = readFileSync(
+      resolve(process.cwd(), 'src/device-link/remoteSyncTask.ts'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
+    expect(source).toContain(
+      'useLayoutEffect(() => {\n    coordinatorRef.current?.setContext(contextKey);\n  }, [contextKey]);',
+    );
+    expect(source).not.toContain('coordinatorRef.current.setContext(contextKey);');
   });
 });

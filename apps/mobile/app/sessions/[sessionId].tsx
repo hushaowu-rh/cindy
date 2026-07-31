@@ -1054,7 +1054,7 @@ export default function SessionScreen() {
   const [controlBusy, setControlBusy] = useState(false);
   const [messageActionBusy, setMessageActionBusy] = useState<string | null>(null);
   const [rewindState, setRewindState] = useState<RewindPreviewState>({ kind: 'idle' });
-  // 切 session 时同步(render 阶段)重置回撤确认框 / busy 态并递增「请求代际」。SessionScreen 切
+  // 切 session 时同步(render 阶段)重置回撤确认框 / busy / loading 态并递增「请求代际」。SessionScreen 切
   // session 复用实例、不 remount,这些本地 UI state 不会自动重置,残留会让确认框跨 session 出现且
   // 无法自愈(messageActionBusy 残留还会置灰目标 session 的消息操作栏)。用 React 官方「prop 变化时
   // 调整 state」的 render 阶段模式而非 useEffect:同步生效,既无切换首帧的残留闪帧,也不留「路由已切、
@@ -1065,6 +1065,7 @@ export default function SessionScreen() {
     setPrevRewindSessionId(sessionId);
     setRewindState({ kind: 'idle' });
     setMessageActionBusy(null);
+    setLoading(false);
     rewindRequestSeqRef.current += 1;
   }
   const [contextLoading, setContextLoading] = useState(false);
@@ -2796,7 +2797,10 @@ export default function SessionScreen() {
     // 新建会话乐观管线在途(running / create-failed):被控端可能还没有这个会话,
     // getSession 会 NOT_FOUND 报错横幅。统一在这里挡掉全部 load 触发点;管线完成
     // (task 移除)后由下方 effect 触发一轮真正的同步。
-    if (shouldBlockSessionSync(sessionId)) return;
+    if (shouldBlockSessionSync(sessionId)) {
+      if (!syncRun.isStale()) setLoading(false);
+      return;
+    }
     // 已读回执门槛的 epoch 必须在 sync **开始**时捕获:重连时 connectionEpoch 先行推进,
     // 旧连接代的 in-flight load 若在尾部读 ref 的最新值,会把旧窗口数据标成新代已同步,
     // 抢在排队的 resync 之前放行回执。开始时捕获则旧 load 落的是旧代 key,门槛不放行。

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 
 export interface RemoteSyncRunner {
   run(): Promise<void>;
@@ -154,7 +154,9 @@ export function useRemoteSyncCoordinator(
   taskRef.current = task;
   const coordinatorRef = useRef<RemoteSyncCoordinator | null>(null);
   coordinatorRef.current ??= createRemoteSyncCoordinator((run) => taskRef.current(run));
-  coordinatorRef.current.setContext(contextKey);
+  useLayoutEffect(() => {
+    coordinatorRef.current?.setContext(contextKey);
+  }, [contextKey]);
 
   return useCallback(
     (request: RemoteSyncRequest) => coordinatorRef.current?.request(request) ?? Promise.resolve(),

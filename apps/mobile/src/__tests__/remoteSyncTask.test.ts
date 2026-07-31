@@ -179,13 +179,16 @@ describe('remote sync coordinator', () => {
     );
   });
 
-  it('applies coordinator context changes after render commits', () => {
+  it('applies coordinator context and task changes after render commits', () => {
     const source = readFileSync(
       resolve(process.cwd(), 'src/device-link/remoteSyncTask.ts'),
       'utf8',
     ).replace(/\r\n/g, '\n');
     expect(source).toContain(
-      'useLayoutEffect(() => {\n    coordinatorRef.current?.setContext(contextKey);\n  }, [contextKey]);',
+      'useLayoutEffect(() => {\n    taskRef.current = task;\n    coordinatorRef.current?.setContext(contextKey);\n  }, [contextKey, task]);',
+    );
+    expect(source).not.toContain(
+      '  taskRef.current = task;\n  const coordinatorRef =',
     );
     expect(source).not.toContain('coordinatorRef.current.setContext(contextKey);');
   });

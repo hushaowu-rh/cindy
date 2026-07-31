@@ -151,12 +151,12 @@ export function useRemoteSyncCoordinator(
   contextKey: string,
 ): (request: RemoteSyncRequest) => Promise<void> {
   const taskRef = useRef(task);
-  taskRef.current = task;
   const coordinatorRef = useRef<RemoteSyncCoordinator | null>(null);
   coordinatorRef.current ??= createRemoteSyncCoordinator((run) => taskRef.current(run));
   useLayoutEffect(() => {
+    taskRef.current = task;
     coordinatorRef.current?.setContext(contextKey);
-  }, [contextKey]);
+  }, [contextKey, task]);
 
   return useCallback(
     (request: RemoteSyncRequest) => coordinatorRef.current?.request(request) ?? Promise.resolve(),

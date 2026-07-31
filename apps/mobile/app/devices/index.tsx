@@ -455,7 +455,14 @@ export default function HomeScreen() {
       await Promise.all(availableRows.map(async (item) => {
         const result = await hydrateDeviceSessions(item.device);
         if (result.failure) failures.push(result.failure);
-        if (result.offline) offlineDeviceIds.add(item.device.deviceId);
+        if (result.offline) {
+          offlineDeviceIds.add(item.device.deviceId);
+        } else if (!result.failure) {
+          // REST + hydrate success is authoritative reachability evidence even when relay
+          // presence was not replayed on this connection. Retire any prior offline marker
+          // so unrelated device invalidations cannot re-clear this device's running badges.
+          remoteScheduleEventStore.clearDeviceMirrorInvalidation(item.device.deviceId);
+        }
       }));
 
       // 收尾再合并一次:hydrate 阶段(可能持续数秒)里新到的 presence 补丁同样不能被覆盖掉。

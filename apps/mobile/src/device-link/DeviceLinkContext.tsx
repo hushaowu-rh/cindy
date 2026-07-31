@@ -429,6 +429,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
                 // 目标端真实应答即可证明设备可达,取消上一代 unavailable 留下的宽限清理;
                 // 不伪造 presence=true,后续权威 false delta 仍可照常过滤并重新计时。
                 clearOnePresenceWipeTimer(presenceWipeTimersRef.current, deviceId);
+                remoteScheduleEventStore.clearDeviceMirrorInvalidation(deviceId);
               },
               onDeviceRemoteDisabled: (deviceId) => {
                 // 被控端实时设置已明确关闭远控:这是当前 epoch 的权威终态,

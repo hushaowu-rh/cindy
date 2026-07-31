@@ -84,6 +84,37 @@ export function shouldUnpinOnUpIntent({ scrollHeight, clientHeight }: UpIntentUn
   return scrollHeight - clientHeight > UNPIN_MIN_SCROLLABLE_PX;
 }
 
+export interface ResolveRenderPinArgs {
+  /** A saved non-bottom viewport is currently being restored. */
+  restoring: boolean;
+  /** The current render introduced a new user message at the tail. */
+  newUserSend: boolean;
+  /** Auto-follow was active before this render. */
+  nearBottom: boolean;
+}
+
+export interface ResolveRenderPinDecision {
+  /** Explicit sends hand ownership back to the latest-message anchor. */
+  clearRestoring: boolean;
+  /** Pin the scroll container to its content end in this layout pass. */
+  pinToBottom: boolean;
+}
+
+/**
+ * Resolve the render-time priority between a saved history anchor and auto-follow.
+ * Reopening a session must preserve a real reading position, but a user message
+ * sent during that mounted session is an explicit request to resume at the tail.
+ */
+export function resolveRenderPinDecision({
+  restoring,
+  newUserSend,
+  nearBottom,
+}: ResolveRenderPinArgs): ResolveRenderPinDecision {
+  if (newUserSend) return { clearRestoring: restoring, pinToBottom: true };
+  if (restoring) return { clearRestoring: false, pinToBottom: false };
+  return { clearRestoring: false, pinToBottom: nearBottom };
+}
+
 export interface ResolveNearBottomArgs {
   /** scroll 事件前的跟随态(isNearBottomRef) */
   wasNearBottom: boolean;

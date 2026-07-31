@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   resolveNearBottomOnScroll,
+  resolveRenderPinDecision,
   shouldUnpinOnUpIntent,
   shouldUnpinOnWheel,
   UNPIN_MIN_SCROLLABLE_PX,
@@ -163,5 +164,36 @@ describe('resolveNearBottomOnScroll', () => {
         scrollDelta: 400,
       }),
     ).toBe(true);
+  });
+});
+
+describe('resolveRenderPinDecision', () => {
+  it('explicit tail send takes ownership from a restored history anchor', () => {
+    expect(resolveRenderPinDecision({
+      restoring: true,
+      newUserSend: true,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: true, pinToBottom: true });
+  });
+
+  it('restored history remains anchored until an explicit user send', () => {
+    expect(resolveRenderPinDecision({
+      restoring: true,
+      newUserSend: false,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: false, pinToBottom: false });
+  });
+
+  it('keeps ordinary near-bottom auto-follow behavior', () => {
+    expect(resolveRenderPinDecision({
+      restoring: false,
+      newUserSend: false,
+      nearBottom: true,
+    })).toEqual({ clearRestoring: false, pinToBottom: true });
+    expect(resolveRenderPinDecision({
+      restoring: false,
+      newUserSend: false,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: false, pinToBottom: false });
   });
 });

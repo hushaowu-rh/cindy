@@ -175,6 +175,7 @@ import { getAppShortcutCombos } from '@/lib/appShortcutStore';
 import { getNextPermissionMode } from '@/lib/permissionModeCycle';
 import { matchesKeyboardEvent } from '../../../shared/appShortcuts';
 import { createLogger } from '@/lib/logger';
+import { createComposerInputLatencyProbe } from '@/lib/composerInputLatencyProbe';
 import { serializeEditorContent, serializeEditorSlice } from './composerContentSerialization';
 import {
   composerDocumentContainsList,
@@ -232,6 +233,7 @@ const log = createLogger('ChatInput');
 // chat-input:commit 量化每次会话切换时 ChatInput 子树(Lexical 初始化 + 草稿恢复
 // + 工具栏)的首次 commit 主线程占用;<30ms 不打,避免噪音。
 const perfLog = createLogger('perf/session-switch');
+const composerPerfLog = createLogger('perf/composer-input');
 
 const VOICE_INPUT_LONG_PRESS_MS = 450;
 const VOICE_INPUT_SHORTCUT_DEDUPE_MS = 250;
@@ -1370,6 +1372,14 @@ export function ChatInput({
   // atomic chips, and only the list nodes needed to preserve Markdown list
   // structure while editing. It does not use StarterKit, whose headings and
   // marks are not part of the chat input contract.
+  const composerInputLatencyProbeRef = useRef<
+    ReturnType<typeof createComposerInputLatencyProbe> | null
+  >(null);
+  composerInputLatencyProbeRef.current ??= createComposerInputLatencyProbe({
+    log: composerPerfLog,
+  });
+  useEffect(() => () => composerInputLatencyProbeRef.current?.dispose(), []);
+
   const editor = useEditor({
     // Match the legacy textarea's `autoFocus` prop — on mount, focus the
     // editor at the end so the user can continue typing after restored text.
@@ -1920,6 +1930,11 @@ export function ChatInput({
         });
       }
       setTick((t) => t + 1);
+      composerInputLatencyProbeRef.current?.markUpdate({
+        kind: 'document',
+        composing: ed.view.composing,
+        docSize: ed.state.doc.content.size,
+      });
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
@@ -1961,6 +1976,11 @@ export function ChatInput({
     },
     onSelectionUpdate: ({ editor: ed }) => {
       setTick((t) => t + 1);
+      composerInputLatencyProbeRef.current?.markUpdate({
+        kind: 'selection',
+        composing: ed.view.composing,
+        docSize: ed.state.doc.content.size,
+      });
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
@@ -2092,6 +2112,8 @@ export function ChatInput({
   // 目录级禁用同判(ghostWorkdirFilter):被禁用的意识胶囊不亮——渲染层
   // 绝不比发送层乐观;禁用变更会广播 ghosts:changed,清单引用变化时重滤。
   const installedGhosts = useInstalledGhosts();
+  const installedGhostsRef = useRef(installedGhosts);
+  installedGhostsRef.current = installedGhosts;
   const pluginsForMenu = useMemo(
     () =>
       installedGhosts.filter(
@@ -3001,13 +3023,12 @@ export function ChatInput({
   useEffect(() => {
     setSlashCommandRoster(editor, mergedCommands);
   }, [editor, mergedCommands]);
-  // 意识指令源($ 触发):已唤醒且声明了 command 的意识,现查现报(同步
-  // IPC 极小);构造成 UnifiedCommand 形状喂同一个面板(交互与 / 完全一致)。
+  // 意识指令源($ 触发):复用窗口级已装意识快照,避免输入触发符时同步扫盘。
   // 目录级禁用同判:被禁用的意识不进 $ 菜单(与胶囊 / 发送期展开同源)。
   const isGhostSigil = trigger.kind === 'slash' && trigger.sigil === '$';
   const ghostCommandItems = useMemo(() => {
     if (!isGhostSigil) return [];
-    return filterGhostsForWorkdir(window.electronAPI.ghosts.listSync().ghosts, workingDir)
+    return ghostsForCommand
       .filter((g) => g.enabled && g.manifest.command !== undefined)
       .map(
         (g) =>
@@ -3017,7 +3038,7 @@ export function ChatInput({
             description: `${g.manifest.name} · ${t('settings.ghosts.commandPaletteTag')}`,
           }) as UnifiedCommand,
       );
-  }, [isGhostSigil, t, workingDir]);
+  }, [ghostsForCommand, isGhostSigil, t]);
   // 面板显示与键盘导航共用同一份命令源:$ 只列意识,/ 只列技能/命令。
   const paletteCommands = isGhostSigil ? ghostCommandItems : mergedCommands;
   const filteredCommands = useMemo(
@@ -3421,10 +3442,10 @@ export function ChatInput({
       const mentionsToSend = mentions.length > 0 ? mentions : undefined;
       // 意识 $指令展开(C3d 双触发):`$画图 ...` 开头且命中已唤醒意识时,
       // 追加"必须走 cindy 总机"的机器指令;未命中原样发送。
-      // listSync 是既有同步 IPC(首帧同款,极小),每次发送现查,装/卸即时反映;
-      // 目录级禁用同判(与胶囊 / main 侧生效点同源),被禁用 = 原样发送。
+      // 读取 useInstalledGhosts 的最新窗口级快照。ghosts:changed 会原子更新
+      // 该快照;发送路径无需同步 IPC,仍按当前工作目录执行同一禁用判定。
       const eligibleGhosts = filterGhostsForWorkdir(
-        window.electronAPI.ghosts.listSync().ghosts,
+        installedGhostsRef.current,
         workingDirRef.current,
       );
       const ghostCommandWord = parseGhostCommandWord(text);

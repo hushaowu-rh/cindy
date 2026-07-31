@@ -4,13 +4,13 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   findClaudeSessionJsonl,
-  resetClaudeTranscriptPathCacheForTesting,
+  __resetClaudeTranscriptPathCacheForTesting,
 } from '../claudeTranscriptAnchors';
 
 const roots: string[] = [];
 
 afterEach(async () => {
-  resetClaudeTranscriptPathCacheForTesting();
+  __resetClaudeTranscriptPathCacheForTesting();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -64,14 +64,30 @@ describe('Claude transcript path lookup cache', () => {
     await expect(findClaudeSessionJsonl('s1', undefined, secondRoot)).resolves.toBe(second);
   });
 
-  it('prefers the direct working-directory project path', async () => {
+  it('rechecks the direct path after a cached fallback is discovered', async () => {
     const root = await createRoot();
     const workingDir = path.join(root, 'workspace');
     await mkdir(workingDir, { recursive: true });
-    await writeTranscript(root, 'fallback', 's1');
+    const fallback = await writeTranscript(root, 'fallback', 's1');
+    let now = 1_000;
+
+    await expect(findClaudeSessionJsonl('s1', workingDir, root, () => now)).resolves.toBe(fallback);
     const directProject = workingDir.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 200);
     const direct = await writeTranscript(root, directProject, 's1');
+    now += 1;
 
-    await expect(findClaudeSessionJsonl('s1', workingDir, root)).resolves.toBe(direct);
+    await expect(findClaudeSessionJsonl('s1', workingDir, root, () => now)).resolves.toBe(direct);
+  });
+
+  it('evicts the oldest cache entries at the capacity limit', async () => {
+    const root = await createRoot();
+    let now = 1_000;
+
+    for (let index = 0; index <= 500; index += 1) {
+      await expect(findClaudeSessionJsonl(`s${index}`, undefined, root, () => now)).resolves.toBeNull();
+    }
+
+    const first = await writeTranscript(root, 'first-project', 's0');
+    await expect(findClaudeSessionJsonl('s0', undefined, root, () => now)).resolves.toBe(first);
   });
 });

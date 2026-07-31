@@ -7,6 +7,7 @@ const SYNTHETIC_BLOCK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 const MAX_SCAN_DEPTH = 4;
 const TRANSCRIPT_PATH_CACHE_TTL_MS = 60_000;
 const TRANSCRIPT_MISS_CACHE_TTL_MS = 5_000;
+const MAX_TRANSCRIPT_PATH_CACHE_ENTRIES = 500;
 
 interface TranscriptPathCacheEntry {
   filePath: string | null;
@@ -92,20 +93,6 @@ async function scanProjectDirsForSession(projectsRoot: string, filename: string)
   return visit(projectsRoot, 0);
 }
 
-async function findClaudeSessionJsonlUncached(
-  sdkSessionId: string,
-  workingDir: string | null | undefined,
-  projectsRoot: string,
-): Promise<string | null> {
-  const filename = `${sdkSessionId}.jsonl`;
-  if (workingDir) {
-    const normalized = await normalizedExistingPath(workingDir);
-    const directPath = path.join(projectsRoot, sanitizeClaudeProjectKey(normalized), filename);
-    if (await fileExists(directPath)) return directPath;
-  }
-  return scanProjectDirsForSession(projectsRoot, filename);
-}
-
 /**
  * JSONL 路径发现按 config root + workingDir + sdkSessionId 单飞并短时缓存。直接路径仍优先；
  * 命中缓存每次先复核文件仍存在，删除/移动后立即回退扫描，不把过期绝对路径返回给 fork/rewind。
@@ -117,6 +104,15 @@ export async function findClaudeSessionJsonl(
   now = Date.now,
 ): Promise<string | null> {
   const key = `${projectsRoot}\0${workingDir ?? ''}\0${sdkSessionId}`;
+
+  // Direct paths are cheap to check and authoritative whenever they appear;
+  // never let a cached scan result mask a transcript restored into workingDir.
+  if (workingDir) {
+    const normalized = await normalizedExistingPath(workingDir);
+    const directPath = path.join(projectsRoot, sanitizeClaudeProjectKey(normalized), `${sdkSessionId}.jsonl`);
+    if (await fileExists(directPath)) return directPath;
+  }
+
   const current = transcriptPathCache.get(key);
   const ttlMs = current?.filePath ? TRANSCRIPT_PATH_CACHE_TTL_MS : TRANSCRIPT_MISS_CACHE_TTL_MS;
   if (current && now() - current.checkedAt < ttlMs) {
@@ -126,9 +122,14 @@ export async function findClaudeSessionJsonl(
   const existing = transcriptPathInFlight.get(key);
   if (existing) return existing;
 
-  const task = findClaudeSessionJsonlUncached(sdkSessionId, workingDir, projectsRoot)
+  const task = scanProjectDirsForSession(projectsRoot, `${sdkSessionId}.jsonl`)
     .then((filePath) => {
       transcriptPathCache.set(key, { filePath, checkedAt: now() });
+      while (transcriptPathCache.size > MAX_TRANSCRIPT_PATH_CACHE_ENTRIES) {
+        const oldestKey = transcriptPathCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        transcriptPathCache.delete(oldestKey);
+      }
       return filePath;
     })
     .finally(() => {
@@ -138,7 +139,7 @@ export async function findClaudeSessionJsonl(
   return task;
 }
 
-export function resetClaudeTranscriptPathCacheForTesting(): void {
+export function __resetClaudeTranscriptPathCacheForTesting(): void {
   transcriptPathCache.clear();
   transcriptPathInFlight.clear();
 }

@@ -656,12 +656,17 @@ function truncateRemoteString(value: string, state: TruncationState): string {
 
 /**
  * 同步「转发 tap 开关」与「被控横幅」到当前 registry 状态。任何 registry 变更后调用:
- *  - registry 非空 → 注册 forwardPush tap(无监听时 broadcast-tap 是 O(1) no-op);空 → 注销。
+ *  - active registry 或 remembered topic 非空 → 注册 forwardPush tap；两者均为空 → 注销。
+ *    remembered topic 让普通断线期间的广播仍可进入离线队列。
  *  - UI 活跃控制端集 = 持 session:<id> / legacy '*' 的订阅者。
  *  - 更新重启阻塞集额外包含 fs-watch:<workdir>，但不扩大 UI 被控横幅语义。
  */
 function syncForwarding(): void {
-  setBroadcastTapListener(subscriptions.isEmpty() ? null : forwardPush);
+  setBroadcastTapListener(
+    subscriptions.isEmpty() && !subscriptions.hasRememberedTopics()
+      ? null
+      : forwardPush,
+  );
   onControllersChanged?.(
     subscriptions.getControlControllers(),
     subscriptions.getUpdateRelaunchControllers(),

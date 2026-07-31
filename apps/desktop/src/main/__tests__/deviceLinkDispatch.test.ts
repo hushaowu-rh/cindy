@@ -607,7 +607,7 @@ describe('被控端控制链路生命周期', () => {
     )).toBe(false);
   });
 
-  it('link-close → 移除控制端,最后一个关闭后停 broadcast-tap', () => {
+  it('legacy link-close keeps the tap alive for its remembered offline queue', () => {
     remoteControlEnabled = true;
     const { client, feed } = makeFakeClient();
     wireInboundDispatch(client);
@@ -615,7 +615,7 @@ describe('被控端控制链路生命周期', () => {
     expect(getActiveControllers()).toHaveLength(1);
     feed({ v: 1, kind: 'link-close', src: 'ctrl-c', payload: { reason: 'user' } });
     expect(getActiveControllers()).toHaveLength(0);
-    expect(hasBroadcastTapListener()).toBe(false);
+    expect(hasBroadcastTapListener()).toBe(true);
   });
 
   it('非订阅 remote invoke 在结果发送前持有更新 busy lease', async () => {
@@ -1872,7 +1872,7 @@ describe('被控端订阅 registry + topic 转发', () => {
     });
   });
 
-  it('unsubscribe 移除 topic;registry 空后停 tap', () => {
+  it('explicit unsubscribe removes the final remembered topic and stops the tap', () => {
     remoteControlEnabled = true;
     const { client, feed } = makeFakeClient();
     wireInboundDispatch(client);
@@ -1882,15 +1882,27 @@ describe('被控端订阅 registry + topic 转发', () => {
     expect(hasBroadcastTapListener()).toBe(false);
   });
 
-  it('presence-offline 清掉该控制端订阅(僵尸兜底)', () => {
+  it('presence-offline keeps the tap alive and queues broadcasts for remembered topics', () => {
     remoteControlEnabled = true;
     const { client, calls, feed } = makeFakeClient();
     wireInboundDispatch(client);
-    feed(subFrame('ctrl-a', SUB, ['sessions']));
+    feed(subFrame('ctrl-a', SUB, ['session:s1']));
     handleControllerOffline('ctrl-a');
-    expect(hasBroadcastTapListener()).toBe(false);
-    tapWindowBroadcast('local-db:sessions:created', { sessionId: 's1' });
+
+    expect(hasBroadcastTapListener()).toBe(true);
+    tapWindowBroadcast('local-db:messages:created', {
+      sessionId: 's1',
+      id: 'm1',
+    });
+
     expect(calls.push).toEqual([]);
+    expect(dispatchTesting.queuedPushesFor('ctrl-a')).toEqual([
+      {
+        channel: 'local-db:messages:created',
+        payload: { sessionId: 's1', id: 'm1' },
+        topic: 'session:s1',
+      },
+    ]);
   });
 
   it('开关关闭 → subscribe 帧回 REMOTE_DISABLED,不记录', () => {

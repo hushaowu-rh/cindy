@@ -195,6 +195,11 @@ export function isEmpty(): boolean {
   return registry.size === 0;
 }
 
+/** 普通断线后是否仍有可用于离线队列精确路由的 remembered topic。 */
+export function hasRememberedTopics(): boolean {
+  return rememberedTopicsByController.size > 0;
+}
+
 /** 当前所有订阅控制端 deviceId(dropAllControllers 逐个 closeLink 用)。 */
 export function getControllerIds(): string[] {
   return [...registry.keys()];

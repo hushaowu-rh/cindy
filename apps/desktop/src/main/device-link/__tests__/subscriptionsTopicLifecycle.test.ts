@@ -84,6 +84,18 @@ describe('subscriptions topic lifecycle listeners', () => {
     expect(subscriptions.getKnownControllersForTopic('session:s1')).toEqual([]);
   });
 
+  it('reports remembered topic state across ordinary disconnect and revocation', () => {
+    expect(subscriptions.hasRememberedTopics()).toBe(false);
+    subscriptions.subscribe('c1', ['session:s1']);
+    expect(subscriptions.hasRememberedTopics()).toBe(true);
+
+    subscriptions.clearController('c1');
+    expect(subscriptions.hasRememberedTopics()).toBe(true);
+
+    subscriptions.forgetKnownController('c1');
+    expect(subscriptions.hasRememberedTopics()).toBe(false);
+  });
+
   it('explicit unsubscribe removes remembered topics from offline routing', () => {
     subscriptions.subscribe('c1', ['sessions', 'session:s1']);
     subscriptions.unsubscribe('c1', ['session:s1']);

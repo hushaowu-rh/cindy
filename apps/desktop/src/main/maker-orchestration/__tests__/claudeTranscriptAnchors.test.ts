@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile, unlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, unlink, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -72,7 +72,8 @@ describe('Claude transcript path lookup cache', () => {
     let now = 1_000;
 
     await expect(findClaudeSessionJsonl('s1', workingDir, root, () => now)).resolves.toBe(fallback);
-    const directProject = workingDir.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 200);
+    const normalizedWorkingDir = (await realpath(workingDir)).normalize('NFC');
+    const directProject = normalizedWorkingDir.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 200);
     const direct = await writeTranscript(root, directProject, 's1');
     now += 1;
 

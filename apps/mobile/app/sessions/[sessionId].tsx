@@ -75,7 +75,7 @@ import {
 } from '@/device-link/remoteStatus';
 import { agentAuthGateHint, agentAuthGateVerdict } from '@/session/agentAuthGate';
 import { isTransientRemoteError, withTransientRemoteRetry } from '@/device-link/remoteRetry';
-import { useRemoteSyncTask } from '@/device-link/remoteSyncTask';
+import { useRemoteSyncCoordinator, type RemoteSyncRun } from '@/device-link/remoteSyncTask';
 import { useMobileMakerTransport } from '@/device-link/useMobileMakerTransport';
 import { createMobileMakerTransport } from '@/device-link/mobileMakerTransport';
 import { startFocusedTopicSubscription } from '@/device-link/focusedTopicSubscription';
@@ -2790,8 +2790,9 @@ export default function SessionScreen() {
     };
   }, [connectionEpoch, deviceId, lastSyncedAt, maker, openLink, sessionAgentSwitchSupported, sessionId]);
 
-  const syncSession = useCallback(async (options: { replaceMessages?: boolean } = {}) => {
-    if (!deviceId || !sessionId) return;
+  const syncSession = useCallback(async (syncRun: Pick<RemoteSyncRun, 'isStale' | 'replaceMessages'>) => {
+    const options = { replaceMessages: syncRun.replaceMessages };
+    if (!deviceId || !sessionId || syncRun.isStale()) return;
     // 新建会话乐观管线在途(running / create-failed):被控端可能还没有这个会话,
     // getSession 会 NOT_FOUND 报错横幅。统一在这里挡掉全部 load 触发点;管线完成
     // (task 移除)后由下方 effect 触发一轮真正的同步。
@@ -2823,6 +2824,7 @@ export default function SessionScreen() {
       const activeSessions = await maker.listActiveSessions().catch(() => []);
       return { activeSessions, activityEpochAtFetchStart };
     };
+    if (syncRun.isStale()) return;
     setLoading(true);
     setError(null);
     try {
@@ -2838,6 +2840,7 @@ export default function SessionScreen() {
             fetchActiveSessionSnapshot(),
           ]);
         });
+        if (syncRun.isStale()) return;
         remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setActiveSessionSnapshots(
           deviceId,
@@ -2877,6 +2880,7 @@ export default function SessionScreen() {
           messageWindowSynced: remoteSessionStore.isSessionMessageWindowSynced(sessionId, sessionMeta),
           storedSession: storedSessionAtStart,
         });
+        if (syncRun.isStale()) return;
         remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setActiveSessionSnapshots(
           deviceId,
@@ -2892,6 +2896,7 @@ export default function SessionScreen() {
               REOPEN_MESSAGE_WINDOW_LIMITS,
             ),
           );
+          if (syncRun.isStale()) return;
           const historyPage: RemoteMessage[] = Array.isArray(history.messages) ? history.messages : [];
           remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
           remoteSessionStore.markSessionMessagesSynced(sessionId, sessionMeta);
@@ -2908,6 +2913,7 @@ export default function SessionScreen() {
       // 不变量:上面 setHasOlderMessages 的校正(:806/:841/:846)与这里的 setLastSyncedAt 之间必须保持
       // 同步尾、无 await —— 否则乐观点亮 effect(依赖 lastSyncedAt===null)会在 await 间隙把刚校正成 false
       // 的「加载更早」入口重新点亮。将来切勿在两者之间插入 await。
+      if (syncRun.isStale()) return;
       setLastSyncedAt(Date.now());
       // 已读回执门槛:本会话在当前连接代完成过整窗同步。sessionId / epoch / 门槛代号
       // 都取 sync 开始时的快照——原地切 session、重连、attention 上升沿之后,启动更早
@@ -2916,12 +2922,19 @@ export default function SessionScreen() {
         setReadAckSyncedKey(`${sessionId}:${readAckEpochAtStart}`);
       }
     } catch (err) {
-      setError(formatRemoteError(err));
+      if (!syncRun.isStale()) setError(formatRemoteError(err));
     } finally {
-      setLoading(false);
+      if (!syncRun.isStale()) setLoading(false);
     }
   }, [deviceId, deviceName, maker, openLink, sessionId, subscribe]);
-  const load = useRemoteSyncTask(() => syncSession());
+  const requestSync = useRemoteSyncCoordinator(
+    (run) => syncSession(run),
+    `${deviceId}:${sessionId}`,
+  );
+  const load = useCallback(
+    () => requestSync({ reason: 'passive-refresh' }),
+    [requestSync],
+  );
 
   /** 恢复路径里装不下的附件:中转对象回收,不留无人认领的已上传对象。 */
   const discardRecoveredAttachments = (attachments: readonly RemoteSerializedAttachment[]) => {
@@ -7129,7 +7142,7 @@ export default function SessionScreen() {
       ));
       clearQuotes(sessionId);
       setRewindState({ kind: 'idle' });
-      await syncSession({ replaceMessages: true });
+      await requestSync({ reason: 'rewind-commit', replaceMessages: true });
     } catch (err) {
       if (rewindRequestSeqRef.current !== seq) return;
       setError(formatRemoteError(err));
@@ -7145,7 +7158,7 @@ export default function SessionScreen() {
     } finally {
       if (rewindRequestSeqRef.current === seq) setMessageActionBusy(null);
     }
-  }, [applyComposerDocument, deviceId, maker, messageActionBusy, rewindState, sessionId, syncSession]);
+  }, [applyComposerDocument, deviceId, maker, messageActionBusy, requestSync, rewindState, sessionId]);
 
   return (
     <View style={styles.safeArea} testID="session.screen">
@@ -7200,7 +7213,7 @@ export default function SessionScreen() {
                 issue={connectionIssue}
                 lastSyncedAt={lastSyncedAt}
                 loading={loading}
-                onSync={() => void load()}
+                onSync={() => void requestSync({ reason: 'manual', replaceMessages: false })}
                 status={status}
                 variant="inline"
               />
@@ -7461,7 +7474,7 @@ export default function SessionScreen() {
             // 设备真不可用(离线/被撤销):消息区保留阻塞占位和重试入口;底部 composer 仍可编辑草稿。
             <SessionSyncPlaceholder
               loading={loading}
-              onSync={() => void load()}
+              onSync={() => void requestSync({ reason: 'manual', replaceMessages: false })}
             />
           ) : (
             <>

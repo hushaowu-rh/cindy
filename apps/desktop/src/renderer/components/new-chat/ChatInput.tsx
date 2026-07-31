@@ -133,6 +133,7 @@ import {
   composerHistoryEntryToDocument,
   type ComposerHistoryEntry,
 } from '@/lib/composerQuoteDocument';
+import { deriveStableComposerHistory } from './composerHistoryProjection';
 import type { PastedTextRange, SlashCommandRange } from '@/lib/imageRef';
 import {
   pastedSessionChipAttrs,
@@ -175,6 +176,13 @@ import { getAppShortcutCombos } from '@/lib/appShortcutStore';
 import { getNextPermissionMode } from '@/lib/permissionModeCycle';
 import { matchesKeyboardEvent } from '../../../shared/appShortcuts';
 import { createLogger } from '@/lib/logger';
+import { createComposerDraftSaveScheduler } from '@/lib/composerDraftSaveScheduler';
+import {
+  composerRenderSnapshot,
+  shouldRefreshComposerRender,
+  type ComposerRenderSnapshot,
+} from './composerRenderGate';
+import { createComposerFrameScheduler } from './composerFrameScheduler';
 import { serializeEditorContent, serializeEditorSlice } from './composerContentSerialization';
 import {
   composerDocumentContainsList,
@@ -988,19 +996,8 @@ export function ChatInput({
   const effectiveCompactToolbar = compactToolbar || autoCompactToolbar;
 
   // ── User message history for ↑/↓ navigation ──────────────────────
-  const userHistory = useMemo(
-    () =>
-      (messages ?? [])
-        .filter((m) => m.role === 'user' && m.content.trim())
-        .map((m): ComposerHistoryEntry => ({
-          content: m.content,
-          ...(m.quotesEncoded === true ? { quotesEncoded: true } : {}),
-        }))
-        .reverse(), // newest first
-    [messages],
-  );
-  const userHistoryRef = useRef(userHistory);
-  userHistoryRef.current = userHistory;
+  const userHistoryRef = useRef<ComposerHistoryEntry[]>([]);
+  userHistoryRef.current = deriveStableComposerHistory(messages, userHistoryRef.current);
   const historyIndexRef = useRef(-1); // -1 = current draft (not browsing)
   const draftRef = useRef<JSONContent | null>(null); // saves draft doc JSON when user starts browsing (preserves marks)
   const hydratedHistoryDocumentRef = useRef<ProseMirrorNode | null>(null);
@@ -1370,7 +1367,36 @@ export function ChatInput({
   // atomic chips, and only the list nodes needed to preserve Markdown list
   // structure while editing. It does not use StarterKit, whose headings and
   // marks are not part of the chat input contract.
+  const [, setTick] = useState(0);
+  const refreshComposerRef = useRef<(() => void) | null>(null);
+  refreshComposerRef.current = () => setTick((t) => t + 1);
+  const renderSnapshotRef = useRef<ComposerRenderSnapshot | null>(null);
+  const draftSaveSchedulerRef = useRef<ReturnType<
+    typeof createComposerDraftSaveScheduler
+  > | null>(null);
+  draftSaveSchedulerRef.current ??= createComposerDraftSaveScheduler();
+  const caretScrollEditorRef = useRef<Editor | null>(null);
+  const caretScrollSchedulerRef = useRef<ReturnType<
+    typeof createComposerFrameScheduler
+  > | null>(null);
+  caretScrollSchedulerRef.current ??= createComposerFrameScheduler(() => {
+    const current = caretScrollEditorRef.current;
+    if (current) scrollCaretIntoView(current);
+  });
+  const scheduleCaretScroll = (ed: Editor): void => {
+    caretScrollEditorRef.current = ed;
+    caretScrollSchedulerRef.current?.schedule();
+  };
+  useEffect(
+    () => () => {
+      caretScrollSchedulerRef.current?.cancel();
+    },
+    [],
+  );
   const editor = useEditor({
+    // React receives only the narrow snapshots above; Tiptap keeps ordinary
+    // transactions inside its editor view instead of rerendering ChatInput.
+    shouldRerenderOnTransaction: false,
     // Match the legacy textarea's `autoFocus` prop — on mount, focus the
     // editor at the end so the user can continue typing after restored text.
     // Tiptap treats boolean `true` as `focus('start')`; its deferred mount
@@ -1919,7 +1945,14 @@ export function ChatInput({
           }
         });
       }
-      setTick((t) => t + 1);
+      const nextRenderSnapshot = composerRenderSnapshot(
+        detectTrigger(ed),
+        !composerDocIsEmpty(ed.state.doc),
+      );
+      if (shouldRefreshComposerRender(renderSnapshotRef.current, nextRenderSnapshot)) {
+        renderSnapshotRef.current = nextRenderSnapshot;
+        refreshComposerRef.current?.();
+      }
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
@@ -1929,45 +1962,56 @@ export function ChatInput({
       // recurse on rapid switches).
       if (isRestoringRef.current) {
         // 即便是 restore，也要补一次滚动——切换 session 后光标常落在末尾
-        requestAnimationFrame(() => scrollCaretIntoView(ed));
+        scheduleCaretScroll(ed);
         return;
       }
       // composer-draft-mount-race 修复 (issue #40):hydration 还没跑过 → 这次
       // onUpdate 是 Tiptap mount 期间的初始触发(空 editor),不能写 store。
       if (!hasHydratedRef.current) {
-        requestAnimationFrame(() => scrollCaretIntoView(ed));
+        scheduleCaretScroll(ed);
         return;
       }
       const sk = storageKeyForDraftRef.current;
       if (!sk) {
-        requestAnimationFrame(() => scrollCaretIntoView(ed));
+        scheduleCaretScroll(ed);
         return;
       }
-      const existing = getComposerDraft(sk);
       // silent: 自己写自己——不通知 subscribeComposerDraft 监听器，避免回灌
-      // setContent 把光标位置/IME 组合状态打乱。
-      saveComposerDraft(
-        sk,
-        {
-          text: ed.getJSON(),
-          attachments: existing?.attachments ?? [],
-          quotes: existing?.quotes ?? [],
-          browserComments: existing?.browserComments ?? [],
-        },
-        { silent: true },
-      );
+      // setContent 把光标位置/IME 组合状态打乱。把 JSON 序列化和写入都放进短
+      // debounce,生命周期边界由 flush 强制落最后一版。
+      draftSaveSchedulerRef.current?.schedule(() => {
+        const existing = getComposerDraft(sk);
+        saveComposerDraft(
+          sk,
+          {
+            text: ed.getJSON(),
+            attachments: existing?.attachments ?? [],
+            quotes: existing?.quotes ?? [],
+            browserComments: existing?.browserComments ?? [],
+          },
+          { silent: true },
+        );
+      });
       // chat-input-autoscroll fix: 输入超过 max-h 后，让光标随内容追底
-      requestAnimationFrame(() => scrollCaretIntoView(ed));
+      scheduleCaretScroll(ed);
     },
     onSelectionUpdate: ({ editor: ed }) => {
-      setTick((t) => t + 1);
+      const nextRenderSnapshot = composerRenderSnapshot(
+        detectTrigger(ed),
+        !composerDocIsEmpty(ed.state.doc),
+      );
+      if (shouldRefreshComposerRender(renderSnapshotRef.current, nextRenderSnapshot)) {
+        renderSnapshotRef.current = nextRenderSnapshot;
+        refreshComposerRef.current?.();
+      }
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
       // 方向键移动光标也要跟随（例如 ↓ 把光标从可见区移到 doc 末尾）
-      requestAnimationFrame(() => scrollCaretIntoView(ed));
+      scheduleCaretScroll(ed);
     },
     onBlur: () => {
+      draftSaveSchedulerRef.current?.flush();
       // Focus left the editor. Spec F1/F2 require the palette to close on
       // blur. We defer by a microtask so mouse-click selections on the
       // palette (which also blur the editor momentarily) still register.
@@ -2573,6 +2617,7 @@ export function ChatInput({
   useEffect(() => {
     if (!editor) return;
     return () => {
+      draftSaveSchedulerRef.current?.flush();
       const editorStorageKey = storageKeyForDraftRef.current;
       if (!editorStorageKey) return;
       const existing = getComposerDraft(editorStorageKey);
@@ -2657,6 +2702,7 @@ export function ChatInput({
 
     const transitionSeq = storageKeyTransitionSeqRef.current + 1;
     storageKeyTransitionSeqRef.current = transitionSeq;
+    draftSaveSchedulerRef.current?.flush();
     const saveCurrentEditorDraft = () => {
       if (!prevEditorKey) return;
       if (!hasHydratedRef.current) return;
@@ -2945,9 +2991,6 @@ export function ChatInput({
     },
     [syncPaletteHover],
   );
-
-  // Bump to force trigger recompute (editor state is mutable, not React state)
-  const [, setTick] = useState(0);
 
   // ── Slash / At panel state ─────────────────────────────────────────
   const trigger: TriggerState = editor ? detectTrigger(editor) : { kind: 'none' };
@@ -3340,6 +3383,7 @@ export function ChatInput({
       if (!editor) return;
       if (disabled) return;
       if (dispatchSendInFlightRef.current) return;
+      draftSaveSchedulerRef.current?.flush();
       dispatchSendInFlightRef.current = true;
       setSendDispatchInFlight(true);
       try {
@@ -4738,6 +4782,7 @@ export function ChatInput({
   );
 
   const hasMessage = !isEditorEmpty(editor);
+  renderSnapshotRef.current = composerRenderSnapshot(trigger, hasMessage);
   const canSend = hasMessage || hasAttachments || browserComments.length > 0;
   const hasVoiceDraftText = voiceInput.draftText.trim().length > 0;
   const [voiceReleaseToSendActive, setVoiceReleaseToSendActive] = useState(false);

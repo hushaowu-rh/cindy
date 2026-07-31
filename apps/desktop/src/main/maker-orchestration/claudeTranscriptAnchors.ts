@@ -5,6 +5,16 @@ import path from 'node:path';
 const PROJECT_KEY_MAX_LENGTH = 200;
 const SYNTHETIC_BLOCK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-0{10}\d{2}$/i;
 const MAX_SCAN_DEPTH = 4;
+const TRANSCRIPT_PATH_CACHE_TTL_MS = 60_000;
+const TRANSCRIPT_MISS_CACHE_TTL_MS = 5_000;
+
+interface TranscriptPathCacheEntry {
+  filePath: string | null;
+  checkedAt: number;
+}
+
+const transcriptPathCache = new Map<string, TranscriptPathCacheEntry>();
+const transcriptPathInFlight = new Map<string, Promise<string | null>>();
 
 type JsonObject = Record<string, unknown>;
 
@@ -82,7 +92,7 @@ async function scanProjectDirsForSession(projectsRoot: string, filename: string)
   return visit(projectsRoot, 0);
 }
 
-async function findClaudeSessionJsonl(
+async function findClaudeSessionJsonlUncached(
   sdkSessionId: string,
   workingDir: string | null | undefined,
   projectsRoot: string,
@@ -94,6 +104,43 @@ async function findClaudeSessionJsonl(
     if (await fileExists(directPath)) return directPath;
   }
   return scanProjectDirsForSession(projectsRoot, filename);
+}
+
+/**
+ * JSONL 路径发现按 config root + workingDir + sdkSessionId 单飞并短时缓存。直接路径仍优先；
+ * 命中缓存每次先复核文件仍存在，删除/移动后立即回退扫描，不把过期绝对路径返回给 fork/rewind。
+ */
+export async function findClaudeSessionJsonl(
+  sdkSessionId: string,
+  workingDir: string | null | undefined,
+  projectsRoot: string,
+  now = Date.now,
+): Promise<string | null> {
+  const key = `${projectsRoot}\0${workingDir ?? ''}\0${sdkSessionId}`;
+  const current = transcriptPathCache.get(key);
+  const ttlMs = current?.filePath ? TRANSCRIPT_PATH_CACHE_TTL_MS : TRANSCRIPT_MISS_CACHE_TTL_MS;
+  if (current && now() - current.checkedAt < ttlMs) {
+    if (!current.filePath || await fileExists(current.filePath)) return current.filePath;
+    transcriptPathCache.delete(key);
+  }
+  const existing = transcriptPathInFlight.get(key);
+  if (existing) return existing;
+
+  const task = findClaudeSessionJsonlUncached(sdkSessionId, workingDir, projectsRoot)
+    .then((filePath) => {
+      transcriptPathCache.set(key, { filePath, checkedAt: now() });
+      return filePath;
+    })
+    .finally(() => {
+      if (transcriptPathInFlight.get(key) === task) transcriptPathInFlight.delete(key);
+    });
+  transcriptPathInFlight.set(key, task);
+  return task;
+}
+
+export function resetClaudeTranscriptPathCacheForTesting(): void {
+  transcriptPathCache.clear();
+  transcriptPathInFlight.clear();
 }
 
 function uniqueTruthy(values: Array<string | undefined>): string[] {

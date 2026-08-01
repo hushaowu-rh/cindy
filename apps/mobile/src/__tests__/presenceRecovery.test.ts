@@ -207,6 +207,27 @@ describe('unavailable mirror wipe timer', () => {
     vi.useRealTimers();
   });
 
+  it('does not let a fulfilled retained link defer unavailable cleanup', async () => {
+    const { deps, timers, wipe } = timerHarness();
+    const tracked = new Map();
+    const request = getOrCreatePresenceTrackedRequest(
+      tracked,
+      createPresenceAvailabilityEpochs(),
+      createPresenceAvailabilityEpochs(),
+      'dev-1',
+      async () => 'accepted',
+      { retainSuccessful: true },
+    );
+    await request.request;
+    deps.isConfirmationInFlight = () => tracked.get('dev-1')?.pending === true;
+
+    vi.advanceTimersByTime(5_000);
+
+    expect(timers.has('dev-1')).toBe(false);
+    expect(wipe).toHaveBeenCalledWith('dev-1');
+    vi.useRealTimers();
+  });
+
   it('allows only an active confirmation to cross the maximum lifetime', () => {
     const { deps, states, timers, wipe } = timerHarness();
     let confirming = true;
@@ -390,6 +411,7 @@ describe('presence availability epochs', () => {
     );
 
     expect(reused).toBe(first);
+    expect(reused.pending).toBe(false);
     expect(create).toHaveBeenCalledTimes(1);
     tracked.delete('dev-1');
     const reopened = getOrCreatePresenceTrackedRequest(

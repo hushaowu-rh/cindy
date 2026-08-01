@@ -212,7 +212,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
   const presenceWipeTimerDeps = useMemo(() => ({
     ...basePresenceWipeTimerDeps,
     isConfirmationInFlight: (deviceId: string) =>
-      openLinkInFlightRef.current.has(deviceId),
+      openLinkInFlightRef.current.get(deviceId)?.pending === true,
   }), []);
   const presenceAvailableByDeviceRef = useRef(new Map<string, boolean>());
   const presenceAvailabilityEpochsRef = useRef(createPresenceAvailabilityEpochs());

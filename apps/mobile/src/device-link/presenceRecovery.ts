@@ -50,6 +50,7 @@ export interface PresenceTrackedRequest<T> {
   capturedPresenceEpoch: number;
   capturedResponseEvidenceEpoch: number;
   request: Promise<T>;
+  pending: boolean;
 }
 
 export function getOrCreatePresenceTrackedRequest<T>(
@@ -66,20 +67,30 @@ export function getOrCreatePresenceTrackedRequest<T>(
   const existing = inFlight.get(deviceId);
   if (existing) return existing;
 
-  const tracked = {
+  const tracked: PresenceTrackedRequest<T> = {
     capturedPresenceEpoch: capturePresenceAvailabilityEpoch(epochs, deviceId),
     capturedResponseEvidenceEpoch: capturePresenceAvailabilityEpoch(
       responseEvidenceEpochs,
       deviceId,
     ),
     request: createRequest(),
+    pending: true,
   };
   inFlight.set(deviceId, tracked);
   const cleanup = (): void => {
+    tracked.pending = false;
     if (inFlight.get(deviceId) === tracked) inFlight.delete(deviceId);
   };
-  if (options.retainSuccessful) void tracked.request.catch(cleanup);
-  else void tracked.request.then(cleanup, cleanup);
+  if (options.retainSuccessful) {
+    void tracked.request.then(
+      () => {
+        tracked.pending = false;
+      },
+      cleanup,
+    );
+  } else {
+    void tracked.request.then(cleanup, cleanup);
+  }
   return tracked;
 }
 

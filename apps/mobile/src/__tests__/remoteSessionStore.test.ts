@@ -1227,6 +1227,37 @@ describe('remoteSessionStore', () => {
     ]);
   });
 
+  it('keeps a same-timestamp pending live assistant during latest-window reconciliation', () => {
+    vi.useFakeTimers();
+    try {
+      const createdAt = '2026-01-01T10:00:02.000Z';
+      pushMakerText('s1', 'live-3', 'still streaming', false);
+      vi.runOnlyPendingTimers();
+      remoteSessionStore.setMessages('s1', remoteSessionStore.getMessages('s1').map((item) => ({
+        ...item,
+        createdAt,
+      })));
+
+      remoteSessionStore.setLatestMessageWindow('s1', [
+        { ...messageAt('latest-1', 's1', '2026-01-01T10:00:01.000Z'), rowid: 1 },
+        { ...messageAt('latest-2', 's1', createdAt), rowid: 2 },
+      ]);
+
+      const rows = remoteSessionStore.getMessages('s1');
+      expect(rows.map((item) => item.id)).toEqual([
+        'latest-1',
+        'live-3',
+        'latest-2',
+      ]);
+      expect(rows.find((item) => item.clientId === 'live-3')).toMatchObject({
+        content: 'still streaming',
+        agentMeta: { isStreaming: true },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('preserves loaded older pages when the refreshed latest page overlaps the current window', () => {
     remoteSessionStore.setMessages('s1', [
       messageAt('older-1', 's1', '2026-01-01T00:00:01.000Z'),

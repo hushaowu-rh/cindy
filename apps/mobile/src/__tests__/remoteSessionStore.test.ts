@@ -1195,6 +1195,25 @@ describe('remoteSessionStore', () => {
     ]);
   });
 
+  it('keeps a same-timestamp live tail with a larger host rowid', () => {
+    const createdAt = '2026-01-01T10:00:02.000Z';
+    remoteSessionStore.setMessages('s1', [
+      { ...messageAt('old-1', 's1', '2026-01-01T00:00:01.000Z'), rowid: 1 },
+      { ...messageAt('live-3', 's1', createdAt), rowid: 3 },
+    ]);
+
+    remoteSessionStore.setLatestMessageWindow('s1', [
+      { ...messageAt('latest-1', 's1', '2026-01-01T10:00:01.000Z'), rowid: 1 },
+      { ...messageAt('latest-2', 's1', createdAt), rowid: 2 },
+    ]);
+
+    expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
+      'latest-1',
+      'latest-2',
+      'live-3',
+    ]);
+  });
+
   it('preserves loaded older pages when the refreshed latest page overlaps the current window', () => {
     remoteSessionStore.setMessages('s1', [
       messageAt('older-1', 's1', '2026-01-01T00:00:01.000Z'),

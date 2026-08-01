@@ -17,6 +17,7 @@ import { useTranslation } from 'react-i18next';
 import type { AgentInputReference } from '@cindy/maker-shared/agent-input-projection';
 import { requiresFullAccessConfirmation } from '@cindy/maker-shared/permission-mode';
 import { ImageLightbox } from '@/components/chat/ImageLightbox';
+import { ImageHoverPreview } from '@/components/chat/ImageHoverPreview';
 import { formatBytes, TextLightbox } from '@/components/chat/TextLightbox';
 import { AttachmentTypeThumb } from './AttachmentTypeThumb';
 import { useEditor, EditorContent } from '@tiptap/react';
@@ -27,6 +28,7 @@ import History from '@tiptap/extension-history';
 import Placeholder from '@tiptap/extension-placeholder';
 import HardBreak from '@tiptap/extension-hard-break';
 import type { Editor, JSONContent } from '@tiptap/core';
+import { createComposerInputLatencyProbe } from '@/lib/composerInputLatencyProbe';
 import { CjkPunctDecoration } from './CjkPunctDecoration';
 import { ComposerListIndentDecoration } from './ComposerListIndentDecoration';
 import {
@@ -148,6 +150,7 @@ import {
 } from './pastePipeline';
 import { upgradePastedPathsToChips, type PendingPathRange } from './pathPaste';
 import { composerDocIsEmpty } from './composerDocState';
+import { canUseLocalAttachmentPicker } from './localAttachmentPicker';
 import {
   isComposerBlankPointerTarget,
   isInteractiveFocusedElement,
@@ -230,6 +233,7 @@ const log = createLogger('ChatInput');
 // chat-input:commit 量化每次会话切换时 ChatInput 子树(Lexical 初始化 + 草稿恢复
 // + 工具栏)的首次 commit 主线程占用;<30ms 不打,避免噪音。
 const perfLog = createLogger('perf/session-switch');
+const composerPerfLog = createLogger('perf/composer-input');
 
 const VOICE_INPUT_LONG_PRESS_MS = 450;
 const VOICE_INPUT_SHORTCUT_DEDUPE_MS = 250;
@@ -1069,6 +1073,12 @@ export function ChatInput({
   addFilesRef.current = addFiles;
   const addFolderPathRef = useRef(addFolderPath);
   addFolderPathRef.current = addFolderPath;
+  const localAttachmentPickerEnabled = canUseLocalAttachmentPicker({
+    sessionId,
+    runtimeAgentKind,
+    remoteHostId,
+    deviceLinkDeviceId,
+  });
 
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounterRef = useRef(0);
@@ -2023,6 +2033,34 @@ export function ChatInput({
     editorRef.current = editor;
   }, [editor]);
 
+  useEffect(() => {
+    if (!editor) return;
+
+    const probe = createComposerInputLatencyProbe({ log: composerPerfLog });
+    const markDocumentUpdate = ({ editor: activeEditor }: { editor: Editor }): void => {
+      probe.markUpdate({
+        kind: 'document',
+        composing: activeEditor.view.composing,
+        docSize: activeEditor.state.doc.content.size,
+      });
+    };
+    const markSelectionUpdate = ({ editor: activeEditor }: { editor: Editor }): void => {
+      probe.markUpdate({
+        kind: 'selection',
+        composing: activeEditor.view.composing,
+        docSize: activeEditor.state.doc.content.size,
+      });
+    };
+
+    editor.on('update', markDocumentUpdate);
+    editor.on('selectionUpdate', markSelectionUpdate);
+    return () => {
+      editor.off('update', markDocumentUpdate);
+      editor.off('selectionUpdate', markSelectionUpdate);
+      probe.dispose();
+    };
+  }, [editor]);
+
   // Message action menu “Add to chat”: reuse the exact session-chip insertion
   // path used by clipboard paste, at the last composer caret position.
   useEffect(() => {
@@ -2084,6 +2122,8 @@ export function ChatInput({
   // 目录级禁用同判(ghostWorkdirFilter):被禁用的意识胶囊不亮——渲染层
   // 绝不比发送层乐观;禁用变更会广播 ghosts:changed,清单引用变化时重滤。
   const installedGhosts = useInstalledGhosts();
+  const installedGhostsRef = useRef(installedGhosts);
+  installedGhostsRef.current = installedGhosts;
   const pluginsForMenu = useMemo(
     () =>
       installedGhosts.filter(
@@ -2993,13 +3033,12 @@ export function ChatInput({
   useEffect(() => {
     setSlashCommandRoster(editor, mergedCommands);
   }, [editor, mergedCommands]);
-  // 意识指令源($ 触发):已唤醒且声明了 command 的意识,现查现报(同步
-  // IPC 极小);构造成 UnifiedCommand 形状喂同一个面板(交互与 / 完全一致)。
+  // 意识指令源($ 触发):复用窗口级已装意识快照,避免输入触发符时同步扫盘。
   // 目录级禁用同判:被禁用的意识不进 $ 菜单(与胶囊 / 发送期展开同源)。
   const isGhostSigil = trigger.kind === 'slash' && trigger.sigil === '$';
   const ghostCommandItems = useMemo(() => {
     if (!isGhostSigil) return [];
-    return filterGhostsForWorkdir(window.electronAPI.ghosts.listSync().ghosts, workingDir)
+    return ghostsForCommand
       .filter((g) => g.enabled && g.manifest.command !== undefined)
       .map(
         (g) =>
@@ -3009,7 +3048,7 @@ export function ChatInput({
             description: `${g.manifest.name} · ${t('settings.ghosts.commandPaletteTag')}`,
           }) as UnifiedCommand,
       );
-  }, [isGhostSigil, t, workingDir]);
+  }, [ghostsForCommand, isGhostSigil, t]);
   // 面板显示与键盘导航共用同一份命令源:$ 只列意识,/ 只列技能/命令。
   const paletteCommands = isGhostSigil ? ghostCommandItems : mergedCommands;
   const filteredCommands = useMemo(
@@ -3413,10 +3452,10 @@ export function ChatInput({
       const mentionsToSend = mentions.length > 0 ? mentions : undefined;
       // 意识 $指令展开(C3d 双触发):`$画图 ...` 开头且命中已唤醒意识时,
       // 追加"必须走 cindy 总机"的机器指令;未命中原样发送。
-      // listSync 是既有同步 IPC(首帧同款,极小),每次发送现查,装/卸即时反映;
-      // 目录级禁用同判(与胶囊 / main 侧生效点同源),被禁用 = 原样发送。
+      // 读取 useInstalledGhosts 的最新窗口级快照。ghosts:changed 会原子更新
+      // 该快照;发送路径无需同步 IPC,仍按当前工作目录执行同一禁用判定。
       const eligibleGhosts = filterGhostsForWorkdir(
-        window.electronAPI.ghosts.listSync().ghosts,
+        installedGhostsRef.current,
         workingDirRef.current,
       );
       const ghostCommandWord = parseGhostCommandWord(text);
@@ -5223,43 +5262,38 @@ export function ChatInput({
                   // create-agent 按 Figma 使用 hug-content pills;默认会话页仍保留左侧优先压缩。
                 )}
               >
-                {/* composer 「+」菜单(权限左侧):新建目标 + 计划模式 + 引用目录(两端通用、同级)。
-                显示条件:有新建目标入口(会话内 → 内部 NewGoalDialog;首页 → onNewGoal 回调)、
-                计划模式入口(capability + 接线齐备),或有引用目录接线。 */}
-                {(inSessionGoalEnabled ||
-                  onNewGoal ||
-                  planModeEntry ||
-                  pluginsForMenu.length > 0 ||
-                  (extraDirs !== undefined && onExtraDirsChange)) && (
-                  <ExtraDirsButton
-                    extraDirs={extraDirs ?? []}
-                    workingDir={workingDir}
-                    planMode={planModeEntry}
-                    plugins={pluginsForMenu}
-                    pluginAvailableIds={pluginAvailableIds}
-                    onPluginSelect={handlePluginSelect}
-                    onChange={onExtraDirsChange}
-                    onNewGoal={
-                      inSessionGoalEnabled || onNewGoal
-                        ? () => {
-                            // 把输入框当前文字(去空白)作为目标默认内容。
-                            const ed = editorRef.current;
-                            const draftText =
-                              ed && !ed.isDestroyed ? serializeEditorContent(ed).text.trim() : '';
-                            if (inSessionGoalEnabled) {
-                              setNewGoalInitial(draftText);
-                              setNewGoalOpen(true);
-                            } else {
-                              onNewGoal?.(draftText);
-                            }
+                {/* composer 「+」菜单(权限左侧):本机会话提供附件入口;目标、计划模式、
+                Plugin、引用目录按各自能力与接线显示。远程会话不能把控制端绝对路径
+                交给远端 agent,因此不接本机文件选择器。 */}
+                <ExtraDirsButton
+                  extraDirs={extraDirs ?? []}
+                  workingDir={workingDir}
+                  onAddFiles={localAttachmentPickerEnabled ? addFiles : undefined}
+                  planMode={planModeEntry}
+                  plugins={pluginsForMenu}
+                  pluginAvailableIds={pluginAvailableIds}
+                  onPluginSelect={handlePluginSelect}
+                  onChange={onExtraDirsChange}
+                  onNewGoal={
+                    inSessionGoalEnabled || onNewGoal
+                      ? () => {
+                          // 把输入框当前文字(去空白)作为目标默认内容。
+                          const ed = editorRef.current;
+                          const draftText =
+                            ed && !ed.isDestroyed ? serializeEditorContent(ed).text.trim() : '';
+                          if (inSessionGoalEnabled) {
+                            setNewGoalInitial(draftText);
+                            setNewGoalOpen(true);
+                          } else {
+                            onNewGoal?.(draftText);
                           }
-                        : undefined
-                    }
-                    disabled={disabled}
-                    dense={effectiveDenseToolbar}
-                    visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
-                  />
-                )}
+                        }
+                      : undefined
+                  }
+                  disabled={disabled}
+                  dense={effectiveDenseToolbar}
+                  visualVariant={isCreateAgentVariant ? 'create-agent' : 'default'}
+                />
                 <PermissionSelector
                   permissionMode={activePermissionMode}
                   onPermissionModeChange={handlePermissionModeChange}
@@ -5949,18 +5983,18 @@ function ThumbnailItem({
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [textLightboxOpen, setTextLightboxOpen] = useState(false);
 
-  // Recalculate portal position when hover state changes
+  // 非图片附件仍使用路径 tooltip；图片定位由共享 ImageHoverPreview 自己负责。
   useLayoutEffect(() => {
-    if (isHovered && thumbRef.current) {
+    if (isHovered && file.category !== 'image' && thumbRef.current) {
       const rect = thumbRef.current.getBoundingClientRect();
       setPopoverPos({
-        top: rect.top, // top edge of the thumbnail
-        left: rect.left + rect.width / 2, // horizontal center
+        top: rect.top,
+        left: rect.left + rect.width / 2,
       });
     } else {
       setPopoverPos(null);
     }
-  }, [isHovered]);
+  }, [file.category, isHovered]);
 
   const handleOpenPreview = useCallback(async () => {
     // attachment-thumb-click polish (2026-04-19): clicking opens the lightbox
@@ -6085,30 +6119,14 @@ function ThumbnailItem({
       </button>
 
       {/* Hover preview / tooltip (F-FI-4) — rendered via portal to escape overflow clipping */}
-      {isHovered &&
-        popoverPos &&
-        file.category === 'image' &&
-        (file.url || file.base64) &&
-        createPortal(
-          <div
-            className="pointer-events-none fixed z-50 overflow-hidden rounded-lg shadow-lg"
-            style={{
-              top: popoverPos.top - 12, // 12px gap above thumbnail
-              left: popoverPos.left,
-              transform: 'translate(-50%, -100%)',
-              maxWidth: 224,
-              maxHeight: 168,
-            }}
-          >
-            <img
-              src={file.url ?? `data:${file.mimeType};base64,${file.base64}`}
-              alt={file.name}
-              className="max-h-[168px] max-w-[224px] object-contain"
-              draggable={false}
-            />
-          </div>,
-          document.body,
-        )}
+      {file.category === 'image' && (file.url || file.base64) ? (
+        <ImageHoverPreview
+          open={isHovered}
+          anchorRef={thumbRef}
+          src={file.url ?? `data:${file.mimeType};base64,${file.base64}`}
+          alt={file.name}
+        />
+      ) : null}
       {isHovered &&
         popoverPos &&
         file.category !== 'image' &&

@@ -189,6 +189,26 @@ export interface AgentDeps {
   capabilityAdditions?: AgentCapabilityAdditions;
 
   /**
+   * 解析某条**具体路由**上该模型已核实的上下文窗口上限（host 注入）；没有则返回 null。
+   *
+   * 用于把上游上报的窗口收敛到真实上限：app-server 对网关路由的模型常报**基础模型**的窗口
+   * （例：目录 372K 的 GPT-5.6-Sol 被报成 1M），虚高值会让上下文占比被低估、memory flush
+   * 阈值跟着推迟。
+   *
+   * 为什么不让 agent 自己查 `capabilities.availableModels`：那是跨 provider 去重后的扁平表，
+   * 同一 model id 由多个 provider 提供时归属已丢，按 id 回查可能命中另一条路由的元数据 ——
+   * 用错路由的上限收敛比不收敛更糟。host 同时持有完整目录与 provider 维度，由它按
+   * (providerId, modelId) 定夺；目录里那些**派生兜底**的窗口（上游不给元数据时补的常量）
+   * 一律不作为上限。
+   *
+   * 返回 null / 缺省不注入 = 不收敛，直接采信上报值（改动前行为）。
+   */
+  resolveVerifiedContextWindow?: (
+    providerId: string | null | undefined,
+    modelId: string,
+  ) => number | null;
+
+  /**
    * Agent 起 session 时追加到 system prompt 末尾的字符串（host 注入）。
    * **本轮一阶段不消费**，仅占位。后续接通后 desktop 可以传项目级 prompt。
    */
@@ -378,6 +398,21 @@ export interface AgentDeps {
   }) => void;
 
   /**
+   * Codex 专用：WS turn 命中仅 HTTP proxy 能处理的请求体恢复错误时，通知宿主把
+   * 该 thread 的后续 WS upgrade 导回 HTTP。
+   *
+   * 宿主负责按自己的 recovery rules 识别错误并登记 transport policy；返回稳定
+   * reason 表示已登记，null 表示不匹配。调用必须同步、纯内存且不得抛错。
+   * maker-core 只在零产出 turn 上据此自动重投一次，不解析供应商错误协议。
+   */
+  armCodexHttpRecovery?: (args: {
+    sessionId: string;
+    threadId: string;
+    message: string;
+    additionalDetails?: string | null;
+  }) => string | null;
+
+  /**
    * Codex 专用：登记 Guardian 子线程回到父业务 session 时应使用的主模型。
    *
    * Codex app-server 的模型目录由共享进程持有，不能代表单个 session 的实际
@@ -388,6 +423,18 @@ export interface AgentDeps {
    * user reviewer，不能让未知路由进入无人值守审批。
    */
   registerCodexReviewerRouteContext?: (args: CodexReviewerRouteContextArgs) => boolean;
+
+  /**
+   * Codex 专用：app-server 创建子 Agent thread 后，把明确的父子 thread 关系同步给宿主。
+   *
+   * 子 thread 会独立发起 Responses 请求，但仍属于父业务 session；宿主据此继承
+   * provider / bridge 路由和 proxy prompt。该钩子必须是同步内存操作，确保在子
+   * thread 首个网络请求前完成登记。
+   */
+  registerCodexChildThreadForParent?: (args: {
+     parentThreadId: string;
+     childThreadId: string;
+   }) => void;
 
   /**
    * Claude 专用: host 明确认定可无提示执行的只读工具名, 透传到 SDK

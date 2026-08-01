@@ -1767,6 +1767,32 @@ describe('被控端订阅 registry + topic 转发', () => {
     ]);
   });
 
+  it('dropAll closes an accepted modern reconnect before explicit subscribe', () => {
+    remoteControlEnabled = true;
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+    feed(subFrame('ctrl-modern', SUB, ['sessions'], 'Modern'));
+    handleControllerOffline('ctrl-modern');
+
+    feed({
+      v: 1,
+      kind: 'link-open',
+      id: 'open-modern-again',
+      src: 'ctrl-modern',
+      payload: {
+        controllerName: 'Modern reconnect',
+        protocolVersion: 1,
+        appVersion: '1.0.0',
+      },
+    });
+    dropAllControllers(client, 'shutdown');
+
+    expect(calls.closed).toContainEqual({
+      dst: 'ctrl-modern',
+      reason: 'shutdown',
+    });
+  });
+
   it('无人值守更新忽略纯 sessions viewer，但保护文件浏览和实际会话控制', () => {
     remoteControlEnabled = true;
     const changes: Array<{

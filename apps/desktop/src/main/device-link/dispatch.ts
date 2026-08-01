@@ -424,6 +424,8 @@ let remoteInvokeResultOutboxTimer: ReturnType<typeof setTimeout> | null = null;
 const remoteInvokeLinkEpoch = new Map<string, number>();
 /** Controllers that have successfully demonstrated topic-subscription support on this link. */
 const topicSubscriptionControllers = new Set<string>();
+/** 已成功 accept、尚未显式 close 的控制端；可无 active topic(现代重连等待 subscribe)。 */
+const acceptedLinkControllers = new Set<string>();
 
 /** `sessions` 订阅出现时通知 host replay 当前列表级轻量状态。 */
 type SessionsSubscribedListener = (controllerDeviceId: string) => void;
@@ -686,6 +688,7 @@ export function dropAllControllers(
   const controllerIds = new Set([
     ...subscriptions.getControllerIds(),
     ...topicSubscriptionControllers,
+    ...acceptedLinkControllers,
   ]);
   for (const dst of controllerIds) {
     try {
@@ -698,6 +701,7 @@ export function dropAllControllers(
   clearAllRemoteInvokeState();
   subscriptions.clearAll();
   topicSubscriptionControllers.clear();
+  acceptedLinkControllers.clear();
   offlinePushQueue.clear();
   syncForwarding();
 }
@@ -710,6 +714,7 @@ export function dropAllControllers(
  */
 export function handleControllerOffline(deviceId: string): void {
   topicSubscriptionControllers.delete(deviceId);
+  acceptedLinkControllers.delete(deviceId);
   if (subscriptions.clearController(deviceId)) {
     syncForwarding();
   }
@@ -725,6 +730,7 @@ export function purgeRevokedController(deviceId: string): void {
   offlinePushQueue.clear(deviceId);
   subscriptions.forgetKnownController(deviceId);
   topicSubscriptionControllers.delete(deviceId);
+  acceptedLinkControllers.delete(deviceId);
   syncForwarding();
 }
 
@@ -755,6 +761,7 @@ async function handleFrame(client: DeviceLinkClient, env: Envelope): Promise<voi
       if (!src) return;
       clearRemoteInvokeStateFor(src);
       offlinePushQueue.clear(src);
+      acceptedLinkControllers.delete(src);
       // Keep the protocol-capability marker, but discard all remembered routing.
       // A modern controller must reconnect and explicitly subscribe; restoring the
       // legacy wildcard here would silently re-enable broad delivery.
@@ -812,6 +819,7 @@ function handleLinkOpen(
     appVersion: app.getVersion(),
     allowlistHash: computeAllowlistHash(),
   });
+  acceptedLinkControllers.add(src);
   if (topicSubscriptionControllers.has(src)) {
     subscriptions.updateControllerMetadata(src, name, capabilities);
   } else {
@@ -1928,6 +1936,7 @@ export const __testing = {
     clearRemoteInvokeResultOutboxTimer();
     remoteInvokeLinkEpoch.clear();
     topicSubscriptionControllers.clear();
+    acceptedLinkControllers.clear();
     onSessionsSubscribed = null;
     activeClient = null;
     offlinePushQueue.clear();

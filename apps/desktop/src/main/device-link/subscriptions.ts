@@ -173,9 +173,9 @@ export function clearController(deviceId: string): boolean {
   return true;
 }
 
-/** 显式撤销/账号边界使用：删除断线恢复所需的 remembered controller 状态。 */
+/** 显式撤销/账号边界使用：释放 active topics，并删除断线恢复状态。 */
 export function forgetKnownController(deviceId: string): void {
-  registry.delete(deviceId);
+  clearController(deviceId);
   knownControllerIds.delete(deviceId);
   rememberedTopicsByController.delete(deviceId);
 }

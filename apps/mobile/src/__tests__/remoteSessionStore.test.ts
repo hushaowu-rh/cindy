@@ -1190,7 +1190,7 @@ describe('remoteSessionStore', () => {
     expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual(['latest-1', 'latest-2']);
   });
 
-  it('keeps live-pushed tail messages when a latest-page sync resolves late', () => {
+  it('prunes untracked cached tail messages when a latest-page sync resolves late', () => {
     remoteSessionStore.setMessages('s1', [
       messageAt('old-1', 's1', '2026-01-01T00:00:01.000Z'),
       messageAt('live-1', 's1', '2026-01-01T10:00:03.000Z'),
@@ -1204,11 +1204,10 @@ describe('remoteSessionStore', () => {
     expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
       'latest-1',
       'latest-2',
-      'live-1',
     ]);
   });
 
-  it('keeps a same-timestamp live tail with a larger host rowid', () => {
+  it('prunes an untracked same-timestamp cached tail even with a larger host rowid', () => {
     const createdAt = '2026-01-01T10:00:02.000Z';
     remoteSessionStore.setMessages('s1', [
       { ...messageAt('old-1', 's1', '2026-01-01T00:00:01.000Z'), rowid: 1 },
@@ -1223,7 +1222,6 @@ describe('remoteSessionStore', () => {
     expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
       'latest-1',
       'latest-2',
-      'live-3',
     ]);
   });
 
@@ -1256,6 +1254,21 @@ describe('remoteSessionStore', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('prunes a stale cached tail missing from the authoritative latest window', () => {
+    remoteSessionStore.setMessages('s1', [
+      { ...messageAt('latest-1', 's1', '2026-01-01T10:00:01.000Z'), rowid: 1 },
+      { ...messageAt('deleted-tail', 's1', '2026-01-01T10:00:02.000Z'), rowid: 2 },
+    ]);
+
+    remoteSessionStore.setLatestMessageWindow('s1', [
+      { ...messageAt('latest-1', 's1', '2026-01-01T10:00:01.000Z'), rowid: 1 },
+    ]);
+
+    expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
+      'latest-1',
+    ]);
   });
 
   it('preserves loaded older pages when the refreshed latest page overlaps the current window', () => {

@@ -84,6 +84,16 @@ describe('subscriptions topic lifecycle listeners', () => {
     expect(subscriptions.getKnownControllersForTopic('session:s1')).toEqual([]);
   });
 
+  it('revocation releases active topics before forgetting remembered routing', () => {
+    subscriptions.subscribe('c1', ['fs-watch:/w1']);
+
+    subscriptions.forgetKnownController('c1');
+
+    expect(released).toHaveBeenCalledWith(['fs-watch:/w1']);
+    expect(subscriptions.getControllerIds()).toEqual([]);
+    expect(subscriptions.getKnownControllerIds()).toEqual([]);
+  });
+
   it('reports remembered topic state across ordinary disconnect and revocation', () => {
     expect(subscriptions.hasRememberedTopics()).toBe(false);
     subscriptions.subscribe('c1', ['session:s1']);

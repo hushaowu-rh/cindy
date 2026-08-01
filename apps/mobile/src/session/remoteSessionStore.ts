@@ -1175,7 +1175,6 @@ export const remoteSessionStore = {
 
     const existing = messages.get(sessionId) ?? [];
     const latestOldest = latestWindow[0];
-    const latestNewest = latestWindow[latestWindow.length - 1];
     const hasOverlap = messageWindowsOverlap(existing, latestWindow);
     const byKey = new Map<string, RemoteMessage>();
     // 截断保护的比较基准必须覆盖全部 existing 行:下面的循环只把窗口外(更新/更旧)
@@ -1187,7 +1186,6 @@ export const remoteSessionStore = {
     // reconciliation therefore drops cached rows missing from that window; callers
     // extending history may explicitly preserve already-loaded older pages.
     for (const item of existing) {
-      const isNewerThanLatestPage = compareMessageOrder(item, latestNewest) > 0;
       const isOlderLoadedPage = options.preserveOlderLoadedPages === true
         && hasOverlap
         && compareMessageOrder(item, latestOldest) < 0;
@@ -1196,8 +1194,7 @@ export const remoteSessionStore = {
       const isLocalSystemCard = messageKey(item).startsWith('mobile-system-');
       const isPendingLiveAssistant = isPendingLiveAssistantMessage(sessionId, item);
       if (
-        isNewerThanLatestPage
-        || isOlderLoadedPage
+        isOlderLoadedPage
         || isLocalSystemCard
         || isPendingLiveAssistant
       ) {

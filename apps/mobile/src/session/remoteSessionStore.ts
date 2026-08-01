@@ -1136,7 +1136,11 @@ export const remoteSessionStore = {
     emit();
   },
 
-  setLatestMessageWindow(sessionId: string, list: readonly RemoteMessage[]): void {
+  setLatestMessageWindow(
+    sessionId: string,
+    list: readonly RemoteMessage[],
+    options: { preserveOlderLoadedPages?: boolean } = {},
+  ): void {
     const textFlushed = flushPendingTextDelta(sessionId);
     const latestWindow = normalizeMessages(list);
     if (latestWindow.length === 0) {
@@ -1172,13 +1176,15 @@ export const remoteSessionStore = {
     // (remoteContentTruncated)会拿 undefined 比较而照样覆盖它们。
     const existingByKey = new Map(existing.map((item) => [messageKey(item), item] as const));
 
-    // A latest-page sync is authoritative for the tail of the conversation.
-    // Only keep older cached pages when they overlap that page; otherwise stale
-    // old windows can be rendered as if they were adjacent to fresh pushes.
+    // A latest-page sync is authoritative for its returned window. Reopen/reconnect
+    // reconciliation therefore drops cached rows missing from that window; callers
+    // extending history may explicitly preserve already-loaded older pages.
     for (const item of existing) {
       const createdAt = item.createdAt;
-      const isNewerThanLatestPage = createdAt.localeCompare(latestNewestCreatedAt) >= 0;
-      const isOlderLoadedPage = hasOverlap && createdAt.localeCompare(latestOldestCreatedAt) < 0;
+      const isNewerThanLatestPage = createdAt.localeCompare(latestNewestCreatedAt) > 0;
+      const isOlderLoadedPage = options.preserveOlderLoadedPages === true
+        && hasOverlap
+        && createdAt.localeCompare(latestOldestCreatedAt) < 0;
       // 本地系统卡(/learn、/context 等)没有服务端对应行:不管时序落在窗口哪里都
       // 不会出现在 latestKeys 里,若不单独保留会被 window 刷新时静默丢弃。
       const isLocalSystemCard = messageKey(item).startsWith('mobile-system-');

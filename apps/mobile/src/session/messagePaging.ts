@@ -223,7 +223,11 @@ export async function collectCompleteIncrementalMessages(
 
     const next = await input.fetchAfter(cursor);
     if (next.messages.length === 0) {
-      forwardComplete = true;
+      // Empty continuation after more than one page proves a progressing forward
+      // walk reached the tail. After only the initial full/reduced page it can also
+      // mean the host ignored an unknown cursor and returned the latest window.
+      if (pageIndex > 0) forwardComplete = true;
+      else forwardValid = false;
       break;
     }
     const nextCursor = latestMessageCursor(next.messages);

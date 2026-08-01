@@ -1206,11 +1206,29 @@ describe('remoteSessionStore', () => {
       messageAt('latest-1', 's1', '2026-01-01T10:00:01.000Z'),
       messageAt('latest-2', 's1', '2026-01-01T10:00:02.000Z'),
       messageAt('latest-3', 's1', '2026-01-01T10:00:03.000Z'),
-    ]);
+    ], { preserveOlderLoadedPages: true });
 
     expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
       'older-1',
       'latest-1',
+      'latest-2',
+      'latest-3',
+    ]);
+  });
+
+  it('prunes missing cached rows from an overlapping authoritative latest window', () => {
+    remoteSessionStore.setMessages('s1', [
+      messageAt('older-1', 's1', '2026-01-01T00:00:01.000Z'),
+      messageAt('deleted-1', 's1', '2026-01-01T10:00:01.000Z'),
+      messageAt('latest-2', 's1', '2026-01-01T10:00:02.000Z'),
+    ]);
+
+    remoteSessionStore.setLatestMessageWindow('s1', [
+      messageAt('latest-2', 's1', '2026-01-01T10:00:02.000Z'),
+      messageAt('latest-3', 's1', '2026-01-01T10:00:03.000Z'),
+    ]);
+
+    expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
       'latest-2',
       'latest-3',
     ]);

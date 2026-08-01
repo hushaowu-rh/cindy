@@ -296,6 +296,41 @@ describe('messagePaging', () => {
       expect(result).toBeNull();
     });
 
+    it('does not accept an unknown after cursor from an empty continuation', async () => {
+      const anchor = message('deleted-anchor', '2026-01-01T00:00:01.000Z');
+      const result = await collectCompleteIncrementalMessages({
+        initialPage: {
+          messages: [
+            message('m4', '2026-01-01T00:00:04.000Z'),
+            message('m5', '2026-01-01T00:00:05.000Z'),
+          ],
+          limit: 2,
+          reducedByPayloadTooLarge: false,
+        },
+        afterMessage: anchor,
+        fetchAfter: async () => ({
+          messages: [],
+          limit: 2,
+          reducedByPayloadTooLarge: false,
+        }),
+        fetchLatest: async () => ({
+          messages: [
+            message('m4', '2026-01-01T00:00:04.000Z'),
+            message('m5', '2026-01-01T00:00:05.000Z'),
+          ],
+          limit: 2,
+          reducedByPayloadTooLarge: false,
+        }),
+        fetchBefore: async () => ({
+          messages: [message('m2', '2026-01-01T00:00:02.000Z')],
+          limit: 2,
+          reducedByPayloadTooLarge: false,
+        }),
+      });
+
+      expect(result).toBeNull();
+    });
+
     it('rejects a short backward page that never reaches the original cursor', async () => {
       const anchor = message('deleted-anchor', '2026-01-01T00:00:01.000Z');
       const result = await collectCompleteIncrementalMessages({

@@ -365,9 +365,6 @@ import {
 import {
   hasOlderMessagesAfterReopen,
   hasOlderMessagesByServerCount,
-  incrementalMessagePageNeedsFallback,
-  collectCompleteIncrementalMessages,
-  latestMessageCursor,
   listMessagesWithPayloadRetry,
   oldestMessageCursor,
   shouldRefreshLatestMessageWindowOnReopen,
@@ -2913,7 +2910,7 @@ export default function SessionScreen() {
         });
         // 廉价对账:updatedAt 主信号(任何消息变化都会 bump),_count 仅在两侧都有时作辅助;
         // 另外要求消息窗口已被详情页同步到当前 meta,避免首页先刷新 session preview 后,
-        // 详情页把旧消息缓存误判成最新。任一变化 → 只拉最新小窗对账(store 旧消息保留 + 按 key 合并);
+        // 详情页把旧消息缓存误判成最新。任一变化 → 拉取权威最新窗口并对账;
         // 都没变 → 跳过整窗重拉(内容已是最新,新消息由 live subscribe 推送)。
         const freshCount = sessionMeta._count?.messages;
         const metaChanged = shouldRefreshLatestMessageWindowOnReopen({
@@ -2922,7 +2919,6 @@ export default function SessionScreen() {
           storedSession: storedSessionAtStart,
         });
         if (syncRun.isStale()) return;
-        remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setActiveSessionSnapshots(
           deviceId,
           Array.isArray(activeSessionSnapshot.activeSessions)
@@ -2931,71 +2927,16 @@ export default function SessionScreen() {
           activeSessionSnapshot.activityEpochAtFetchStart,
         );
         if (metaChanged) {
-          const after = latestMessageCursor(storedMessagesAtStart);
           const history = await withTransientRemoteRetry(() =>
             listMessagesWithPayloadRetry(
-              (limit) => maker.listMessages(sessionId, { limit, ...(after ? { after } : {}) }),
+              (limit) => maker.listMessages(sessionId, { limit }),
               REOPEN_MESSAGE_WINDOW_LIMITS,
             ),
           );
           if (syncRun.isStale()) return;
           const historyPage: RemoteMessage[] = Array.isArray(history.messages) ? history.messages : [];
-          if (after) {
-            const previousCount = storedSessionAtStart?._count?.messages;
-            const afterMessage = storedMessagesAtStart.find((message) => message.id === after) ?? null;
-            if (incrementalMessagePageNeedsFallback({
-              page: history,
-              totalCount: freshCount,
-              previousTotalCount: previousCount,
-              afterMessage,
-            })) {
-              // Older Desktop hosts may ignore `after`; a single latest-tail fallback
-              // cannot prove a large delta complete because it can skip the middle.
-              const completeDelta = afterMessage
-                ? await collectCompleteIncrementalMessages({
-                    initialPage: history,
-                    afterMessage,
-                    fetchAfter: async (cursor) => withTransientRemoteRetry(() =>
-                      listMessagesWithPayloadRetry(
-                        (limit) => maker.listMessages(sessionId, { limit, after: cursor }),
-                        REOPEN_MESSAGE_WINDOW_LIMITS,
-                      ),
-                    ),
-                    fetchLatest: async () => withTransientRemoteRetry(() =>
-                      listMessagesWithPayloadRetry(
-                        (limit) => maker.listMessages(sessionId, { limit }),
-                        REOPEN_MESSAGE_WINDOW_LIMITS,
-                      ),
-                    ),
-                    fetchBefore: async (cursor) => withTransientRemoteRetry(() =>
-                      listMessagesWithPayloadRetry(
-                        (limit) => maker.listMessages(sessionId, { limit, before: cursor }),
-                        REOPEN_MESSAGE_WINDOW_LIMITS,
-                      ),
-                    ),
-                    maxPages: 256,
-                  })
-                : null;
-              if (!completeDelta) {
-                // Do not advance the store cursor until completeness is proven.
-                // A later reopen can safely retry from the original cached tail.
-                setHasOlderMessages(true);
-                return;
-              }
-              remoteSessionStore.mergeMessages(sessionId, completeDelta);
-            } else {
-              remoteSessionStore.mergeMessages(sessionId, historyPage);
-            }
-            setHasOlderMessages(
-              hasOlderMessagesAfterReopen(
-                freshCount,
-                remoteSessionStore.getMessages(sessionId),
-              ),
-            );
-          } else {
-            remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
-            setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
-          }
+          remoteSessionStore.setLatestMessageWindow(sessionId, historyPage);
+          setHasOlderMessages(shouldKeepOlderMessagesAffordance(history));
           remoteSessionStore.markSessionMessagesSynced(sessionId, sessionMeta);
         } else {
           // 回归修复:没新内容也要补设 hasOlderMessages —— 屏幕重开把该 state 重置为 false,跳过整窗
@@ -3003,6 +2944,7 @@ export default function SessionScreen() {
           // 真实消息数推断(getSession 没给总数时退化为窗口启发式)。
           setHasOlderMessages(hasOlderMessagesAfterReopen(freshCount, remoteSessionStore.getMessages(sessionId)));
         }
+        remoteSessionStore.upsertDeviceSession(deviceId, deviceName, sessionMeta);
         remoteSessionStore.setPendingInteractions(sessionId, Array.isArray(pendingInteractions) ? pendingInteractions : []);
         remoteSessionStore.setInputProjection(sessionId, projection);
       }

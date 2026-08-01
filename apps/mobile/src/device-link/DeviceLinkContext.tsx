@@ -716,6 +716,7 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
         deviceId,
         openLinkInFlightRef.current,
         remoteSubscribedTopicsRef.current,
+        noteSessionLiveStreamsInterrupted,
       ),
       onProviderChanged: (deviceId) => {
         // provider 目录与 capabilities.availableModels 是同一份 active catalog 的两种视图。

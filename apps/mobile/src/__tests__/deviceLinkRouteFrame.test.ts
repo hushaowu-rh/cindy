@@ -34,21 +34,32 @@ describe('handlePeerLinkCloseFrame', () => {
 });
 
 describe('invalidatePeerLinkState', () => {
-  it('clears retained open-link and remote topic acknowledgement state', () => {
+  it('clears retained link state and reports invalidated session topic ACKs', () => {
     const openLinks = new Map<string, unknown>([
       ['desktop-a', Promise.resolve()],
       ['desktop-b', Promise.resolve()],
     ]);
-    const remoteTopicAcks = new Map<string, unknown>([
-      ['desktop-a', new Set(['sessions', 'session:s1'])],
+    const remoteTopicAcks = new Map<string, Set<string>>([
+      ['desktop-a', new Set(['sessions', 'session:s1', 'session:s2'])],
       ['desktop-b', new Set(['sessions'])],
     ]);
+    const onTopicsInterrupted = vi.fn();
 
-    invalidatePeerLinkState('desktop-a', openLinks, remoteTopicAcks);
+    invalidatePeerLinkState(
+      'desktop-a',
+      openLinks,
+      remoteTopicAcks,
+      onTopicsInterrupted,
+    );
 
     expect(openLinks.has('desktop-a')).toBe(false);
     expect(remoteTopicAcks.has('desktop-a')).toBe(false);
     expect(openLinks.has('desktop-b')).toBe(true);
     expect(remoteTopicAcks.has('desktop-b')).toBe(true);
+    expect(onTopicsInterrupted).toHaveBeenCalledWith([
+      'sessions',
+      'session:s1',
+      'session:s2',
+    ]);
   });
 });

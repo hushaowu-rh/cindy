@@ -10,10 +10,14 @@ export type ComposerHistoryMessage = {
  * Builds a stable user-message projection. If assistant streaming replaces the
  * parent messages array without changing user rows, the previous array is
  * returned so ChatInput's history consumers do not receive new identities.
+ *
+ * `previous` is typed as the same mutable array its one caller
+ * (`userHistoryRef.current` in ChatInput) actually holds, so the identity
+ * short-circuit below can return it as-is — no readonly-stripping cast needed.
  */
 export function deriveStableComposerHistory(
   messages: ComposerHistoryMessage[] | undefined,
-  previous: readonly ComposerHistoryEntry[],
+  previous: ComposerHistoryEntry[],
 ): ComposerHistoryEntry[] {
   const next = (messages ?? [])
     .filter((message) => message.role === 'user' && message.content.trim())
@@ -31,7 +35,7 @@ export function deriveStableComposerHistory(
         entry.quotesEncoded === previous[index]?.quotesEncoded,
     )
   ) {
-    return previous as ComposerHistoryEntry[];
+    return previous;
   }
   return next;
 }

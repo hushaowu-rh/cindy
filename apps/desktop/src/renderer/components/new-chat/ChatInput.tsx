@@ -1979,7 +1979,19 @@ export function ChatInput({
       // silent: 自己写自己——不通知 subscribeComposerDraft 监听器，避免回灌
       // setContent 把光标位置/IME 组合状态打乱。把 JSON 序列化和写入都放进短
       // debounce,生命周期边界由 flush 强制落最后一版。
+      //
+      // voice-input session-switch 草稿串味修复:`ed.getJSON()` 故意延后到
+      // debounce 触发那一刻才读(保住上面这条 perf 优化——不在每次按键都同步
+      // 序列化整份文档)。但 storageKeyForDraftRef 在语音输入 stop/refine/send
+      // 的 async 等待期间会「故意滞后」于 storageKey prop(见该 ref 声明处注释),
+      // 期间若这条 debounce 定时器还没触发,restoreNextDraft 就可能先跑完
+      // setContent 把编辑器换成下一个 session 的文档、再把 ref 切到新 key —
+      // 定时器这时才触发的话,`ed.getJSON()` 读到的已经是下一个 session 的内容,
+      // 却仍会存进这里捕获的旧 `sk` 下,串味覆盖旧会话草稿。任务真正执行时重新核对
+      // ref 是否还等于调度时捕获的 `sk`,不等就说明编辑器内容已经不再属于它,直接
+      // 跳过这次写入(旧会话的最终内容已由 saveCurrentEditorDraft 在切换前存妥)。
       draftSaveSchedulerRef.current?.schedule(() => {
+        if (storageKeyForDraftRef.current !== sk) return;
         const existing = getComposerDraft(sk);
         saveComposerDraft(
           sk,

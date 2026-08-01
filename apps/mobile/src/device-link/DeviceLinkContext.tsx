@@ -41,7 +41,10 @@ import { normalizeMobileAgentCapabilities } from '@/session/agentCapabilities';
 import { evictComposerPaletteCacheForDevice, resetComposerPaletteCache } from '@/session/composerPaletteCache';
 import { clearAllDeviceModelMeta, evictDeviceModelMeta } from '@/device-link/deviceModelMetaCache';
 import { dispatchFileBrowserWatchEvent } from '@/device-link/fileBrowserWatch';
-import { handlePeerLinkCloseFrame } from '@/device-link/linkClose';
+import {
+  handlePeerLinkCloseFrame,
+  invalidatePeerLinkState,
+} from '@/device-link/linkClose';
 import { resolveMobileInvokeTimeoutMs } from '@/device-link/invokeTimeouts';
 import {
   classifySnapshotBatchFailure,
@@ -667,7 +670,11 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
     });
     const offFrame = client.onFrame((env) => routeFrame(env, {
       onAccessRevoked: (deviceId) => remoteSubscribedTopicsRef.current.delete(deviceId),
-      onLinkClosed: (deviceId) => openLinkInFlightRef.current.delete(deviceId),
+      onLinkClosed: (deviceId) => invalidatePeerLinkState(
+        deviceId,
+        openLinkInFlightRef.current,
+        remoteSubscribedTopicsRef.current,
+      ),
       onProviderChanged: (deviceId) => {
         // provider 目录与 capabilities.availableModels 是同一份 active catalog 的两种视图。
         // 同时驱逐并后台重拉；页面保留旧画面，当前代完整快照提交后由订阅一次性更新。

@@ -196,6 +196,10 @@ export async function collectCompleteIncrementalMessages(
     }
     return valid;
   };
+  const anchorKey = anchor.id || anchor.clientId;
+  const containsAnchor = (rows: readonly RemoteMessage[]): boolean =>
+    Boolean(anchorKey) && rows.some((message) =>
+      (message.id || message.clientId) === anchorKey);
   const ordered = (): RemoteMessage[] => [...collected.values()].sort(compareMessageOrder);
   const hasTrimmedRows = (page: MessagePageRetryResult): boolean =>
     page.messages.some((message) => message.agentMeta?.remoteRowsTrimmed === true);
@@ -205,16 +209,23 @@ export async function collectCompleteIncrementalMessages(
   let page = input.initialPage;
   let forwardValid = addRowsAfterAnchor(page.messages);
   let cursor = latestMessageCursor(page.messages);
+  let forwardComplete = false;
   for (let pageIndex = 0; forwardValid && pageIndex < maxPages; pageIndex += 1) {
     if (!cursor) break;
     if (
       page.messages.length < page.limit
       && !page.reducedByPayloadTooLarge
       && !hasTrimmedRows(page)
-    ) return ordered();
+    ) {
+      forwardComplete = true;
+      break;
+    }
 
     const next = await input.fetchAfter(cursor);
-    if (next.messages.length === 0) break;
+    if (next.messages.length === 0) {
+      forwardComplete = true;
+      break;
+    }
     const nextCursor = latestMessageCursor(next.messages);
     if (!nextCursor || nextCursor === cursor) {
       forwardValid = false;
@@ -224,20 +235,23 @@ export async function collectCompleteIncrementalMessages(
     page = next;
     cursor = nextCursor;
   }
-  if (forwardValid) return ordered();
+  if (forwardValid && forwardComplete) return ordered();
+  if (forwardValid) return null;
 
   // A latest-window fallback must be paged backwards; using only its tail can
   // silently omit the middle of a delta larger than the window size.
   collected.clear();
   page = await input.fetchLatest();
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
-    const reachedAnchor = !addRowsAfterAnchor(page.messages);
+    const reachedAnchor = containsAnchor(page.messages);
+    const crossedAnchor = !addRowsAfterAnchor(page.messages);
     if (reachedAnchor) return ordered();
+    if (crossedAnchor) return null;
     if (
       page.messages.length < page.limit
       && !page.reducedByPayloadTooLarge
       && !hasTrimmedRows(page)
-    ) return ordered();
+    ) return null;
     const before = oldestMessageCursor(page.messages);
     if (!before) return null;
     page = await input.fetchBefore(before);

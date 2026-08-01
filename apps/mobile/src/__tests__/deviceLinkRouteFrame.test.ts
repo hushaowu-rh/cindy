@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Envelope } from '@cindy/device-link';
-import { handlePeerLinkCloseFrame } from '@/device-link/linkClose';
+import {
+  handlePeerLinkCloseFrame,
+  invalidatePeerLinkState,
+} from '@/device-link/linkClose';
 
 describe('handlePeerLinkCloseFrame', () => {
   it.each(['user', 'toggle-off', 'shutdown', 'revoked'] as const)(
@@ -21,7 +24,31 @@ describe('handlePeerLinkCloseFrame', () => {
 
   it('ignores unrelated frames', () => {
     const onLinkClosed = vi.fn();
-    expect(handlePeerLinkCloseFrame({ v: 1, kind: 'push', src: 'desktop-a' } as Envelope, onLinkClosed)).toBe(false);
+    expect(handlePeerLinkCloseFrame({
+      v: 1,
+      kind: 'push',
+      src: 'desktop-a',
+    } as Envelope, onLinkClosed)).toBe(false);
     expect(onLinkClosed).not.toHaveBeenCalled();
+  });
+});
+
+describe('invalidatePeerLinkState', () => {
+  it('clears retained open-link and remote topic acknowledgement state', () => {
+    const openLinks = new Map<string, unknown>([
+      ['desktop-a', Promise.resolve()],
+      ['desktop-b', Promise.resolve()],
+    ]);
+    const remoteTopicAcks = new Map<string, unknown>([
+      ['desktop-a', new Set(['sessions', 'session:s1'])],
+      ['desktop-b', new Set(['sessions'])],
+    ]);
+
+    invalidatePeerLinkState('desktop-a', openLinks, remoteTopicAcks);
+
+    expect(openLinks.has('desktop-a')).toBe(false);
+    expect(remoteTopicAcks.has('desktop-a')).toBe(false);
+    expect(openLinks.has('desktop-b')).toBe(true);
+    expect(remoteTopicAcks.has('desktop-b')).toBe(true);
   });
 });

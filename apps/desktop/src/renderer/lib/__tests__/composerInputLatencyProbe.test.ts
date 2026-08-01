@@ -111,4 +111,57 @@ describe('createComposerInputLatencyProbe', () => {
       maxLogsPerWindow: 20,
     });
   });
+
+  it('is a true no-op and never reads the clock or schedules a frame when no log sink is provided', () => {
+    const now = vi.fn<() => number>(() => 0);
+    const requestFrame = vi.fn<(callback: FrameRequestCallback) => number>(() => 1);
+    const cancelFrame = vi.fn();
+
+    const probe = createComposerInputLatencyProbe({ now, requestFrame, cancelFrame });
+
+    probe.markUpdate({ kind: 'document', composing: false, docSize: 10 });
+    probe.dispose();
+
+    expect(now).not.toHaveBeenCalled();
+    expect(requestFrame).not.toHaveBeenCalled();
+    expect(cancelFrame).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'is a true no-op and never reads the clock, schedules a frame, or logs when maxLogsPerWindow is %s',
+    (maxLogsPerWindow) => {
+      const now = vi.fn<() => number>(() => 0);
+      const requestFrame = vi.fn<(callback: FrameRequestCallback) => number>(() => 1);
+      const cancelFrame = vi.fn();
+      const debug = vi.fn();
+
+      const probe = createComposerInputLatencyProbe({
+        now,
+        requestFrame,
+        cancelFrame,
+        log: { debug },
+        maxLogsPerWindow,
+      });
+
+      probe.markUpdate({ kind: 'document', composing: false, docSize: 10 });
+      probe.dispose();
+
+      expect(now).not.toHaveBeenCalled();
+      expect(requestFrame).not.toHaveBeenCalled();
+      expect(debug).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still logs at the smallest positive maxLogsPerWindow boundary', () => {
+    const h = harness({ maxLogsPerWindow: 1 });
+
+    h.probe.markUpdate({ kind: 'document', composing: false, docSize: 5 });
+    h.runNextFrame(150);
+    expect(h.debug).toHaveBeenCalledTimes(1);
+
+    h.setNow(10);
+    h.probe.markUpdate({ kind: 'document', composing: false, docSize: 6 });
+    h.runNextFrame(160);
+    expect(h.debug).toHaveBeenCalledTimes(1);
+  });
 });

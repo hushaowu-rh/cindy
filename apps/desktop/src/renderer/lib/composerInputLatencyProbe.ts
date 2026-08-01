@@ -32,13 +32,23 @@ const DEFAULT_MAX_LOGS_PER_WINDOW = 20;
 export function createComposerInputLatencyProbe(
   options: ComposerInputLatencyProbeOptions = {},
 ): ComposerInputLatencyProbe {
+  const log = options.log;
+  const maxLogsPerWindow = options.maxLogsPerWindow ?? DEFAULT_MAX_LOGS_PER_WINDOW;
+
+  // Without a log sink or a positive, finite log budget nothing can ever be
+  // recorded, so skip touching the clock and RAF entirely.
+  if (!log || !Number.isFinite(maxLogsPerWindow) || maxLogsPerWindow <= 0) {
+    return {
+      markUpdate(): void {},
+      dispose(): void {},
+    };
+  }
+
   const now = options.now ?? (() => performance.now());
   const requestFrame = options.requestFrame ?? ((callback) => requestAnimationFrame(callback));
   const cancelFrame = options.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
   const thresholdMs = options.thresholdMs ?? DEFAULT_THRESHOLD_MS;
   const windowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
-  const maxLogsPerWindow = options.maxLogsPerWindow ?? DEFAULT_MAX_LOGS_PER_WINDOW;
-  const log = options.log;
 
   let pendingFrame: FrameHandle | null = null;
   let pendingStartedAt = 0;

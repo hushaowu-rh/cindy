@@ -1767,6 +1767,45 @@ describe('被控端订阅 registry + topic 转发', () => {
     ]);
   });
 
+  it('modern reconnect after releasing every topic waits for a fresh subscribe', () => {
+    remoteControlEnabled = true;
+    const { client, calls, feed } = makeFakeClient();
+    wireInboundDispatch(client);
+
+    feed({
+      v: 1,
+      kind: 'link-open',
+      id: 'open-modern',
+      src: 'ctrl-modern',
+      payload: {
+        controllerName: 'Modern',
+        protocolVersion: 1,
+        appVersion: '1.0.0',
+      },
+    });
+    feed(subFrame('ctrl-modern', SUB, ['sessions'], 'Modern'));
+    feed(subFrame('ctrl-modern', UNSUB, ['sessions']));
+    handleControllerOffline('ctrl-modern');
+
+    feed({
+      v: 1,
+      kind: 'link-open',
+      id: 'open-modern-again',
+      src: 'ctrl-modern',
+      payload: {
+        controllerName: 'Modern reconnect',
+        protocolVersion: 1,
+        appVersion: '1.0.0',
+      },
+    });
+
+    tapWindowBroadcast('local-db:sessions:created', { sessionId: 's1' });
+    tapWindowBroadcast('maker:event', { sessionId: 's1', event: {} });
+
+    expect(calls.push).toEqual([]);
+    expect(getUpdateRelaunchControllers()).toEqual([]);
+  });
+
   it('dropAll closes an accepted modern reconnect before explicit subscribe', () => {
     remoteControlEnabled = true;
     const { client, calls, feed } = makeFakeClient();

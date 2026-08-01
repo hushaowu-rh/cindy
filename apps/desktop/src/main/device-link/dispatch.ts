@@ -422,7 +422,7 @@ let remoteInvokeResultOutboxBytes = 0;
 let remoteInvokeResultOutboxTimer: ReturnType<typeof setTimeout> | null = null;
 /** 显式 link-close/撤权世代；旧世代仍在执行的 IPC 完成后不得把结果送进新链路。 */
 const remoteInvokeLinkEpoch = new Map<string, number>();
-/** Controllers that have successfully demonstrated topic-subscription support on this link. */
+/** Controllers that have demonstrated topic-subscription support in this process/account epoch. */
 const topicSubscriptionControllers = new Set<string>();
 /** 已成功 accept、尚未显式 close 的控制端；可无 active topic(现代重连等待 subscribe)。 */
 const acceptedLinkControllers = new Set<string>();
@@ -714,7 +714,6 @@ export function dropAllControllers(
  * 不清 invoke result/outbox：presence offline 可能只是弱网重连，控制端可靠请求仍在等回包。
  */
 export function handleControllerOffline(deviceId: string): void {
-  topicSubscriptionControllers.delete(deviceId);
   acceptedLinkControllers.delete(deviceId);
   if (subscriptions.clearController(deviceId)) {
     syncForwarding();
@@ -814,6 +813,9 @@ function handleLinkOpen(
   // 已在当前 link 上证明支持 topic 的客户端可能重复 open;不能重新装回兼容 wildcard。
   const capabilities = sanitizeControllerCapabilities(payload?.capabilities);
   const rememberedModernTopics = subscriptions.hasRememberedModernTopics(src);
+  const knownModernController =
+    topicSubscriptionControllers.has(src)
+    || rememberedModernTopics;
   // 先确认 link-accept 已经进入 socket/可靠层，再提交本地订阅状态。弱网背压下
   // accept 发送失败时不能留下“控制端未连上、被控端却显示已受控”的幽灵订阅。
   client.sendLinkAccept(src, requestId, {
@@ -821,14 +823,14 @@ function handleLinkOpen(
     allowlistHash: computeAllowlistHash(),
   });
   acceptedLinkControllers.add(src);
-  if (topicSubscriptionControllers.has(src)) {
+  if (knownModernController) {
     subscriptions.updateControllerMetadata(src, name, capabilities);
   } else {
-    subscriptions.subscribe(src, rememberedModernTopics ? [] : [LEGACY_TOPIC], name, capabilities);
+    subscriptions.subscribe(src, [LEGACY_TOPIC], name, capabilities);
   }
   syncForwarding();
   flushRemoteInvokeResultOutbox(src);
-  if (!rememberedModernTopics) {
+  if (!knownModernController) {
     for (const queued of offlinePushQueue.drain(src, [LEGACY_TOPIC])) {
       sendPushBestEffort(src, queued.channel, queued.payload);
     }

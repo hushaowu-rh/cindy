@@ -523,9 +523,14 @@ function forwardPush(channel: string, payload: unknown): void {
         }
       : payload;
   const dsts = subscriptions.getControllersForTopic(topic);
+  // The active registry describes peer topic intent, not whether this host can
+  // currently write to the relay. During host-side reconnects sendPush is a
+  // silent no-op, so route queueable pushes through the offline backlog instead.
+  const relayOnline = activeClient.getStatus() === 'online';
+  const liveTargets = relayOnline ? dsts : [];
   const offlineTargets = subscriptions
     .getKnownControllersForTopic(topic)
-    .filter((dst) => !dsts.includes(dst));
+    .filter((dst) => !liveTargets.includes(dst));
   for (const dst of offlineTargets) {
     if (OFFLINE_QUEUEABLE_PUSH_CHANNELS.has(channel)) {
       offlinePushQueue.enqueue(dst, {
@@ -535,7 +540,7 @@ function forwardPush(channel: string, payload: unknown): void {
       });
     }
   }
-  for (const dst of dsts) {
+  for (const dst of liveTargets) {
     // 转发是尽力而为的旁路:单个控制端的帧超限(PAYLOAD_TOO_LARGE,如大 tool 输出)/ 连接异常
     // 绝不能冒泡——它会经 tapWindowBroadcast 回到 broadcastToAllWindows,让被控端**本机** renderer
     // 漏收该事件(本地 UI 是第一优先);per-dst 接住也避免一个控制端坏帧拖垮其它控制端的转发。

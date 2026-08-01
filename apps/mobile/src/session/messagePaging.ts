@@ -274,5 +274,7 @@ export function compareMessageOrder(a: RemoteMessage, b: RemoteMessage): number 
     && Number.isFinite(b.rowid)
     && a.rowid !== b.rowid
   ) return a.rowid - b.rowid;
-  return (a.id || a.clientId).localeCompare(b.id || b.clientId);
+  // Older hosts and live push frames may not carry rowid. Their same-timestamp
+  // arrival order is meaningful; message ids are not insertion ordered.
+  return 0;
 }

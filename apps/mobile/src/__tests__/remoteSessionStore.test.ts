@@ -145,6 +145,19 @@ describe('remoteSessionStore', () => {
     ]);
   });
 
+  it('preserves arrival order for same-timestamp messages without host rowid', () => {
+    const createdAt = '2026-01-01T00:00:00.000Z';
+    remoteSessionStore.setMessages('s1', [
+      { ...message('z-first', 's1'), createdAt },
+      { ...message('a-second', 's1'), createdAt },
+    ]);
+
+    expect(remoteSessionStore.getMessages('s1').map((item) => item.id)).toEqual([
+      'z-first',
+      'a-second',
+    ]);
+  });
+
   it('stamps sessions with device-link origin and indexes session ids', () => {
     remoteSessionStore.setDeviceSessions('dev-1', 'Mac', [session('s1')]);
 

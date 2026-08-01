@@ -46,11 +46,13 @@ import * as subscriptions from '../subscriptions';
 /** 最小 mock client:只实现被测路径用到的两个发送方法。 */
 function mkClient(
   over: Partial<{
+    getStatus: ReturnType<typeof vi.fn>;
     sendInvokeResult: ReturnType<typeof vi.fn>;
     sendPush: ReturnType<typeof vi.fn>;
   }> = {},
 ) {
   return {
+    getStatus: over.getStatus ?? vi.fn(() => 'online'),
     sendInvokeResult: over.sendInvokeResult ?? vi.fn(),
     sendLinkAccept: vi.fn(),
     closeLink: vi.fn(),

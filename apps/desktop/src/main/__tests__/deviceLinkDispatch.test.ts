@@ -394,8 +394,9 @@ import { DEVICE_LINK_RECONCILIATION_PROBE_MARKER } from '@cindy/maker-shared/dev
 import { MAKER_PUSH } from '../maker-ipc/channels';
 
 /** 最小 fake client:捕获 onFrame handler,记录出站调用 */
-function makeFakeClient() {
+function makeFakeClient(initialStatus: 'stopped' | 'connecting' | 'online' = 'online') {
   let frameHandler: ((env: Envelope) => unknown | Promise<unknown>) | null = null;
+  let status = initialStatus;
   const calls = {
     linkAccept: [] as Array<{ dst: string; requestId: string }>,
     closed: [] as Array<{ dst: string; reason: string }>,
@@ -403,6 +404,7 @@ function makeFakeClient() {
     invokeResult: [] as Array<{ dst: string; requestId: string; payload: unknown }>,
   };
   const client = {
+    getStatus: () => status,
     onFrame: (cb: (env: Envelope) => unknown | Promise<unknown>) => {
       frameHandler = cb;
       return () => {};
@@ -417,6 +419,9 @@ function makeFakeClient() {
   return {
     client: client as never,
     calls,
+    setStatus: (nextStatus: 'stopped' | 'connecting' | 'online') => {
+      status = nextStatus;
+    },
     feed: (env: Envelope) => frameHandler?.(env),
   };
 }
@@ -1910,6 +1915,28 @@ describe('被控端订阅 registry + topic 转发', () => {
     expect(hasBroadcastTapListener()).toBe(true);
     feed(subFrame('ctrl-a', UNSUB, ['sessions']));
     expect(hasBroadcastTapListener()).toBe(false);
+  });
+
+  it('relay-offline queues broadcasts for active topic subscribers', () => {
+    remoteControlEnabled = true;
+    const { client, calls, feed, setStatus } = makeFakeClient();
+    wireInboundDispatch(client);
+    feed(subFrame('ctrl-a', SUB, ['session:s1']));
+    setStatus('connecting');
+
+    tapWindowBroadcast('local-db:messages:created', {
+      sessionId: 's1',
+      id: 'm1',
+    });
+
+    expect(calls.push).toEqual([]);
+    expect(dispatchTesting.queuedPushesFor('ctrl-a')).toEqual([
+      {
+        channel: 'local-db:messages:created',
+        payload: { sessionId: 's1', id: 'm1' },
+        topic: 'session:s1',
+      },
+    ]);
   });
 
   it('presence-offline keeps the tap alive and queues broadcasts for remembered topics', () => {

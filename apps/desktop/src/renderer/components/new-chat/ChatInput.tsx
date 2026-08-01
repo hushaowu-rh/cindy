@@ -28,6 +28,7 @@ import History from '@tiptap/extension-history';
 import Placeholder from '@tiptap/extension-placeholder';
 import HardBreak from '@tiptap/extension-hard-break';
 import type { Editor, JSONContent } from '@tiptap/core';
+import { createComposerInputLatencyProbe } from '@/lib/composerInputLatencyProbe';
 import { CjkPunctDecoration } from './CjkPunctDecoration';
 import { ComposerListIndentDecoration } from './ComposerListIndentDecoration';
 import {
@@ -175,7 +176,6 @@ import { getAppShortcutCombos } from '@/lib/appShortcutStore';
 import { getNextPermissionMode } from '@/lib/permissionModeCycle';
 import { matchesKeyboardEvent } from '../../../shared/appShortcuts';
 import { createLogger } from '@/lib/logger';
-import { createComposerInputLatencyProbe } from '@/lib/composerInputLatencyProbe';
 import { serializeEditorContent, serializeEditorSlice } from './composerContentSerialization';
 import {
   composerDocumentContainsList,
@@ -1372,14 +1372,6 @@ export function ChatInput({
   // atomic chips, and only the list nodes needed to preserve Markdown list
   // structure while editing. It does not use StarterKit, whose headings and
   // marks are not part of the chat input contract.
-  const composerInputLatencyProbeRef = useRef<
-    ReturnType<typeof createComposerInputLatencyProbe> | null
-  >(null);
-  composerInputLatencyProbeRef.current ??= createComposerInputLatencyProbe({
-    log: composerPerfLog,
-  });
-  useEffect(() => () => composerInputLatencyProbeRef.current?.dispose(), []);
-
   const editor = useEditor({
     // Match the legacy textarea's `autoFocus` prop — on mount, focus the
     // editor at the end so the user can continue typing after restored text.
@@ -1930,11 +1922,6 @@ export function ChatInput({
         });
       }
       setTick((t) => t + 1);
-      composerInputLatencyProbeRef.current?.markUpdate({
-        kind: 'document',
-        composing: ed.view.composing,
-        docSize: ed.state.doc.content.size,
-      });
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
@@ -1976,11 +1963,6 @@ export function ChatInput({
     },
     onSelectionUpdate: ({ editor: ed }) => {
       setTick((t) => t + 1);
-      composerInputLatencyProbeRef.current?.markUpdate({
-        kind: 'selection',
-        composing: ed.view.composing,
-        docSize: ed.state.doc.content.size,
-      });
       if (!composerMentionDragActiveRef.current) {
         lastComposerSelectionFromRef.current = ed.state.selection.from;
       }
@@ -2049,6 +2031,34 @@ export function ChatInput({
   const editorRef = useRef<Editor | null>(null);
   useEffect(() => {
     editorRef.current = editor;
+  }, [editor]);
+
+  useEffect(() => {
+    if (!editor) return;
+
+    const probe = createComposerInputLatencyProbe({ log: composerPerfLog });
+    const markDocumentUpdate = ({ editor: activeEditor }: { editor: Editor }): void => {
+      probe.markUpdate({
+        kind: 'document',
+        composing: activeEditor.view.composing,
+        docSize: activeEditor.state.doc.content.size,
+      });
+    };
+    const markSelectionUpdate = ({ editor: activeEditor }: { editor: Editor }): void => {
+      probe.markUpdate({
+        kind: 'selection',
+        composing: activeEditor.view.composing,
+        docSize: activeEditor.state.doc.content.size,
+      });
+    };
+
+    editor.on('update', markDocumentUpdate);
+    editor.on('selectionUpdate', markSelectionUpdate);
+    return () => {
+      editor.off('update', markDocumentUpdate);
+      editor.off('selectionUpdate', markSelectionUpdate);
+      probe.dispose();
+    };
   }, [editor]);
 
   // Message action menu “Add to chat”: reuse the exact session-chip insertion

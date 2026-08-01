@@ -34,6 +34,7 @@ import {
   type AskUserDraft,
   type AskUserViewerState,
   type ChatMessage,
+  type ContinuationInFlightProjectionCapability,
   type PendingPermission,
   type PendingAskUser,
   type PendingPluginSetup,
@@ -64,6 +65,7 @@ export type {
   AskUserDraft,
   AskUserViewerState,
   ChatMessage,
+  ContinuationInFlightProjectionCapability,
   PendingPermission,
   PendingAskUser,
   PendingPlanReview,
@@ -157,7 +159,7 @@ interface UseCCAgentChatReturn {
   /** Dismiss the error banner without retrying. */
   clearError: () => void;
   /** Retry the main-owned typed recovery target. */
-  retryLastError: () => void;
+  retryLastError: () => Promise<void>;
   /** silent-stop 耗尽横幅「继续」:清横幅并发隐藏续跑指令(充值守卫额度)。 */
   continueAfterSilentStop: () => void;
   /** F-CMD: Insert a local-only system card */
@@ -184,6 +186,10 @@ interface UseCCAgentChatReturn {
   credentialSwitchWait: { clientId?: string; blockedBySessionIds: string[] } | null;
   /** 已离队、正在 coordinator dispatch/turn 边界内的 Continue clientId。 */
   continuationInFlightClientId: string | null;
+  /** 当前 vendor turn 的续跑发起项 clientId，steer 后及 Renderer 重载仍保持。 */
+  continuationTurnClientId: string | null;
+  /** 续跑边界投影能力；legacy 时保留旧被控端的兼容兜底。 */
+  continuationInFlightProjectionCapability: ContinuationInFlightProjectionCapability;
   /** F-SYNC-2: Load older messages (prepend to top) */
   loadOlderMessages: () => void;
   isLoadingMore: boolean;
@@ -502,8 +508,8 @@ export function useCCAgentChat(
   }, [sessionId]);
 
   const retryLastError = useCallback(() => {
-    if (!sessionId) return;
-    makerChatStore.retryLastError(sessionId);
+    if (!sessionId) return Promise.resolve();
+    return makerChatStore.retryLastError(sessionId);
   }, [sessionId]);
 
   const insertSystemCard = useCallback(
@@ -833,6 +839,9 @@ export function useCCAgentChat(
     errorRetryText: lightState.errorRetryText,
     credentialSwitchWait: lightState.credentialSwitchWait,
     continuationInFlightClientId: lightState.continuationInFlightClientId,
+    continuationTurnClientId: lightState.continuationTurnClientId,
+    continuationInFlightProjectionCapability:
+      lightState.continuationInFlightProjectionCapability,
     loadOlderMessages,
     isLoadingMore: lightState.isLoadingMore,
     hasMoreMessages: lightState.hasMoreMessages,

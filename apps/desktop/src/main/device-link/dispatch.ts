@@ -67,7 +67,7 @@ import { createOfflinePushQueue } from './offlinePushQueue';
 import * as subscriptions from './subscriptions';
 import { LEGACY_TOPIC, type ActiveController } from './subscriptions';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
-import { sanitizeGhostSetupRequestForRemote } from '../cindy-brain/ghostSetupInteractionBridge.js';
+import { projectInteractionRequestForRemote } from '../cindy-brain/ghostSetupInteractionBridge.js';
 import {
   remoteWorkingDirRejectionToIpcError,
   type RemoteWorkingDirCheckResult,
@@ -512,18 +512,19 @@ function forwardPush(channel: string, payload: unknown): void {
   if (!activeClient) return;
   const topic = topicForPush(channel, payload);
   if (!topic) return;
-  const remotePayload =
+  let remotePayload = payload;
+  if (
     channel === MAKER_PUSH.INTERACTION_REQUEST &&
     payload &&
     typeof payload === 'object' &&
     'request' in payload
-      ? {
-          ...payload,
-          request: sanitizeGhostSetupRequestForRemote(
-            (payload as { request: unknown }).request,
-          ),
-        }
-      : payload;
+  ) {
+    const request = projectInteractionRequestForRemote(
+      (payload as { request: unknown }).request,
+    );
+    if (request === null) return;
+    remotePayload = { ...payload, request };
+  }
   const dsts = subscriptions.getControllersForTopic(topic);
   // The active registry describes peer topic intent, not whether this host can
   // currently write to the relay. During host-side reconnects sendPush is a

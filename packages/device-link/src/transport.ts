@@ -34,6 +34,12 @@ export const MAX_TRANSPORT_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
 export const TRANSPORT_RETRY_INTERVAL_MS = 2_000;
 /** 连续重发上限；之后保留消息等待重连，避免弱网下无限制造流量。 */
 export const TRANSPORT_MAX_RETRY_ATTEMPTS = 5;
+/**
+ * pending 里 push 帧的最大滞留时长。push 是尽力而为的实时镜像旁路，对端长时间
+ * 未 ACK（典型是离线）后这些帧只剩历史价值；超龄后视为过期，在链路恢复重放前
+ * 与 invoke-result 需要腾位时清扫，避免陈旧 push 独占有界 pending 缓冲。
+ */
+export const TRANSPORT_PENDING_PUSH_MAX_AGE_MS = 5 * 60_000;
 
 const TRANSPORT_MARKER = '__cindyDeviceLinkTransport';
 const TRANSPORT_SKIP_MARKER = '__cindyDeviceLinkTransportSkip';

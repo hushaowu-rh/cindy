@@ -8,7 +8,9 @@ import { PROTOCOL_VERSION, DeviceLinkError, type Envelope } from '../protocol.js
 import {
   DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT,
   DEVICE_LINK_TRANSPORT_ACK_CHANNEL,
+  MAX_TRANSPORT_PENDING_MESSAGES,
   MAX_TRANSPORT_WEBSOCKET_BUFFERED_BYTES,
+  TRANSPORT_PENDING_PUSH_MAX_AGE_MS,
   encodeReliableFrames,
   makeTransportSkipPayload,
   parseTransportPayload,
@@ -1207,6 +1209,142 @@ describe('DeviceLinkClient', () => {
     h.client.sendPush('dev-b', 'maker:event', { text: 'sent' });
     const sent = h.current().sent.filter((e) => e.kind === 'push' && e.dst === 'dev-b');
     expect(parseTransportPayload(sent.at(-1)!.payload)?.meta.seq).toBe(1);
+    h.client.stop();
+  });
+
+  it('缓冲被未 ACK 的 push 占满时，invoke-result 按最旧优先驱逐 push 腾位，不被饿死', async () => {
+    const warn = vi.fn();
+    const h = makeHarness({
+      timing: { pingIntervalMs: 10_000 },
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+    });
+    h.client.start();
+    await tick();
+    h.current().ack();
+    await establishInboundReliableLink(h, 'starved-stream');
+
+    for (let i = 0; i < MAX_TRANSPORT_PENDING_MESSAGES; i++) {
+      h.client.sendPush('dev-b', 'maker:event', { i });
+    }
+    // push 之间不互相驱逐：溢出的 push 仍按原语义被背压拒绝
+    expect(() => h.client.sendPush('dev-b', 'maker:event', { text: 'overflow' })).toThrow(
+      expect.objectContaining({ code: 'BACKPRESSURE' }),
+    );
+
+    // invoke-result 是控制端的存活凭据：驱逐最旧 push 腾位，立即入队发出
+    expect(() =>
+      h.client.sendInvokeResult('dev-b', 'probe-result', { ok: true, result: [] }),
+    ).not.toThrow();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('to make room for invoke-result'),
+    );
+    const resultFrame = h.current().sent.find(
+      (env) => env.kind === 'invoke-result' && env.id === 'probe-result',
+    )!;
+    const meta = parseTransportPayload(resultFrame.payload)!.meta;
+    expect(meta.seq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 1);
+    // 只驱逐了最旧的 seq=1：baseSeq 前移到 2，其余未过期 push 保留等待 ACK
+    expect(meta.baseSeq).toBe(2);
+    h.client.stop();
+  });
+
+  it('建链即清扫：离线期间过期的 push 不再重放，link-accept 的 baseSeq 直接跳过它们', async () => {
+    const warn = vi.fn();
+    const h = makeHarness({
+      timing: { pingIntervalMs: 10_000, transportRetryIntervalMs: 60_000 },
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+    });
+    h.client.start();
+    await tick();
+    h.current().ack();
+    await establishInboundReliableLink(h, 'stale-stream');
+
+    h.client.sendPush('dev-b', 'maker:event', { text: 'stale-1' });
+    h.client.sendPush('dev-b', 'maker:event', { text: 'stale-2' });
+    h.client.sendPush('dev-b', 'maker:event', { text: 'stale-3' });
+
+    // 静默断连(无 link-close,如对端失联/中继断开):push 留在 pending 等待重放
+    h.current().emit('close', 1006, 'network lost');
+    await vi.waitFor(() => expect(h.sockets).toHaveLength(2));
+    h.current().ack();
+    await tick();
+
+    // 离线时长超过 push 最大滞留时长后控制端重新建链
+    const realNow = Date.now;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(
+      () => realNow() + TRANSPORT_PENDING_PUSH_MAX_AGE_MS + 1_000,
+    );
+    try {
+      const before = h.current().sent.length;
+      await establishInboundReliableLink(h, 'stale-stream-reopen');
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('swept 3 expired push frame(s)'),
+      );
+      // accept 直接宣告新基线：过期 push 的 seq 1..3 被接收端整体跳过
+      const accept = h.current().sent.slice(before).find((env) => env.kind === 'link-accept')!;
+      expect((accept.payload as { transportBaseSeq?: number }).transportBaseSeq).toBe(4);
+      // 过期 push 一条都不重放
+      const replayedPushes = h.current().sent.slice(before).filter((env) =>
+        env.kind === 'push' && env.dst === 'dev-b' && parseTransportPayload(env.payload) !== null,
+      );
+      expect(replayedPushes).toHaveLength(0);
+
+      // 建链后 invoke-result 立即发出，不再排在陈旧 push 的重放洪峰后面
+      h.client.sendInvokeResult('dev-b', 'probe-result', { ok: true, result: [] });
+      const resultFrame = h.current().sent.find(
+        (env) => env.kind === 'invoke-result' && env.id === 'probe-result',
+      )!;
+      expect(parseTransportPayload(resultFrame.payload)!.meta.seq).toBe(4);
+    } finally {
+      nowSpy.mockRestore();
+    }
+    h.client.stop();
+  });
+
+  it('腾位只驱逐 push：队头是未完成 invoke 时不驱逐，invoke-result 保持原背压语义', async () => {
+    const warn = vi.fn();
+    const h = makeHarness({
+      timing: { pingIntervalMs: 10_000, requestTimeoutMs: 5_000 },
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+    });
+    h.client.start();
+    await tick();
+    h.current().ack();
+
+    const open = h.client.openLink('dev-b', {
+      controllerName: 'Test',
+      protocolVersion: 1,
+      appVersion: '1',
+    });
+    const sentOpen = h.current().sent.find((e) => e.kind === 'link-open')!;
+    h.current().push({
+      v: PROTOCOL_VERSION,
+      kind: 'link-accept',
+      id: sentOpen.id,
+      src: 'dev-b',
+      payload: {
+        appVersion: '1',
+        allowlistHash: 'hash',
+        capabilities: [DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT],
+        transportStreamId: 'remote-stream',
+      },
+    });
+    await open;
+
+    // 队头 seq=1 是等待响应的 invoke，其后被 push 填满
+    const p = h.client.invoke('dev-b', { channel: 'maker:list-active', args: [] }, 5_000);
+    p.catch(() => {});
+    for (let i = 0; i < MAX_TRANSPORT_PENDING_MESSAGES - 1; i++) {
+      h.client.sendPush('dev-b', 'maker:event', { i });
+    }
+
+    expect(() => h.client.sendInvokeResult('dev-b', 'r1', { ok: true, result: [] })).toThrow(
+      expect.objectContaining({ code: 'BACKPRESSURE' }),
+    );
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('to make room for invoke-result'),
+    );
     h.client.stop();
   });
 

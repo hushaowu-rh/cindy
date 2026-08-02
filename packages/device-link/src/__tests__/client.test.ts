@@ -107,6 +107,7 @@ async function establishInboundReliableLink(
   h: Harness,
   streamId: string,
   transportBaseSeq = 1,
+  src = 'dev-b',
 ): Promise<void> {
   const id = `inbound-link-${++inboundLinkId}`;
   const off = h.client.onFrame((env) => {
@@ -120,7 +121,7 @@ async function establishInboundReliableLink(
     v: PROTOCOL_VERSION,
     kind: 'link-open',
     id,
-    src: 'dev-b',
+    src,
     payload: {
       controllerName: 'Remote',
       protocolVersion: 1,
@@ -1651,6 +1652,129 @@ describe('DeviceLinkClient', () => {
 
     host.stop();
     controller.stop();
+  });
+
+  it('被驱逐 seq 的迟到 ACK 幂等无害：不误删存活的 result、不抛错、不错推状态', async () => {
+    const h = makeHarness({ timing: { pingIntervalMs: 10_000, transportRetryIntervalMs: 60_000 } });
+    h.client.start();
+    await tick();
+    h.current().ack();
+    await establishInboundReliableLink(h, 'stale-ack-stream');
+
+    for (let i = 0; i < MAX_TRANSPORT_PENDING_MESSAGES; i++) {
+      h.client.sendPush('dev-b', 'maker:event', { i });
+    }
+    // 驱逐 seq 1..64，result 以 seq=65 入队
+    h.client.sendInvokeResult('dev-b', 'probe-result', { ok: true, result: [] });
+    const resultFrame = h.current().sent.find(
+      (env) => env.kind === 'invoke-result' && env.id === 'probe-result',
+    )!;
+    const streamId = parseTransportPayload(resultFrame.payload)!.meta.streamId;
+
+    // 驱逐×ACK 竞态：接收端对早已被驱逐的 seq=3 的迟到累计 ACK 现在才到
+    const sendAck = (ackSeq: number) => h.current().push({
+      v: PROTOCOL_VERSION,
+      kind: 'push',
+      src: 'dev-b',
+      payload: {
+        channel: DEVICE_LINK_TRANSPORT_ACK_CHANNEL,
+        payload: { streamId, ackSeq },
+      },
+    });
+    sendAck(3);
+    // 越界的未知 ACK（超过 nextSeq-1）同样幂等忽略
+    sendAck(999);
+    await tick();
+
+    // result 仍在 pending 队头：后续帧的 baseSeq 仍指向 65，未被误删
+    h.client.sendPush('dev-b', 'maker:event', { text: 'after-stale-ack' });
+    const pushFrames = h.current().sent.filter(
+      (env) => env.kind === 'push' && parseTransportPayload(env.payload) !== null,
+    );
+    const afterStale = parseTransportPayload(pushFrames[pushFrames.length - 1].payload)!.meta;
+    expect(afterStale.seq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 2);
+    expect(afterStale.baseSeq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 1);
+
+    // 真正的 ACK(65) 只清掉 result：再下一帧 baseSeq 前移到 66
+    sendAck(MAX_TRANSPORT_PENDING_MESSAGES + 1);
+    await tick();
+    h.client.sendPush('dev-b', 'maker:event', { text: 'after-real-ack' });
+    const pushFrames2 = h.current().sent.filter(
+      (env) => env.kind === 'push' && parseTransportPayload(env.payload) !== null,
+    );
+    const afterReal = parseTransportPayload(pushFrames2[pushFrames2.length - 1].payload)!.meta;
+    expect(afterReal.seq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 3);
+    expect(afterReal.baseSeq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 2);
+    h.client.stop();
+  });
+
+  it('单 FIFO 固有极限：live invoke 卡在中段时，result 只跨过其前的可丢弃前缀，语义一致不死锁', async () => {
+    const warn = vi.fn();
+    const h = makeHarness({
+      timing: { pingIntervalMs: 10_000, transportRetryIntervalMs: 60_000 },
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+    });
+    h.client.start();
+    await tick();
+    h.current().ack();
+    await establishInboundReliableLink(h, 'mid-live-stream');
+
+    // 队形：[push(1), live-invoke(2), push×62] → 满 64
+    h.client.sendPush('dev-b', 'maker:event', { text: 'head-discardable' });
+    const p = h.client.invoke('dev-b', { channel: 'maker:list-active', args: [] }, 5_000);
+    p.catch(() => {});
+    for (let i = 0; i < MAX_TRANSPORT_PENDING_MESSAGES - 2; i++) {
+      h.client.sendPush('dev-b', 'maker:event', { i });
+    }
+
+    // 前缀清扫停在 live invoke：只丢 seq=1，result 入队但排在 invoke+push 之后。
+    // 这是维护者确认的单 FIFO 极限：live 帧之后的 push 不可跨越（会留 seq 空洞）
+    expect(() =>
+      h.client.sendInvokeResult('dev-b', 'queued-result', { ok: true, result: [] }),
+    ).not.toThrow();
+    const resultFrame = h.current().sent.find(
+      (env) => env.kind === 'invoke-result' && env.id === 'queued-result',
+    )!;
+    const meta = parseTransportPayload(resultFrame.payload)!.meta;
+    expect(meta.seq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 1);
+    expect(meta.baseSeq).toBe(2);
+
+    // 再次满员且队头已是 live invoke：前缀为空，维持 BACKPRESSURE，不死循环不死锁
+    expect(() => h.client.sendInvokeResult('dev-b', 'r2', { ok: true, result: [] })).toThrow(
+      expect.objectContaining({ code: 'BACKPRESSURE' }),
+    );
+    h.client.stop();
+  });
+
+  it('驱逐只作用于目标 peer：另一控制端的 pending 不受影响', async () => {
+    const h = makeHarness({ timing: { pingIntervalMs: 10_000, transportRetryIntervalMs: 60_000 } });
+    h.client.start();
+    await tick();
+    h.current().ack();
+    await establishInboundReliableLink(h, 'iso-b');
+    await establishInboundReliableLink(h, 'iso-c', 1, 'dev-c');
+
+    h.client.sendPush('dev-c', 'maker:event', { keep: true });
+    for (let i = 0; i < MAX_TRANSPORT_PENDING_MESSAGES; i++) {
+      h.client.sendPush('dev-b', 'maker:event', { i });
+    }
+    // dev-b 的 result 驱逐 dev-b 全部 64 条 push
+    h.client.sendInvokeResult('dev-b', 'probe-result', { ok: true, result: [] });
+    const resultMeta = parseTransportPayload(
+      h.current().sent.find((env) => env.kind === 'invoke-result' && env.id === 'probe-result')!.payload,
+    )!.meta;
+    expect(resultMeta.baseSeq).toBe(MAX_TRANSPORT_PENDING_MESSAGES + 1);
+
+    // dev-c 的缓冲丝毫未动：seq=1 仍在 pending，新帧 baseSeq 仍为 1
+    h.client.sendPush('dev-c', 'maker:event', { second: true });
+    const devCFrames = h.current().sent.filter(
+      (env) => env.kind === 'push' && env.dst === 'dev-c' && parseTransportPayload(env.payload) !== null,
+    );
+    const devCMeta = parseTransportPayload(devCFrames[devCFrames.length - 1].payload)!.meta;
+    expect(devCMeta.seq).toBe(2);
+    // 线上格式在 baseSeq === 1 时省略该字段：基线仍为 1 即未发生任何驱逐
+    expect(devCMeta.baseSeq ?? 1).toBe(1);
+    h.client.stop();
   });
 
   it('invoke request id 在没有 global crypto 的运行时仍可生成', async () => {

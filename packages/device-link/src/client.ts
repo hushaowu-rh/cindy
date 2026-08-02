@@ -1991,6 +1991,9 @@ export class DeviceLinkClient {
   private handleTransportAck(src: string, streamId: string, ackSeq: number): void {
     const peer = this.peerTransport.get(src);
     if (!peer || !peer.reliable || !peer.linkReady || peer.streamId !== streamId) return;
+    // 迟到/陈旧 ACK 幂等无害（含指向已被驱逐 seq 的 ACK）：驱逐后该 seq 已不在
+    // map 里，累计删除循环遇到更高的队头 live seq 直接 break，不会误删、不抛错、
+    // 不错误推进状态；高于 nextSeq-1 的未知 ACK 与倒退的 ACK 直接忽略。
     if (ackSeq > peer.nextSeq - 1 || ackSeq <= peer.highestAckSeq) return;
     peer.highestAckSeq = ackSeq;
     for (const [seq, pending] of peer.pending) {
@@ -2036,6 +2039,24 @@ export class DeviceLinkClient {
    * 用于普通入队压力下的兜底清扫；expiredOnly=false 丢弃整个可丢弃前缀
    * （fresh push 一并放弃），用于重连重放前与 invoke-result 腾位——保证剩余
    * 队头就是最早的 live 帧，invoke-result 不会排在任何可丢弃帧之后。
+   *
+   * 不变量的作用域（刻意从窄）：「result 成为最早可交付的 live seq」只在两个
+   * 清扫时点成立——重连重放写入 socket 之前、新帧入队之前。已写进 WebSocket
+   * FIFO 的帧无法撤回，本方法不承诺全时态抢占；队头是 live 帧时前缀为空，
+   * 维持原 BACKPRESSURE 语义。这也是单 FIFO 的固有极限：live 帧之后的 push
+   * 不可跨越（会留 seq 空洞），例如 [push, live-invoke, push…] 只能丢掉第一段，
+   * result 仍排在 live-invoke 之后——「push 无损」与「result 抢占」在单流上
+   * 不可兼得（需独立优先 stream 才能同时满足）。
+   *
+   * 终止性与计数：每轮迭代要么删除当前队头、要么 break（队头 live / 未过期），
+   * 至多 pending.size 轮；removePendingEntry 同步扣减 pendingBytes 并在队空时
+   * 回收 retryTimer，不产生计数漂移。只触碰参数 peer（按 dst 隔离）的缓冲。
+   *
+   * 数据完整性：被丢弃的 push 不是静默丢数据——push 是尽力而为的状态镜像，
+   * 控制端在重连/回前台时会整体 resync + 重新订阅（mobile 侧 reconnect
+   * reseed），最新状态由下一次全量拉取补偿。传输层没有 push 的离线持久队列
+   * （invoke-result 的 outbox 在 host 层且与 push 无关），驱逐回填既无宿主也无
+   * 必要，故不做。
    */
   private dropDiscardablePendingPrefix(
     dst: string,

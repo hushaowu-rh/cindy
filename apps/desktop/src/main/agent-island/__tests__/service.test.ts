@@ -76,6 +76,7 @@ const mocks = vi.hoisted(() => ({
   readLayoutPreferences: vi.fn<() => Map<number, AgentIslandLayoutPreference>>(() => new Map()),
   writeLayoutPreference: vi.fn(),
   tapWindowBroadcast: vi.fn(),
+  pushSessionActivityToController: vi.fn(),
   showMessageBox: vi.fn(),
   openExternal: vi.fn(),
   readdir: vi.fn<(...args: unknown[]) => Promise<string[]>>(() => Promise.resolve([])),
@@ -128,6 +129,12 @@ vi.mock('../../device-link/broadcast-tap.js', () => ({
   tapWindowBroadcast: mocks.tapWindowBroadcast,
 }));
 
+// 定向 replay 出口(L3):service 只依赖这一个函数,mock 掉避免把整个 dispatch
+// 隔离层(electron app / settings-store / invoke 链)拖进灵动岛单测。
+vi.mock('../../device-link/dispatch.js', () => ({
+  pushSessionActivityToController: mocks.pushSessionActivityToController,
+}));
+
 import { resetEpermGuidanceForTest } from '../../file-access/permissions.js';
 
 beforeEach(() => {
@@ -158,6 +165,7 @@ beforeEach(() => {
   mocks.readLayoutPreferences.mockReturnValue(new Map());
   mocks.writeLayoutPreference.mockReset();
   mocks.tapWindowBroadcast.mockReset();
+  mocks.pushSessionActivityToController.mockReset();
   mocks.showMessageBox.mockReset();
   mocks.showMessageBox.mockResolvedValue({ response: 1, checkboxChecked: false });
   mocks.openExternal.mockReset();
@@ -561,16 +569,18 @@ describe('AgentIslandService native publishing', () => {
     service.handleUserPrompt({ sessionId: 's1', agentKind: 'codex' }, 'run tests');
     mocks.tapWindowBroadcast.mockClear();
 
-    service.replaySessionActivity();
+    service.replaySessionActivity('controller-a');
 
-    expect(mocks.tapWindowBroadcast).toHaveBeenCalledWith(
-      SESSION_ACTIVITY_CHANNEL,
+    // 定向 replay(L3):只补给刚订阅的那台,不再经 broadcast-tap 扇出给全部控制端。
+    expect(mocks.pushSessionActivityToController).toHaveBeenCalledWith(
+      'controller-a',
       expect.objectContaining({
         sessionId: 's1',
         phase: 'running',
         compactDetail: 'run tests',
       }),
     );
+    expect(mocks.tapWindowBroadcast).not.toHaveBeenCalled();
   });
 
   it('replays unread terminal activity for late sessions subscribers', async () => {
@@ -590,19 +600,20 @@ describe('AgentIslandService native publishing', () => {
     service.handleAgentEvent({ sessionId: 's1', agentKind: 'codex' }, doneEvent());
     mocks.tapWindowBroadcast.mockClear();
 
-    service.replaySessionActivity();
+    service.replaySessionActivity('controller-a');
 
     // 完成但未读(attention=true)对迟到订阅者重放完整快照,而不是收尾清除包 ——
     // 手机端会话行右侧的完成绿点靠 phase+attention 点亮;已读后 attention 翻 false
     // 才降级为 terminal clear(由 relay isPublishableActivity 判定)。
-    expect(mocks.tapWindowBroadcast).toHaveBeenCalledWith(
-      SESSION_ACTIVITY_CHANNEL,
+    expect(mocks.pushSessionActivityToController).toHaveBeenCalledWith(
+      'controller-a',
       expect.objectContaining({
         sessionId: 's1',
         phase: 'completed',
         attention: true,
       }),
     );
+    expect(mocks.tapWindowBroadcast).not.toHaveBeenCalled();
   });
 
   it('broadcasts a terminal clear for read receipts even when the session is unknown to state', async () => {

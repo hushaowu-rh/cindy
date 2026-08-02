@@ -43,6 +43,7 @@ import {
   type InvokePayload,
   type InvokeResultPayload,
   type LinkOpenPayload,
+  type SessionActivityPayload,
   type Topic,
 } from '@cindy/device-link';
 import {
@@ -617,6 +618,22 @@ function forwardPush(channel: string, payload: unknown): void {
   }
 }
 
+/**
+ * L3 定向 replay 出口:把一帧 activity 只发给**指定控制端**(刚完成 `sessions` 订阅
+ * 的那台),不经 broadcast-tap 扇出惊扰其它控制端。走同一键控缓冲 —— replay 与
+ * 并发 publish 的同 key 帧自动合并,重连窗口的 replay 洪峰同样被压成 O(会话数)。
+ * 控制端已不在 `sessions` 订阅者集合(极短窗口内退订/断链)则丢弃,不为幽灵设备缓冲。
+ */
+export function pushSessionActivityToController(
+  controllerDeviceId: string,
+  payload: SessionActivityPayload,
+): void {
+  if (!activeClient) return;
+  if (!subscriptions.getControllersForTopic('sessions').includes(controllerDeviceId)) return;
+  const key = sessionActivityOutboxKey(SESSION_ACTIVITY_CHANNEL, payload);
+  if (key === null) return;
+  sessionActivityOutbox.enqueue(controllerDeviceId, key, SESSION_ACTIVITY_CHANNEL, payload);
+}
 
 /**
  * 被控端主动产生的 topic 域推送(不经 broadcast-tap 的路径):当前消费方是远程
@@ -2054,6 +2071,7 @@ export const __testing = {
   remoteInvokeResultOutboxSize: () => remoteInvokeResultOutbox.size,
   flushRemoteInvokeResultOutbox,
   forwardPush,
+  pushSessionActivityToController,
   sessionActivityOutbox,
   queuedPushesFor(deviceId: string) {
     return offlinePushQueue.snapshot(deviceId);

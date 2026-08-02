@@ -34,7 +34,12 @@ export class SessionActivityRelay {
   private readonly terminalReplayPayloads = new Map<string, SessionActivityPayload>();
 
   constructor(
-    private readonly emit: (payload: SessionActivityPayload) => void,
+    /**
+     * 出帧回调。target 缺省(publish / clear 路径)= 广播语义,由消费方扇出给全部
+     * 订阅者;target 指定(replay 路径)= 只投递给该控制端 —— replay 是新订阅者的
+     * 补课,其它控制端状态本就新鲜,摇给全员只会在重连窗口制造结构性洪峰。
+     */
+    private readonly emit: (payload: SessionActivityPayload, target?: string) => void,
     options: SessionActivityRelayOptions = {},
   ) {
     this.minIntervalMs = Math.max(0, options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
@@ -98,18 +103,31 @@ export class SessionActivityRelay {
     this.emit(payload);
   }
 
-  /** Replays current list activity without changing throttle state. */
-  replay(list: readonly AgentIslandSessionActivity[]): void {
+  /**
+   * Replays current list activity without changing throttle state.
+   * target 透传给 emit:指定时整轮 replay 只定向投递给该控制端(订阅触发的补课),
+   * 缺省保持历史广播语义。
+   */
+  replay(list: readonly AgentIslandSessionActivity[], target?: string): void {
     const seenSessionIds = new Set<string>();
     for (const activity of list) {
       if (!activity.sessionId) continue;
       seenSessionIds.add(activity.sessionId);
       const payload = toSessionActivityPayload(activity);
-      this.emit(isPublishableActivity(payload) ? payload : toTerminalActivityPayload(activity.sessionId));
+      this.emitTo(
+        isPublishableActivity(payload) ? payload : toTerminalActivityPayload(activity.sessionId),
+        target,
+      );
     }
     for (const [sessionId, payload] of this.terminalReplayPayloads) {
-      if (!seenSessionIds.has(sessionId)) this.emit(payload);
+      if (!seenSessionIds.has(sessionId)) this.emitTo(payload, target);
     }
+  }
+
+  /** 无 target 时保持与 publish/clear 路径完全同形的单参 emit(不附带 trailing undefined)。 */
+  private emitTo(payload: SessionActivityPayload, target: string | undefined): void {
+    if (target === undefined) this.emit(payload);
+    else this.emit(payload, target);
   }
 
   private publishOne(payload: SessionActivityPayload): void {

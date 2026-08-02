@@ -2606,8 +2606,10 @@ const registerIpcHandlers = () => {
     getMainWindow: () => getWindow() ?? null,
     isPlannedRemoteDaemonClose: isCcMgrUpgradeInFlight,
   })?.setAppFocused(hasFocusedAppWindow());
-  setSessionsSubscribedListener(() => {
-    getAgentIslandService()?.replaySessionActivity();
+  setSessionsSubscribedListener((controllerDeviceId) => {
+    // 定向 replay:只补给刚完成 sessions 订阅的那台(经 dispatch 键控缓冲),
+    // 不再全员扇出 —— 多设备重连窗口互相陀螺式放大 push 洪峰是 #1375 取证的病根之一。
+    getAgentIslandService()?.replaySessionActivity(controllerDeviceId);
   });
 
   // 「在新窗口打开」会话多开 —— 新建一个完整窗口定位到该 session, 初始 bounds 取主窗。

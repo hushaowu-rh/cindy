@@ -110,6 +110,7 @@ import {
 } from './layoutPreferenceStore.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
+import { pushSessionActivityToController } from '../device-link/dispatch.js';
 import {
   beginProtectedFolderCheck,
   detectProtectedFolderEperm,
@@ -274,7 +275,13 @@ export class AgentIslandService {
     sessionId: string;
     request: Extract<InteractionRequest, { kind: 'permission' }>;
   }>();
-  private readonly sessionActivityRelay = new SessionActivityRelay((payload) => {
+  private readonly sessionActivityRelay = new SessionActivityRelay((payload, target) => {
+    if (target !== undefined) {
+      // 定向 replay(某控制端刚完成 sessions 订阅):只补给那一台,走 dispatch 的
+      // 键控 latest-wins 缓冲 —— 不经 broadcast-tap 扇出,其它控制端与本机 renderer 零打扰。
+      pushSessionActivityToController(target, payload);
+      return;
+    }
     tapWindowBroadcast(SESSION_ACTIVITY_CHANNEL, payload);
   });
   private permissionResolver: ((requestId: string, decision: AgentIslandPermissionDecision) => boolean) | null = null;
@@ -1160,8 +1167,8 @@ export class AgentIslandService {
     this.commitMetadata(sessionId, next);
   }
 
-  replaySessionActivity(): void {
-    this.sessionActivityRelay.replay(this.buildSessionActivityPayload());
+  replaySessionActivity(controllerDeviceId: string): void {
+    this.sessionActivityRelay.replay(this.buildSessionActivityPayload(), controllerDeviceId);
   }
 
   /**

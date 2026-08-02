@@ -136,6 +136,36 @@ describe('SessionActivityRelay', () => {
     }));
   });
 
+  it('threads the target controller through every replay emit (targeted replay, L3)', () => {
+    const emit = vi.fn();
+    const relay = new SessionActivityRelay(emit, { minIntervalMs: 0 });
+
+    // 先留下一个 terminal replay 条目(未被 list 覆盖的会话)
+    relay.publish([activity('s-done', 'finishing')]);
+    relay.publish([]);
+    emit.mockClear();
+
+    relay.replay([activity('s1', 'Thinking')], 'controller-a');
+
+    // 活跃帧与 terminal 补发帧都必须带上同一目标控制端 —— 定向 replay 不惊扰其它设备
+    expect(emit).toHaveBeenCalledTimes(2);
+    expect(emit).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ sessionId: 's1', compactDetail: 'Thinking' }),
+      'controller-a',
+    );
+    expect(emit).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ sessionId: 's-done', phase: 'completed' }),
+      'controller-a',
+    );
+
+    // 无 target 的 replay 保持单参 emit(历史广播语义不变)
+    emit.mockClear();
+    relay.replay([activity('s1', 'Thinking')]);
+    expect(emit.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
   it('replays terminal clears that late subscribers may have missed', () => {
     const emit = vi.fn();
     const relay = new SessionActivityRelay(emit, { minIntervalMs: 1_500 });

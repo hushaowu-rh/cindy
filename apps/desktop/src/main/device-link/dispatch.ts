@@ -38,6 +38,7 @@ import {
   DL_TELEGRAM_SET_ONLINE_CHANNEL,
   DeviceLinkError,
   parseFsWatchTopic,
+  SESSION_ACTIVITY_CHANNEL,
   type Envelope,
   type InvokePayload,
   type InvokeResultPayload,
@@ -67,6 +68,7 @@ import { adviseAndRecordVoiceInputDictionaryLearning } from '../voice-input/inde
 import { readDictionaryProjectionForMobile } from '../voice-input/dictionarySyncDriver.js';
 import { setBroadcastTapListener } from './broadcast-tap';
 import { createOfflinePushQueue } from './offlinePushQueue';
+import { SessionActivityOutbox } from './sessionActivityOutbox';
 import * as subscriptions from './subscriptions';
 import { LEGACY_TOPIC, type ActiveController } from './subscriptions';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
@@ -120,6 +122,32 @@ const UPDATE_RELAUNCH_NON_BLOCKING_INVOKE_CHANNELS: ReadonlySet<string> = new Se
 ]);
 const textEncoder = new TextEncoder();
 const offlinePushQueue = createOfflinePushQueue();
+
+/**
+ * `sessions:activity` 的键控 latest-wins 出站缓冲(结构性削峰,见模块头注释)。
+ * send 直接走 activeClient.sendPush(错误按 DeviceLinkError 分类);canSend 预判
+ * relay 在线,避开 sendPush 离线静默 no-op 导致的假成功。
+ */
+const sessionActivityOutbox = new SessionActivityOutbox({
+  send: (dst, channel, payload) => {
+    if (!activeClient) throw new DeviceLinkError('NOT_CONNECTED', 'device-link client not wired');
+    activeClient.sendPush(dst, channel, payload);
+  },
+  canSend: () => activeClient?.getStatus() === 'online',
+});
+
+/**
+ * 状态通道帧的缓冲 key;非 activity 通道 / 形状异常(无 sessionId)返回 null,
+ * 调用方回落 sendPushBestEffort 直发路径。只有 `sessions:activity` 被收编:
+ * 它是接收端 last-write-wins 的状态镜像;maker:event 等真事件流每帧有语义,不可合并。
+ */
+function sessionActivityOutboxKey(channel: string, payload: unknown): string | null {
+  if (channel !== SESSION_ACTIVITY_CHANNEL) return null;
+  if (!payload || typeof payload !== 'object') return null;
+  const sessionId = (payload as { sessionId?: unknown }).sessionId;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
+  return `${channel}:${sessionId}`;
+}
 
 /** 只排队可由 session snapshot 对账、且不携带权限终态的会话域事件。 */
 const OFFLINE_QUEUEABLE_PUSH_CHANNELS: ReadonlySet<string> = new Set([
@@ -575,12 +603,20 @@ function forwardPush(channel: string, payload: unknown): void {
     }
   }
   for (const dst of liveTargets) {
+    // 状态通道(sessions:activity)走键控 latest-wins 缓冲:洪峰压成 O(会话数) 且自钟控,
+    // 不再与 invoke-result / 真事件流抢 per-peer 可靠传输 pending 槽位(PR #1375 病根链)。
+    const activityKey = sessionActivityOutboxKey(channel, remotePayload);
+    if (activityKey !== null) {
+      sessionActivityOutbox.enqueue(dst, activityKey, channel, remotePayload);
+      continue;
+    }
     // 转发是尽力而为的旁路:单个控制端的帧超限(PAYLOAD_TOO_LARGE,如大 tool 输出)/ 连接异常
     // 绝不能冒泡——它会经 tapWindowBroadcast 回到 broadcastToAllWindows,让被控端**本机** renderer
     // 漏收该事件(本地 UI 是第一优先);per-dst 接住也避免一个控制端坏帧拖垮其它控制端的转发。
     sendPushBestEffort(dst, channel, remotePayload);
   }
 }
+
 
 /**
  * 被控端主动产生的 topic 域推送(不经 broadcast-tap 的路径):当前消费方是远程
@@ -735,6 +771,7 @@ export function dropAllControllers(
   topicSubscriptionControllers.clear();
   acceptedLinkControllers.clear();
   offlinePushQueue.clear();
+  sessionActivityOutbox.clearAll();
   syncForwarding();
 }
 
@@ -746,6 +783,9 @@ export function dropAllControllers(
  */
 export function handleControllerOffline(deviceId: string): void {
   acceptedLinkControllers.delete(deviceId);
+  // 活跃订阅已清,缓冲的 activity 帧失去投递对象;控制端恢复后重新 subscribe
+  // 会触发定向 replay 重新播种最新状态,不需要为离线设备留存退避重试定时器。
+  sessionActivityOutbox.clear(deviceId);
   if (subscriptions.clearController(deviceId)) {
     syncForwarding();
   }
@@ -759,6 +799,7 @@ export function forgetControllerInvokeState(deviceId: string): void {
 /** 显式撤销时清理短时离线队列与 remembered topic，避免恢复后重放撤权期间数据。 */
 export function purgeRevokedController(deviceId: string): void {
   offlinePushQueue.clear(deviceId);
+  sessionActivityOutbox.clear(deviceId);
   subscriptions.forgetKnownController(deviceId);
   topicSubscriptionControllers.delete(deviceId);
   acceptedLinkControllers.delete(deviceId);
@@ -792,6 +833,7 @@ async function handleFrame(client: DeviceLinkClient, env: Envelope): Promise<voi
       if (!src) return;
       clearRemoteInvokeStateFor(src);
       offlinePushQueue.clear(src);
+      sessionActivityOutbox.clear(src);
       acceptedLinkControllers.delete(src);
       // Keep the protocol-capability marker, but discard all remembered routing.
       // A modern controller must reconnect and explicitly subscribe; restoring the
@@ -1721,6 +1763,8 @@ function handleSubscriptionFrame(src: string, payload: InvokePayload): InvokeRes
     }
   } else {
     subscriptions.unsubscribe(src, topics);
+    // 退订 sessions 即不再欠该控制端列表级状态,丢弃其暂存区里尚未泵出的 activity 帧。
+    if (topics.includes('sessions')) sessionActivityOutbox.clear(src);
   }
   syncForwarding();
   if (isSub && topics.includes('sessions')) {
@@ -1992,6 +2036,7 @@ export const __testing = {
     onSessionsSubscribed = null;
     activeClient = null;
     offlinePushQueue.clear();
+    sessionActivityOutbox.clearAll();
     setBroadcastTapListener(null);
   },
   getActiveControllers,
@@ -2009,6 +2054,7 @@ export const __testing = {
   remoteInvokeResultOutboxSize: () => remoteInvokeResultOutbox.size,
   flushRemoteInvokeResultOutbox,
   forwardPush,
+  sessionActivityOutbox,
   queuedPushesFor(deviceId: string) {
     return offlinePushQueue.snapshot(deviceId);
   },

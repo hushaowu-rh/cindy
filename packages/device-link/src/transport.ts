@@ -35,9 +35,11 @@ export const TRANSPORT_RETRY_INTERVAL_MS = 2_000;
 /** 连续重发上限；之后保留消息等待重连，避免弱网下无限制造流量。 */
 export const TRANSPORT_MAX_RETRY_ATTEMPTS = 5;
 /**
- * pending 里 push 帧的最大滞留时长。push 是尽力而为的实时镜像旁路，对端长时间
- * 未 ACK（典型是离线）后这些帧只剩历史价值；超龄后视为过期，在链路恢复重放前
- * 与 invoke-result 需要腾位时清扫，避免陈旧 push 独占有界 pending 缓冲。
+ * pending 里 push 帧的最大滞留时长（按单调时钟计量，不受墙钟校正影响）。push 是
+ * 尽力而为的实时镜像旁路，长时间未被 ACK（典型是对端离线）后只剩历史价值；
+ * 超龄后在普通入队压力下被兜底清扫，避免陈旧 push 独占有界 pending 缓冲。
+ * 重连重放前与 invoke-result 腾位不看此 TTL：这两条路径直接丢弃队头整个可丢弃
+ * 前缀（含新鲜 push 与 transport-skip 占位），保证 invoke-result 是最早的 live seq。
  */
 export const TRANSPORT_PENDING_PUSH_MAX_AGE_MS = 5 * 60_000;
 

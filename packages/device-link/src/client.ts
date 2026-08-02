@@ -250,7 +250,7 @@ interface PendingReliableMessage {
   attempts: number;
   lastSentAt: number;
   sent: boolean;
-  /** 入队时刻；push 帧按 TRANSPORT_PENDING_PUSH_MAX_AGE_MS 判定过期。 */
+  /** 入队时刻（monotonicNow 单调时钟）；push 帧按 TRANSPORT_PENDING_PUSH_MAX_AGE_MS 判定过期。 */
   enqueuedAt: number;
 }
 
@@ -600,11 +600,15 @@ export class DeviceLinkClient {
       && matchingOffer.capabilities.includes(DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT)
     );
     const peer = this.getPeerTransport(dst);
-    // 建链即清扫：过期 push 先出队，让 accept 携带的 transportBaseSeq 直接跳过
-    // 它们，对端从一开始就不等这些陈旧 seq，随后的重放也不再灌回离线期间堆积
-    // 的过期实时镜像（v0.1.25 线上曾出现建链后 250ms invoke-result 仍被离线期
-    // 间堆满的 push 挤在缓冲外，控制端的存活探测因此超时，熔断持续 open）。
-    if (peerSupportsReliable) this.sweepExpiredPendingPushes(dst, peer);
+    // 建链即丢弃队头连续的可丢弃前缀（push 不分新旧 + skip 占位）：让 accept
+    // 携带的 transportBaseSeq 直接跳过它们，对端从一开始就不等这些 seq，随后的
+    // 重放不再灌回离线期间堆积的实时镜像，紧随建链而来的 invoke-result 成为最
+    // 早可交付的 live seq（v0.1.25 线上曾出现建链后 250ms invoke-result 仍被离
+    // 线期间堆满的 push 重放洪峰挤在后面，控制端的存活探测因此超时，熔断持续
+    // open）。
+    if (peerSupportsReliable) {
+      this.dropDiscardablePendingPrefix(dst, peer, false, 'before link re-establishment replay');
+    }
     this.sendEnvelope({
       v: PROTOCOL_VERSION,
       kind: 'link-accept',
@@ -1689,10 +1693,17 @@ export class DeviceLinkClient {
       peer.pending.size < MAX_TRANSPORT_PENDING_MESSAGES
       && peer.pendingBytes + reservedBytes <= MAX_TRANSPORT_PENDING_BYTES
     );
-    if (!hasPendingCapacity() && env.kind === 'invoke-result') {
-      // invoke-result 是控制端确认被控端存活的唯一凭据，绝不能被堆积的 push
-      // 饿死：先清扫过期 push，仍不够则按最旧优先继续驱逐队头 push 腾位。
-      this.evictPendingPushesForInvokeResult(env.dst, peer, hasPendingCapacity);
+    if (!hasPendingCapacity()) {
+      if (env.kind === 'invoke-result') {
+        // invoke-result 是控制端确认被控端存活的唯一凭据，绝不能被堆积的可丢弃
+        // 帧饿死：丢弃整个队头可丢弃前缀（fresh push 一并放弃——单 FIFO 无法同时
+        // 做到 push 无损与 result 抢占），让 result 成为最早可交付的 live seq。
+        this.dropDiscardablePendingPrefix(env.dst, peer, false, 'to make room for invoke-result');
+      } else {
+        // 其它帧的入队压力只做 TTL 兜底清扫：过期 push 已无实时价值，先出队腾位；
+        // 新鲜 push 之间维持原有 BACKPRESSURE 语义，不互相驱逐。
+        this.dropDiscardablePendingPrefix(env.dst, peer, true, 'after pending push TTL expiry');
+      }
     }
     if (!hasPendingCapacity()) {
       throw new DeviceLinkError(
@@ -1713,7 +1724,7 @@ export class DeviceLinkClient {
       attempts: 0,
       lastSentAt: 0,
       sent: false,
-      enqueuedAt: Date.now(),
+      enqueuedAt: this.monotonicNow(),
     };
     peer.pending.set(seq, pending);
     peer.pendingBytes += reservedBytes;
@@ -1994,52 +2005,62 @@ export class DeviceLinkClient {
   }
 
   /**
-   * 清扫 pending 队头连续的过期 push 帧。只能从队头连续删除：队头出队后
-   * baseSeq（最小 pending seq）随之前移，后续帧携带的 baseSeq 会让接收端整体
-   * 跳过这些 seq；若删除中段条目则会留下 seq 空洞，接收端累计 ACK 永久停住。
-   * 队内 seq 即入队顺序，队头最老，所以「过期段」天然是队头连续前缀。
+   * 单调时钟。pending 帧的滞留时长（TTL）必须用不受墙钟校正影响的时源计量：
+   * Date.now() 在系统时间被向前校正超过 TRANSPORT_PENDING_PUSH_MAX_AGE_MS 时，
+   * 会把刚入队的 push 误判为过期。测试通过 stub 本方法模拟老化。
    */
-  private sweepExpiredPendingPushes(dst: string, peer: PeerTransportState): number {
-    const now = Date.now();
-    let evicted = 0;
-    for (const [seq, pending] of peer.pending) {
-      if (pending.envelope.kind !== 'push') break;
-      if (now - pending.enqueuedAt < TRANSPORT_PENDING_PUSH_MAX_AGE_MS) break;
-      this.removePendingEntry(peer, seq, pending);
-      evicted += 1;
-    }
-    if (evicted > 0) {
-      this.log.warn(
-        `swept ${evicted} expired push frame(s) from reliable buffer for peer ${dst.slice(0, 8)}`,
-      );
-    }
-    return evicted;
+  private monotonicNow(): number {
+    return performance.now();
   }
 
   /**
-   * invoke-result 入队时缓冲已满：先清扫过期 push，仍满则按最旧优先继续驱逐
-   * 队头 push，直到腾出容量或队头不再是 push（invoke / invoke-result 绝不驱逐）。
-   * push 本就是尽力而为的旁路（见 desktop 侧 forwardPush），而 invoke-result
-   * 一旦被饿死，控制端会把被控端判定为无响应并保持熔断，形成死锁。
+   * 可丢弃帧判据（重连重放与 invoke-result 腾位两条路径共用的不变量）：
+   * best-effort push，以及 timeout / relay-error 后被 dropReliablePendingForRequest
+   * 换成 transport-skip 占位 payload 的帧——其外层 kind 仍是原 invoke /
+   * invoke-result，但已无任何业务副作用。两者都可以通过推进 baseSeq 让接收端
+   * 整体跳过；live invoke / invoke-result 永不可丢弃，是丢弃前缀的边界。
    */
-  private evictPendingPushesForInvokeResult(
+  private isDiscardablePending(pending: PendingReliableMessage): boolean {
+    return (
+      pending.envelope.kind === 'push'
+      || isTransportSkipPayload(pending.envelope.payload)
+    );
+  }
+
+  /**
+   * 丢弃 pending 队头连续的可丢弃前缀。只能从队头连续删除：队头出队后
+   * baseSeq（最小 pending seq）随之前移，后续帧携带的 baseSeq 会让接收端整体
+   * 跳过这些 seq；若删除中段条目则会留下 seq 空洞，接收端累计 ACK 永久停住。
+   *
+   * expiredOnly=true 只删过期 push（skip 占位没有任何交付价值，始终可删），
+   * 用于普通入队压力下的兜底清扫；expiredOnly=false 丢弃整个可丢弃前缀
+   * （fresh push 一并放弃），用于重连重放前与 invoke-result 腾位——保证剩余
+   * 队头就是最早的 live 帧，invoke-result 不会排在任何可丢弃帧之后。
+   */
+  private dropDiscardablePendingPrefix(
     dst: string,
     peer: PeerTransportState,
-    hasCapacity: () => boolean,
-  ): void {
-    this.sweepExpiredPendingPushes(dst, peer);
-    let evicted = 0;
+    expiredOnly: boolean,
+    reason: string,
+  ): number {
+    const now = this.monotonicNow();
+    let dropped = 0;
     for (const [seq, pending] of peer.pending) {
-      if (hasCapacity()) break;
-      if (pending.envelope.kind !== 'push') break;
+      if (!this.isDiscardablePending(pending)) break;
+      if (
+        expiredOnly
+        && pending.envelope.kind === 'push'
+        && now - pending.enqueuedAt < TRANSPORT_PENDING_PUSH_MAX_AGE_MS
+      ) break;
       this.removePendingEntry(peer, seq, pending);
-      evicted += 1;
+      dropped += 1;
     }
-    if (evicted > 0) {
+    if (dropped > 0) {
       this.log.warn(
-        `evicted ${evicted} pending push frame(s) for peer ${dst.slice(0, 8)} to make room for invoke-result`,
+        `dropped ${dropped} discardable pending frame(s) (best-effort push / transport-skip) for peer ${dst.slice(0, 8)} ${reason}`,
       );
     }
+    return dropped;
   }
 
   private removePendingEntry(
@@ -2092,9 +2113,11 @@ export class DeviceLinkClient {
   private replayPending(dst: string, resumedLink = false): void {
     const peer = this.peerTransport.get(dst);
     if (!peer || !peer.reliable || !peer.linkReady || peer.pending.size === 0) return;
-    // 链路恢复先清扫过期 push：对端离线期间堆积的陈旧实时镜像不值得重放，只会
-    // 占满重放窗口，把紧随建链而来的 invoke-result 挤到数秒之后。
-    this.sweepExpiredPendingPushes(dst, peer);
+    // 重放前先丢弃队头连续的可丢弃前缀（push 不分新旧 + skip 占位）：重放一旦把
+    // 它们写进 WebSocket FIFO 就无法撤回，之后的 invoke-result 驱逐救不回已发出
+    // 的帧，接收端仍会按 seq 顺序先消化整段重放洪峰。丢弃后重放的第一帧就是最
+    // 早的 live 帧。
+    this.dropDiscardablePendingPrefix(dst, peer, false, 'before link re-establishment replay');
     if (peer.pending.size === 0) return;
     if (resumedLink || peer.lastReplayEpoch !== this.connEpoch) {
       peer.lastReplayEpoch = this.connEpoch;

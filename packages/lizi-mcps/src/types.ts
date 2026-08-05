@@ -401,6 +401,12 @@ export interface ContactsMcpDeps {
     items: import('@cindy/maker-core').SystemContactWriteItem[],
   ) => Promise<import('@cindy/maker-core').SystemContactWriteResult[]>;
   /**
+   * 系统通讯录回写的单批上限(host 侧 writeSystemContacts 一次能接收的最大条数)。
+   * 只接受 1..200 的整数, 缺省 200(host 硬限制);非法值/超限回退 200。
+   * 测试注入小值可省去大量建卡开销, 仍能验证分批边界。
+   */
+  systemWriteBatchSize?: number;
+  /**
    * write/manage 类工具成功后的变更通知(host 注入, 用于广播 renderer 刷新)。
    * MCP 直写同进程 store 不经 IPC 层, 没有这个回调 UI 就收不到 agent 侧变更。
    */
@@ -488,7 +494,7 @@ export type ControlResult<T extends object = object, E extends string = never> =
  * adding a new vendor (e.g. 'gemini') without updating this union will cause
  * LLM tool calls to fail zod enum validation.
  */
-export type ControlWorkerAgent = 'claude-code' | 'codex';
+export type ControlWorkerAgent = 'claude-code' | 'codex' | 'pi';
 
 /** Browser automation MCP host deps. Core browser execution is injected by host. */
 export interface BrowserMcpDeps {
@@ -745,6 +751,13 @@ export interface LiziMcpSessionContext {
    * ctx 时，标准范式是工具直接返业务错误码 (如 LEAD_NOT_SUPPORTED) 而不是抛异常。
    */
   sessionId?: string;
+  /**
+   * 当前内存 Session 实例的唯一代号。business sessionId 在重建后可能复用，
+   * 权限读取方用本字段阻断旧 MCP 请求借用新实例权限。宿主可将它作为
+   * opaque route identity 放进 harness 的本地 MCP URL；不得把它暴露成
+   * 模型或插件可控的工具参数。
+   */
+  sessionInstanceId?: string;
 }
 
 export interface CodexHttpMcpConfig {

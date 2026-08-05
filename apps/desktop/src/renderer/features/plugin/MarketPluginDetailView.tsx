@@ -1,12 +1,13 @@
-import { ArrowLeft, Download, ShieldCheck } from 'lucide-react';
+import { useId } from 'react';
+import { Download, ShieldCheck } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { WINDOW_NO_DRAG_STYLE } from '@/components/layout/windowDrag';
 import { cn } from '@/lib/utils';
 import { ghostPermissionItems } from '../../../shared/ghost';
 import type { PluginMarketDetail } from '../../../shared/pluginMarket';
 import { GhostPluginIcon } from './GhostPluginIcon';
 import { pluginPresentationOrigin } from './lib/pluginMarketPresentation';
+import { PluginDetailTopBar, usePluginDetailScrolled } from './PluginDetailTopBar';
 
 interface MarketPluginDetailViewProps {
   detail: PluginMarketDetail;
@@ -24,8 +25,11 @@ export function MarketPluginDetailView({
   onIconLoadError,
 }: MarketPluginDetailViewProps) {
   const { t } = useTranslation();
+  const { scrolled, onScroll } = usePluginDetailScrolled();
   const permissions = ghostPermissionItems(detail.manifest);
   const presentationOrigin = pluginPresentationOrigin(detail);
+  // 自定义市场（Git/本地源）的包字节未经服务端校验，安全说明必须如实区分。
+  const isCustomSource = detail.sourceType !== 'server';
   const actionKey =
     detail.installState === 'update-available'
       ? 'settings.ghosts.market.update'
@@ -36,20 +40,25 @@ export function MarketPluginDetailView({
           : 'settings.ghosts.market.install';
   const actionDisabled =
     busy || detail.installState === 'installed' || detail.installState === 'conflict';
+  // 冲突态的行动按钮只说「暂不可用」,原因必须在详情页也给出——列表卡片同一处理。
+  // 详情可能是先以非冲突态打开、随后目录或本地安装状态变化才转冲突的。
+  const conflictDescriptionId = useId();
+  const conflictDescription =
+    detail.installState === 'conflict'
+      ? t('settings.ghosts.market.conflictDescription')
+      : undefined;
 
   return (
-    <main className="plugin-motion-root h-full min-h-0 w-full overflow-y-auto bg-[var(--surface)] [scrollbar-gutter:stable_both-edges]">
+    <main
+      className="plugin-motion-root h-full min-h-0 w-full overflow-y-auto bg-[var(--surface)] [scrollbar-gutter:stable_both-edges]"
+      onScroll={onScroll}
+    >
+      <PluginDetailTopBar
+        label={t('settings.ghosts.detail.backToList')}
+        onBack={onBack}
+        scrolled={scrolled}
+      />
       <article className="plugin-detail-frame mx-auto w-full max-w-[824px] px-8 pb-16 pt-5 max-[760px]:px-6">
-        <button
-          type="button"
-          onClick={onBack}
-          className="-ml-3 mb-7 inline-flex h-9 items-center gap-2 rounded-full px-3 text-13 text-[var(--text-secondary)] transition-colors duration-150 hover:bg-[var(--surface-hover-soft)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)]"
-          style={WINDOW_NO_DRAG_STYLE}
-        >
-          <ArrowLeft size={16} aria-hidden="true" />
-          {t('settings.ghosts.detail.backToList')}
-        </button>
-
         <header>
           <div className="plugin-detail-hero grid grid-cols-[64px_minmax(0,1fr)_auto] items-center gap-3">
             <GhostPluginIcon
@@ -79,6 +88,7 @@ export function MarketPluginDetailView({
               type="button"
               onClick={onInstall}
               disabled={actionDisabled}
+              aria-describedby={conflictDescription ? conflictDescriptionId : undefined}
               className={cn(
                 'plugin-detail-primary-action inline-flex h-10 min-w-[104px] items-center justify-center gap-2 whitespace-nowrap rounded-full px-4 text-13 font-medium',
                 'bg-[var(--accent-cta-bg)] text-[var(--accent-pure-cta-fg)]',
@@ -91,8 +101,11 @@ export function MarketPluginDetailView({
               {t(actionKey)}
             </button>
           </div>
-          <p className="mt-5 text-14 leading-[22px] text-[var(--text-secondary)]">
-            {detail.description || detail.ghostId}
+          <p
+            id={conflictDescription ? conflictDescriptionId : undefined}
+            className="mt-5 text-14 leading-[22px] text-[var(--text-secondary)]"
+          >
+            {conflictDescription ?? (detail.description || detail.ghostId)}
           </p>
         </header>
 
@@ -110,7 +123,11 @@ export function MarketPluginDetailView({
               aria-hidden="true"
             />
             <p className="text-13 leading-5 text-[var(--text-secondary)]">
-              {t('settings.ghosts.market.securityDescription')}
+              {t(
+                isCustomSource
+                  ? 'settings.ghosts.market.customSecurityDescription'
+                  : 'settings.ghosts.market.securityDescription',
+              )}
             </p>
           </div>
         </section>

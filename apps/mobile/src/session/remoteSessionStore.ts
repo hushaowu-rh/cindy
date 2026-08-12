@@ -1,5 +1,10 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { SESSION_ACTIVITY_CHANNEL, type SessionActivityPayload } from '@cindy/device-link';
+import {
+  MAKER_EVENT_BATCH_CHANNEL,
+  SESSION_ACTIVITY_CHANNEL,
+  expandMakerEventBatchPayload,
+  type SessionActivityPayload,
+} from '@cindy/device-link';
 import {
   applyAgentTaskUpdateEvent,
   isSameAgentTaskAlias,
@@ -7,9 +12,13 @@ import {
   type AgentTaskUpdate,
 } from '@cindy/maker-shared/agent-task';
 import type { MobileGoalStatusPayload } from '@cindy/maker-shared/device-link-contract';
-import { applyCodexPlanSnapshotOnDone } from '@cindy/maker-shared/message-render';
+import { applyCodexPlanSnapshotOnDone, markCodexPlanTurnFailed } from '@cindy/maker-shared/message-render';
 import type { RemoteSessionLiveActivity } from '@cindy/maker-shared/session-list';
 import { buildDeviceIdentity, resolveCanonicalDeviceId } from '@cindy/maker-shared/mobile-home';
+import {
+  isProductTurnDoneEvent,
+  isTurnContinuationBoundaryEvent,
+} from '@cindy/maker-shared/turn-continuation';
 import { EMPTY_INPUT_PROJECTION, normalizeInputProjection } from '@/session/inputProjection';
 import { sortPendingInteractions } from '@/session/interactionModel';
 import { applySessionModelPrefPush } from '@/session/sessionModelMirror';
@@ -22,6 +31,7 @@ import { cacheSessionMessages, getCachedSessionMessages } from '@/session/mobile
 import { contentToPreview } from '@/utils/contentPreview';
 import type { MobileSystemCardType } from '@/session/systemCard';
 import type { InputProjection, PendingInteraction, RemoteMessage, RemoteSession } from '@/session/types';
+import { compareMessageOrder } from '@/session/messagePaging';
 import { normalizeRemoteMoney } from '@/session/remoteMoney';
 
 interface DeviceShard {
@@ -29,6 +39,28 @@ interface DeviceShard {
   deviceName: string;
   sessions: RemoteSession[];
 }
+
+export interface RemoteNewMakerWorktreePreference {
+  enabled: boolean;
+  /**
+   * 每次 pull / push / 本机显式点击都递增。新建页用它给在途 one-shot pull 做 fence，
+   * 防止较早发出的响应覆盖后来到达的工作端 push 或用户选择。
+   */
+  revision: number;
+}
+
+const EMPTY_NEW_MAKER_WORKTREE_PREFERENCE: RemoteNewMakerWorktreePreference =
+  Object.freeze({ enabled: false, revision: 0 });
+
+/**
+ * 工作端拥有的 New Maker worktree 源分支镜像。null 表示该 device + canonical
+ * baseRepo 尚无显式选择；revision 完全采用工作端快照，手机不自行递增。
+ */
+export type RemoteNewMakerWorktreeBranchPreference = {
+  baseRepo: string;
+  sourceBranch: string;
+  revision: number;
+} | null;
 
 /**
  * 会话元数据在途写登记(app 级单例):首页乐观写(置顶/归档/删除/重命名)begin 时
@@ -58,18 +90,31 @@ export interface RemoteSessionReconnectAttempt {
   attempt: number;
   maxAttempts: number;
   /**
-   * 重试原因。`'overload'` = 上游模型没有可用容量、agent 正在退避重投
-   * (maker-core 的 `(auto-retry N/M)` 标记); 缺省 / `'reconnect'` = 传输层重连。
+   * 重试原因。`'overload'` = 上游模型没有可用容量；`'rate-limit'` = Codex daemon
+   * 已耗尽内部 retry budget 后的受限外层重投；缺省 / `'reconnect'` = 传输层重连。
    *
    * 刻意复用同一个字段而不是新加一个: 这个 attempt 有 6 处清理点(turn 边界 / 快照 /
    * 收口 / 活动流), 拆成两个字段就得在每处各清一次, 漏一处就会残留一个假状态。
    */
-  kind?: 'reconnect' | 'overload';
+  kind?: 'reconnect' | 'overload' | 'rate-limit';
 }
 
 interface SessionMessageSyncMarker {
   messageCount: number | null;
   updatedAt: string;
+}
+
+export interface SetLatestMessageWindowOptions {
+  /**
+   * 本页**上沿之外服务端还有历史**(满页,或被 device-link 裁过行)。
+   *
+   * 真为真时,早于本页最旧行的缓存段一律不保留 —— 它与本页之间可能隔着从未加载的行,保留就会
+   * 在窗口里留下孤岛(详见 `setLatestMessageWindow` 里的说明与 #1222)。调用方用既有的
+   * `hasMoreOlderMessages` / `shouldKeepOlderMessagesAffordance` 判定即可,不需要自己数。
+   *
+   * 省略时按 false 处理(保持旧行为):调用方拿不到分页元信息时不该因此丢历史。
+   */
+  moreBeyondWindow?: boolean;
 }
 
 interface LivePlanSnapshot {
@@ -88,12 +133,33 @@ const EMPTY_SESSION_RUN_STATUS: RemoteSessionRunStatus = Object.freeze({
 });
 
 const shards = new Map<string, DeviceShard>();
+// 工作端拥有的 New Maker worktree 偏好按设备隔离；这里只是不持久化的显示镜像，
+// push 属 sessions topic，无 sessionId。唯一持久副本仍在被控端现有 Cindy 配置里。
+const newMakerWorktreePreferences = new Map<string, RemoteNewMakerWorktreePreference>();
+// deviceId → canonical baseRepo → 工作端权威分支快照。分支与 checkbox 是两份独立镜像；
+// 任一分支 pull / push / write-back 都不得改动 newMakerWorktreePreferences。
+const newMakerWorktreeBranchPreferences = new Map<
+  string,
+  Map<string, Exclude<RemoteNewMakerWorktreeBranchPreference, null>>
+>();
 const messages = new Map<string, RemoteMessage[]>();
 // The maker event is broadcast before its async DB create/update completes. Keep the latest
 // plan snapshot briefly in the session mirror so a late initial `messages:created` row cannot
 // overwrite a newer live state with the first stale 0/N snapshot.
 const livePlanSnapshots = new Map<string, Map<string, LivePlanSnapshot>>();
 const pendingInteractions = new Map<string, PendingInteraction[]>();
+/**
+ * 这个会话的 pending 列表当前是不是**权威**的(来自被控端的一次全量快照)。
+ *
+ * 空列表有两种来源,消费方光看 `getPendingInteractions()` 分辨不了:
+ * - 权威的空:被控端确认所有请求都已回答 / 撤销;
+ * - 非权威的空:`markDeviceOffline` / `removeDevice` 按设计清掉了这份投影(它依赖
+ *   实时连接),此刻我们其实不知道被控端还在等什么。
+ *
+ * 凡是「空快照才能做的清理」都必须先问这里,否则短暂离线会被误判成「都处理完了」。
+ * 不能退化成看全局 relay status:目标设备 offline 时 relay 仍可能 online(#1493 review)。
+ */
+const pendingInteractionsAuthoritative = new Set<string>();
 /**
  * 乐观 resolve 在途抑制集合:交互卡批准 / 拒绝已在本地乐观撤卡、被控端还没有
  * 确认的 requestId。这个窗口里权威流(全量快照 setPendingInteractions / push
@@ -194,6 +260,12 @@ function interactionsByRequestId(list: readonly PendingInteraction[]): Map<strin
   return byId;
 }
 const inputProjections = new Map<string, InputProjection>();
+// Projection queries can resolve after a newer push or terminal boundary. Keep
+// a monotonic per-session authority epoch so late snapshots cannot overwrite
+// current queue / continuation state (mirrors Desktop makerChatStore).
+const inputProjectionAuthorityEpochs = new Map<string, number>();
+let nextInputProjectionAuthorityEpoch = 0;
+let inputProjectionAuthorityEpochFloor = 0;
 const sessionLiveActivity = new Map<string, RemoteSessionLiveActivity>();
 const sessionRunning = new Map<string, boolean>();
 const sessionRunStatus = new Map<string, RemoteSessionRunStatus>();
@@ -203,6 +275,206 @@ const sessionRunStatus = new Map<string, RemoteSessionRunStatus>();
 const sessionMakerActivityEpochs = new Map<string, number>();
 let makerActivityEpoch = 0;
 const sessionMessageSyncMarkers = new Map<string, SessionMessageSyncMarker>();
+/**
+ * 每会话「已验证连续覆盖区间」:`[since, until]`(闭区间,ISO createdAt)内的**所有**服务端行都在
+ * 窗口里 —— 中间没有服务端有、本地没加载的行。缺省(未登记)= 未知,窗口不被信任为连续。
+ *
+ * 为什么需要它:`setLatestMessageWindow` 判断"要不要保留早于本页的旧段"时,只有两种旧段
+ *  - **来源不明的缓存**(冷开 hydrate 的那页):与本页的关系无从确认,本页上沿之外还有服务端历史
+ *    时必须丢弃,否则窗口留下孤岛(#1222);
+ *  - **已验证连续的历史**(整窗替换的那一页、用户一路「加载更早」翻出来的、以及订阅未断时收到的
+ *    实时 push):与本页确实相接。把它一并丢掉会让用户正在看的历史和滚动锚点凭空消失,而且自动
+ *    补齐也不会拉回(裁完窗口里已经没有内部跳变可发现了)——#1210 review 实测到的回归。
+ * 区间就是区分这两者的那条线:旧行落在 `[since, until]` 内、**且本页最旧行不晚于 `until`**
+ * (两段首尾相接)时才保留。
+ *
+ * 为什么不能只记下界:下界断言的是"从它到**窗口最新端**连续",而"窗口最新端"会被断流期间漏收的
+ * 行悄悄作废 —— 旧窗 1–80,断线漏收 81–200,重连后先到一条 push 201,再收到最新页 122–201:
+ * 窗口最新端已经跳到 201,下界仍指着 1,旧结论于是给"1–80 + 122–201"这个孤岛背了书。把上界显式
+ * 记下来,这类"接不上"就是一次比较(#1210 review)。
+ *
+ * `liveTailTrusted`:自 `until` 建立以来实时推送链路没断过 —— 只有这时新到的 push 才能把 `until`
+ * 往后推(订阅内的推送是顺序且完整的)。它由**权威页落库那一刻订阅是否已 ACK**决定:屏幕侧的
+ * `openAndSubscribe` 与 `startFocusedTopicSubscription` 都是 `void subscribe(...)`,刻意不等 ACK
+ * (订阅只管之后的推送,不该挡数据读),所以页比订阅先到是常态 —— 这个空窗里被控端写下的行既不会
+ * 进这一页、也不会被推过来,之后一条 push 就会把 `until` 抬过它们,而等尾部涨过一页后最新页已不含
+ * 那几行,事实自检也发现不了(#1210 review)。反过来重连补齐路径(`rehydrate`)是 `await subscribe`
+ * 之后才拉页的,所以那条路径拿到的是可信尾部。
+ * 断流(socket 掉线、退后台释放 session 订阅、离开会话取消订阅)一律清掉信任位与 ACK 记录:之后
+ * 收到的 push 与 `until` 之间可能漏了任意多行,不能续算。区间本身保留 —— 断流不会让断流前已验证
+ * 的那段失效。信任位只能由「ACK 之后落库的权威页」重新点亮(ACK 本身不行:ACK 之前的空窗里可能
+ * 已经漏了行,只有新的权威页能重新确定尾部)。
+ *
+ * 建立 / 扩展点(都对应"服务端一次给出的连续段"或"订阅内的顺序推送"):整窗替换 `setMessages`、
+ * 最新窗口 `setLatestMessageWindow`、「加载更早」`mergeEarlierMessages`、实时 push `appendMessage`。
+ * 冷开 hydrate 与空洞补齐 `mergeMessages` 刻意不登记:前者来源不明;后者补的是窗口内部的洞,补完
+ * 要算准新区间得先确认窗口里没有别的洞——而这正是补齐本身在解决的问题(保守不动的代价是补回来
+ * 的段可能在下一次满页同步时被丢弃,下次打开会重新补,方向上是安全的那一侧)。
+ * 清空 / rewind / 会话回收一律删除(重置为未知),下次最新窗口同步会重建。
+ *
+ * 事实自检:最新页若在 `[since, until]` 内带来窗口没有的行,说明旧结论已被服务端事实推翻(桌面侧
+ * 改写历史、迟到落库等),当次按"未知"处置,见 `joinableWindowCoverage`。
+ */
+type SessionWindowCoverage = {
+  /** 区间下界(含)。 */
+  since: string;
+  /** 区间上界(含)。 */
+  until: string;
+  /** 见上:实时推送链路自 `until` 建立以来未断过,`until` 可被新 push 续推。 */
+  liveTailTrusted: boolean;
+};
+const sessionWindowCoverage = new Map<string, SessionWindowCoverage>();
+/**
+ * 远端已 ACK「该会话实时流」订阅(topic `session:<id>`)的会话集合。只用来决定新落库的权威页能否
+ * 把尾部标成可信(见 `liveTailTrusted`);由 device-link 的订阅 ACK / 释放两侧记账。
+ */
+const sessionLiveStreamAcked = new Set<string>();
+
+/** 取一批行里最旧的 createdAt(空列表 → undefined)。 */
+function oldestCreatedAt(list: readonly RemoteMessage[]): string | undefined {
+  let oldest: string | undefined;
+  for (const item of list) {
+    if (!item.createdAt) continue;
+    if (oldest === undefined || item.createdAt.localeCompare(oldest) < 0) oldest = item.createdAt;
+  }
+  return oldest;
+}
+
+/** 取一批行里最新的 createdAt(空列表 → undefined)。 */
+function newestCreatedAt(list: readonly RemoteMessage[]): string | undefined {
+  let newest: string | undefined;
+  for (const item of list) {
+    if (!item.createdAt) continue;
+    if (newest === undefined || item.createdAt.localeCompare(newest) > 0) newest = item.createdAt;
+  }
+  return newest;
+}
+
+function forgetWindowCoverage(sessionId: string): void {
+  sessionWindowCoverage.delete(sessionId);
+}
+
+/**
+ * 这一页落库时尾部是否可信:订阅已 ACK → 之后的行会被推过来,`until` 可由 push 续推;订阅还没
+ * ACK(页比订阅先到,屏幕侧的常态)→ 空窗里被控端写下的行既不在这一页、也不会被推来,尾部不可信。
+ */
+function liveTailTrustedForPage(sessionId: string): boolean {
+  return sessionLiveStreamAcked.has(sessionId);
+}
+
+/** 整窗替换:窗口就是这一页,区间即这一页 —— 不与旧结论求并(旧内容已经不在窗口里了)。 */
+function coverReplacedWindow(sessionId: string, list: readonly RemoteMessage[]): void {
+  const since = oldestCreatedAt(list);
+  const until = newestCreatedAt(list);
+  if (!since || !until) {
+    forgetWindowCoverage(sessionId);
+    return;
+  }
+  sessionWindowCoverage.set(sessionId, {
+    since,
+    until,
+    liveTailTrusted: liveTailTrustedForPage(sessionId),
+  });
+}
+
+/**
+ * 最新页对账后登记:本页自身是连续段。`joined` 是本次**实际采纳**的旧结论(与本页首尾相接、
+ * 因此其覆盖的旧段被保留),undefined 表示旧段没被采纳、区间收敛到本页。
+ *
+ * 保留判据与这里必须用同一个 `joined`:否则"保留了旧段却不声明覆盖它"(下次同步照丢)或"声明了
+ * 覆盖却已经把它丢掉"(凭空背书出一个孤岛)两个方向都会让区间与窗口对不上。
+ */
+function coverLatestPage(
+  sessionId: string,
+  pageOldest: string,
+  pageNewest: string,
+  joined: SessionWindowCoverage | undefined,
+): void {
+  const since = joined && joined.since.localeCompare(pageOldest) < 0 ? joined.since : pageOldest;
+  const until = joined && joined.until.localeCompare(pageNewest) > 0 ? joined.until : pageNewest;
+  // 采纳的旧结论若已经是可信尾部(它的 until 就是本次上界),沿用它;否则由本页落库时的 ACK 状态决定。
+  const inheritsTrustedTail = joined?.liveTailTrusted === true
+    && joined.until.localeCompare(pageNewest) >= 0;
+  sessionWindowCoverage.set(sessionId, {
+    since,
+    until,
+    liveTailTrusted: inheritsTrustedTail || liveTailTrustedForPage(sessionId),
+  });
+}
+
+/**
+ * 「加载更早」:沿 `before` 从窗口最旧端连续取的一页,把下界前移。
+ *
+ * 还没有任何结论时(冷开 hydrate 的窗口上翻),这一页只能证明"从它到它接上的那一行"连续 ——
+ * `joinsAt` 就是合并前窗口的最旧行;窗口更上面的部分来源仍然不明,上界不能顺手抬到窗口最新端。
+ */
+function coverEarlierPage(sessionId: string, pageOldest: string, joinsAt: string | undefined): void {
+  const current = sessionWindowCoverage.get(sessionId);
+  if (current) {
+    if (pageOldest.localeCompare(current.since) < 0) {
+      sessionWindowCoverage.set(sessionId, { ...current, since: pageOldest });
+    }
+    return;
+  }
+  if (!joinsAt || pageOldest.localeCompare(joinsAt) > 0) return;
+  sessionWindowCoverage.set(sessionId, { since: pageOldest, until: joinsAt, liveTailTrusted: false });
+}
+
+/** 订阅内到达的实时 push:顺序且完整,可把上界往后推。 */
+function coverLiveRow(sessionId: string, message: RemoteMessage): void {
+  const current = sessionWindowCoverage.get(sessionId);
+  if (!current || !current.liveTailTrusted) return;
+  // 本地系统卡(/learn、/context 等)没有服务端对应行:用它推上界等于凭空声明"服务端到这一刻的
+  // 行都在窗口里"。
+  if (messageKey(message).startsWith('mobile-system-')) return;
+  const createdAt = message.createdAt;
+  if (!createdAt || createdAt.localeCompare(current.until) <= 0) return;
+  sessionWindowCoverage.set(sessionId, { ...current, until: createdAt });
+}
+
+/**
+ * 实时推送链路中断:ACK 记录作废,上界也不再能被 push 续算(见 `liveTailTrusted`)。区间本身保留。
+ * 省略 sessionId = 全部会话(socket 掉线影响所有订阅)。
+ */
+function noteLiveStreamInterrupted(sessionId?: string): void {
+  if (sessionId !== undefined) {
+    sessionLiveStreamAcked.delete(sessionId);
+    const current = sessionWindowCoverage.get(sessionId);
+    if (current?.liveTailTrusted) {
+      sessionWindowCoverage.set(sessionId, { ...current, liveTailTrusted: false });
+    }
+    return;
+  }
+  sessionLiveStreamAcked.clear();
+  for (const [key, current] of sessionWindowCoverage) {
+    if (current.liveTailTrusted) {
+      sessionWindowCoverage.set(key, { ...current, liveTailTrusted: false });
+    }
+  }
+}
+
+/**
+ * 取本次可采纳的旧结论:必须与本页首尾相接(本页最旧行不晚于上界),且没有被本页的事实推翻
+ * (本页在区间内带来了窗口里没有的行)。任一不成立 → undefined,按"未知"处置。
+ */
+function joinableWindowCoverage(
+  sessionId: string,
+  existingIndex: MessageIdentityIndex,
+  latestWindow: readonly RemoteMessage[],
+  pageOldest: string,
+): SessionWindowCoverage | undefined {
+  const coverage = sessionWindowCoverage.get(sessionId);
+  if (!coverage) return undefined;
+  if (pageOldest.localeCompare(coverage.until) > 0) return undefined;
+  for (const item of latestWindow) {
+    const createdAt = item.createdAt;
+    if (!createdAt) continue;
+    if (createdAt.localeCompare(coverage.since) < 0) continue;
+    if (createdAt.localeCompare(coverage.until) > 0) continue;
+    if (!messageIdentityIndexHas(existingIndex, item)) return undefined;
+  }
+  return coverage;
+}
 // Per-session live sub-agent task state, decoded from `agent_task_update` events (live-only,
 // never persisted — see @cindy/maker-shared/agent-task). Keyed taskId/parentToolUseId → update.
 const sessionTaskUpdates = new Map<string, ReadonlyMap<string, AgentTaskUpdate>>();
@@ -249,6 +521,19 @@ let deviceList: readonly { deviceId: string; name: string }[] | null = null;
 function emit(): void {
   storeVersion += 1;
   for (const sub of subs) sub();
+}
+
+function bumpInputProjectionAuthorityEpoch(sessionId: string): number {
+  const epoch = ++nextInputProjectionAuthorityEpoch;
+  inputProjectionAuthorityEpochs.set(sessionId, epoch);
+  return epoch;
+}
+
+function commitInputProjection(sessionId: string, next: InputProjection): boolean {
+  if (deepValueEqual(inputProjections.get(sessionId) ?? EMPTY_INPUT_PROJECTION, next)) return false;
+  inputProjections.set(sessionId, next);
+  emit();
+  return true;
 }
 
 function recomputeSessions(): void {
@@ -329,7 +614,7 @@ function preserveSessionRuntimeFields(fresh: RemoteSession, local: RemoteSession
 }
 
 function normalizeMessages(list: readonly RemoteMessage[]): RemoteMessage[] {
-  return [...list].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return [...list].sort(compareMessageOrder);
 }
 
 function messageKey(message: RemoteMessage): string {
@@ -378,6 +663,7 @@ function completeLivePlanSnapshotOnDone(
   snapshot: unknown,
   turnId: string | null,
   terminalStatus: string | null,
+  cancelled: boolean,
 ): boolean {
   if (!turnId) return false;
   const toolUseId = `plan:${turnId}`;
@@ -389,6 +675,8 @@ function completeLivePlanSnapshotOnDone(
     snapshot,
     turnId,
     terminalStatus,
+    undefined,
+    cancelled,
   );
   const content = completed.messages[0]?.content;
   if (!completed.changed || !isRecord(content)) return false;
@@ -487,23 +775,38 @@ function findMessageMergeKey(byKey: ReadonlyMap<string, RemoteMessage>, target: 
   return null;
 }
 
-function messageWindowsOverlap(a: readonly RemoteMessage[], b: readonly RemoteMessage[]): boolean {
-  // Keep the overlap probe linear even when the cached history contains many pages.
-  // `messageKey` is the common path; the separate identity sets preserve the
-  // clientId/id migration case without falling back to an O(n×m) nested scan.
-  const keys = new Set<string>();
-  const ids = new Set<string>();
-  const clientIds = new Set<string>();
-  for (const message of a) {
-    keys.add(messageKey(message));
-    if (message.id) ids.add(message.id);
-    if (message.clientId) clientIds.add(message.clientId);
+/**
+ * 「这一行在不在那一批里」的线性判据。`messageKey` 是常态路径;单独的 id / clientId 集合保留
+ * clientId→id 迁移那一档,不必退回 O(n×m) 嵌套扫描。
+ *
+ * 交集探测(`messageWindowsOverlap`)与覆盖区间的事实自检(`joinableWindowCoverage`)问的是同一件
+ * 事,共用这一份索引 —— 两处各写一遍迟早会在迁移档上分叉。
+ */
+type MessageIdentityIndex = {
+  keys: Set<string>;
+  ids: Set<string>;
+  clientIds: Set<string>;
+};
+
+function buildMessageIdentityIndex(list: readonly RemoteMessage[]): MessageIdentityIndex {
+  const index: MessageIdentityIndex = { keys: new Set(), ids: new Set(), clientIds: new Set() };
+  for (const message of list) {
+    index.keys.add(messageKey(message));
+    if (message.id) index.ids.add(message.id);
+    if (message.clientId) index.clientIds.add(message.clientId);
   }
-  return b.some((message) => (
-    keys.has(messageKey(message))
-      || (message.id ? ids.has(message.id) : false)
-      || (message.clientId ? clientIds.has(message.clientId) : false)
-  ));
+  return index;
+}
+
+function messageIdentityIndexHas(index: MessageIdentityIndex, message: RemoteMessage): boolean {
+  return index.keys.has(messageKey(message))
+    || (message.id ? index.ids.has(message.id) : false)
+    || (message.clientId ? index.clientIds.has(message.clientId) : false);
+}
+
+function messageWindowsOverlap(a: readonly RemoteMessage[], b: readonly RemoteMessage[]): boolean {
+  const index = buildMessageIdentityIndex(a);
+  return b.some((message) => messageIdentityIndexHas(index, message));
 }
 
 function streamingMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> {
@@ -835,12 +1138,19 @@ function flushAndFinalizeRemoteStreamingMessages(
 }
 
 function hasLiveAssistantMessage(sessionId: string): boolean {
-  const pendingLiveIds = pendingLiveAssistantClientIds.get(sessionId);
-  if (!pendingLiveIds || pendingLiveIds.size === 0) return false;
   return (messages.get(sessionId) ?? []).some((message) => (
-    message.role === 'assistant'
-      && (pendingLiveIds.has(message.clientId) || pendingLiveIds.has(message.id))
+    isPendingLiveAssistantMessage(sessionId, message)
   ));
+}
+
+function isPendingLiveAssistantMessage(
+  sessionId: string,
+  message: RemoteMessage,
+): boolean {
+  const pendingLiveIds = pendingLiveAssistantClientIds.get(sessionId);
+  return message.role === 'assistant'
+    && pendingLiveIds !== undefined
+    && (pendingLiveIds.has(message.clientId) || pendingLiveIds.has(message.id));
 }
 
 function flushPendingTextDeltas(): void {
@@ -933,7 +1243,7 @@ function sweepStaleTaskUpdates(sessionId: string): boolean {
 function recallParkedTaskUpdates(
   sessionId: string,
   data: unknown,
-  source: 'claude-code' | 'codex' | undefined,
+  source: 'claude-code' | 'codex' | 'pi' | undefined,
   prevMap: ReadonlyMap<string, AgentTaskUpdate> | undefined,
 ): ReadonlyMap<string, AgentTaskUpdate> | undefined {
   const parkedMap = sessionParkedTaskUpdates.get(sessionId);
@@ -952,6 +1262,16 @@ function recallParkedTaskUpdates(
 }
 
 export const remoteSessionStore = {
+  /**
+   * 读当前权威设备身份列表(setDeviceIdentity 注入的那份;未注入过为空)。
+   * 会话页抽屉等在首页之外调 buildMobileHomePresentation 时传入,保证展示归一化
+   * (canonicalDeviceId 认领)与首页/本 store 同一口径——不传 devices 的空列表会把
+   * store 已算好的规范 id 覆盖成仅凭会话内嵌名字推出的弱结果(re-link 后路由错设备)。
+   */
+  getDeviceIdentity(): readonly { deviceId: string; name: string }[] {
+    return deviceList ?? [];
+  },
+
   // 注入当前权威设备列表(首页从 /api/device-link/devices reconcile 后调用),用于设备身份归一化。
   // 仅在身份索引实际变化时重算,避免每次设备列表引用变动都刷新全部会话。
   setDeviceIdentity(devices: readonly { deviceId: string; name: string }[]): void {
@@ -1108,6 +1428,10 @@ export const remoteSessionStore = {
   setMessages(sessionId: string, list: readonly RemoteMessage[]): void {
     const textFlushed = flushPendingTextDelta(sessionId);
     const next = normalizeMessages(list);
+    // 记账在相等早退**之前**:这一页是服务端一次给出的连续段,它带来的连续性结论与"窗口内容有没有
+    // 变"无关。冷开缓存恰好与服务端最新页逐行相同时(常态)若被早退跳过,这次权威响应就白来了 ——
+    // 之后会话涨过一页、再遇一次满页重连刷新,本可保留的历史会被当成来源不明全丢(#1210 review)。
+    coverReplacedWindow(sessionId, next);
     if (remoteMessageListsEqual(messages.get(sessionId) ?? emptyMessages, next)) {
       if (textFlushed) emit();
       return;
@@ -1135,7 +1459,11 @@ export const remoteSessionStore = {
     emit();
   },
 
-  setLatestMessageWindow(sessionId: string, list: readonly RemoteMessage[]): void {
+  setLatestMessageWindow(
+    sessionId: string,
+    list: readonly RemoteMessage[],
+    options: SetLatestMessageWindowOptions = {},
+  ): void {
     const textFlushed = flushPendingTextDelta(sessionId);
     const latestWindow = normalizeMessages(list);
     if (latestWindow.length === 0) {
@@ -1152,6 +1480,8 @@ export const remoteSessionStore = {
       const preserved = existing.filter((item) => messageKey(item).startsWith('mobile-system-'));
       const next = preserved.length > 0 ? preserved : [];
       if (!remoteMessageListsEqual(existing, next)) {
+        // 服务端行被清空(只余本地卡):旧覆盖区间连同它背书的那些行一起没了,不能留着背书。
+        forgetWindowCoverage(sessionId);
         messages.set(sessionId, next);
         bumpMessageVersion();
         emit();
@@ -1164,7 +1494,8 @@ export const remoteSessionStore = {
     const existing = messages.get(sessionId) ?? [];
     const latestOldestCreatedAt = latestWindow[0].createdAt;
     const latestNewestCreatedAt = latestWindow[latestWindow.length - 1].createdAt;
-    const hasOverlap = messageWindowsOverlap(existing, latestWindow);
+    const existingIdentityIndex = buildMessageIdentityIndex(existing);
+    const hasOverlap = latestWindow.some((item) => messageIdentityIndexHas(existingIdentityIndex, item));
     const byKey = new Map<string, RemoteMessage>();
     // 截断保护的比较基准必须覆盖全部 existing 行:下面的循环只把窗口外(更新/更旧)
     // 的行 seed 进 byKey,窗口内重叠的完整行若不在基准里,payload 超限的窗口刷新
@@ -1174,14 +1505,52 @@ export const remoteSessionStore = {
     // A latest-page sync is authoritative for the tail of the conversation.
     // Only keep older cached pages when they overlap that page; otherwise stale
     // old windows can be rendered as if they were adjacent to fresh pushes.
+    //
+    // 「有交集」这个判据不足以保证**连续**:交集只说明两段有共同的行,不排除更早那一段与本页
+    // 之间还隔着服务端仍有、本地从未加载的行。于是窗口会留下"首段 + 尾段"的孤岛,中间几百行
+    // 缺失(手机端实测:整场会话的 6 轮对话在界面上凭空消失)。
+    //
+    // `moreBeyondWindow` 是调用方给的结构信号:本页是满页、或被 device-link 裁过行 —— 两者都
+    // 意味着**本页上沿之外服务端还有历史**。这时任何早于本页最旧行的缓存段都无法确认与本页
+    // 相接,一律丢弃,窗口于是始终是"某点 → 最新"的连续区间。代价是用户可见的历史变少(丢掉的
+    // 是不可信的那一段),「加载更早」入口仍在、可以按连续分页重新取回。
+    //
+    // 反之本页不满页时,服务端从会话起点到最新已经全给了,不存在中间缺口,旧段照原判据保留。
+    //
+    // 为什么不靠时间阈值判断空洞:那只能发现"两侧间隔很久"的孤岛。断连期间漏收几十上百条、
+    // 而它们在半小时内快速产生时(一个长 turn 里的连续工具调用就是),两侧间隔根本不大,检测不到
+    // (#1222)。从源头保证连续区间才覆盖得住。
+    //
+    // 例外(#1210 review):已验证连续的历史(整窗替换的那页、用户一路「加载更早」翻出来的、订阅
+    // 未断时收到的实时 push)与本页确实相接 —— 它由 `sessionWindowCoverage` 的覆盖区间标出。把这种
+    // 段也丢掉会让用户正在看的历史与滚动锚点凭空消失,而且补齐不会拉回它(裁完已无内部跳变可
+    // 发现)。所以判据是"在已验证覆盖区间内、且本页与该区间首尾相接 → 保留;否则才按
+    // moreBeyondWindow 处置"。
+    const keepUnverifiedOlderPages = hasOverlap && options.moreBeyondWindow !== true;
+    // 相接与否是一次判断,保留判据与下面的记账共用它:两处分开算迟早会让区间与窗口对不上。
+    const joinedCoverage = joinableWindowCoverage(
+      sessionId,
+      existingIdentityIndex,
+      latestWindow,
+      latestOldestCreatedAt,
+    );
     for (const item of existing) {
       const createdAt = item.createdAt;
       const isNewerThanLatestPage = createdAt.localeCompare(latestNewestCreatedAt) >= 0;
-      const isOlderLoadedPage = hasOverlap && createdAt.localeCompare(latestOldestCreatedAt) < 0;
+      const isVerifiedContiguous = joinedCoverage !== undefined
+        && createdAt.localeCompare(joinedCoverage.since) >= 0;
+      const isOlderLoadedPage = createdAt.localeCompare(latestOldestCreatedAt) < 0
+        && (isVerifiedContiguous || keepUnverifiedOlderPages);
       // 本地系统卡(/learn、/context 等)没有服务端对应行:不管时序落在窗口哪里都
       // 不会出现在 latestKeys 里,若不单独保留会被 window 刷新时静默丢弃。
       const isLocalSystemCard = messageKey(item).startsWith('mobile-system-');
-      if (isNewerThanLatestPage || isOlderLoadedPage || isLocalSystemCard) {
+      const isPendingLiveAssistant = isPendingLiveAssistantMessage(sessionId, item);
+      if (
+        isNewerThanLatestPage
+        || isOlderLoadedPage
+        || isLocalSystemCard
+        || isPendingLiveAssistant
+      ) {
         byKey.set(messageKey(item), item);
       }
     }
@@ -1230,6 +1599,9 @@ export const remoteSessionStore = {
     }
 
     const next = normalizeMessages([...byKey.values()]);
+    // 记账在相等早退**之前**(同 setMessages):这一页是服务端一次给出的连续段,它带来的结论与
+    // "窗口内容有没有变"无关。被早退跳过时这次权威响应就白来了(#1210 review)。
+    coverLatestPage(sessionId, latestOldestCreatedAt, latestNewestCreatedAt, joinedCoverage);
     if (remoteMessageListsEqual(existing, next)) {
       if (textFlushed) emit();
       return;
@@ -1295,10 +1667,46 @@ export const remoteSessionStore = {
     emit();
   },
 
+  /**
+   * 「加载更早」拉回的一页:沿 `before` 游标**从窗口最旧端连续**往前取,所以它与既有窗口相接。
+   *
+   * 与 `mergeMessages` 的唯一差别是它会把「已验证连续」覆盖区间的下界前移到这一页的最旧行
+   * (见 `sessionWindowCoverage`):这样后续满页的最新窗口同步就不会把用户一路翻出来的历史
+   * 当成来源不明的缓存丢掉(#1210 review 实测到的回归)。
+   *
+   * 只有真正沿窗口最旧端连续翻页的调用方可以用它;补内部空洞请继续用 `mergeMessages`。
+   */
+  mergeEarlierMessages(sessionId: string, list: readonly RemoteMessage[]): void {
+    // 合并前窗口的最旧行 = 这一页接上的那一行,尚无结论时它就是区间上界(见 coverEarlierPage)。
+    const joinsAt = oldestCreatedAt(messages.get(sessionId) ?? emptyMessages);
+    this.mergeMessages(sessionId, list);
+    const pageOldest = oldestCreatedAt(list);
+    if (pageOldest) coverEarlierPage(sessionId, pageOldest, joinsAt);
+  },
+
   appendMessage(sessionId: string, message: RemoteMessage): void {
     let changed = flushPendingTextDelta(sessionId);
     changed = upsertMessage(sessionId, overlayLivePlanSnapshot(sessionId, message)) || changed;
+    // 订阅内到达的实时行可以把覆盖区间的上界往后推;断流后收到的不行(见 liveTailTrusted)。
+    coverLiveRow(sessionId, message);
     if (changed) emit();
+  },
+
+  /**
+   * 该会话的实时流订阅已被远端 ACK。只影响**此后**落库的权威页能否把尾部标成可信 —— ACK 之前的
+   * 空窗里可能已经漏了行,所以 ACK 本身不点亮既有区间的信任位(见 `sessionWindowCoverage`)。
+   */
+  noteLiveStreamAcked(sessionId: string): void {
+    if (sessionId) sessionLiveStreamAcked.add(sessionId);
+  },
+
+  /**
+   * 实时推送链路中断:socket 掉线(省略 sessionId = 全部会话)、退后台释放 `session:<id>` 订阅、
+   * 或离开会话取消订阅。此后到达的 push 与覆盖区间上界之间可能漏了任意多行,不能再续算
+   * (见 `sessionWindowCoverage` 的 `liveTailTrusted`)。
+   */
+  noteLiveStreamInterrupted(sessionId?: string): void {
+    noteLiveStreamInterrupted(sessionId);
   },
 
   /**
@@ -1317,6 +1725,9 @@ export const remoteSessionStore = {
       !deletedClientIds.has(message.clientId) && !deletedClientIds.has(message.id)
     ));
     sessionMessageSyncMarkers.delete(sessionId);
+    // 连续性结论随窗口一起失效:rewind 可能删掉中间的行,清空/回收更是整窗重来。
+    // 重置为未知,下一次最新窗口同步会重建(见 sessionWindowCoverage)。
+    forgetWindowCoverage(sessionId);
     const messagesChanged = next.length !== existing.length;
     if (messagesChanged) messages.set(sessionId, next);
     const deletedTaskAliases = new Set<string>(deletedClientIds);
@@ -1437,8 +1848,13 @@ export const remoteSessionStore = {
     const streamingChanged = options.finalizeStreaming === true && next.length > 0
       ? flushAndFinalizeRemoteStreamingMessages(sessionId)
       : false;
+    // 权威性先落:哪怕内容一字未变(典型是重连后的 [] → []),消费方也必须知道
+    // 「这份空列表已经被被控端确认过」——否则离线期收起态的清理永远等不到时机
+    // (#1493 review)。因此 authority 的翻转本身就是一次需要通知的变化。
+    const authorityChanged = !pendingInteractionsAuthoritative.has(sessionId);
+    pendingInteractionsAuthoritative.add(sessionId);
     if (deepValueEqual(pendingInteractions.get(sessionId) ?? emptyPendingInteractions, next)) {
-      if (streamingChanged) emit();
+      if (streamingChanged || authorityChanged) emit();
       return;
     }
     pendingInteractions.set(sessionId, next);
@@ -1447,9 +1863,31 @@ export const remoteSessionStore = {
 
   setInputProjection(sessionId: string, projection: unknown): void {
     const next = normalizeInputProjection(projection, sessionId);
-    if (deepValueEqual(inputProjections.get(sessionId) ?? EMPTY_INPUT_PROJECTION, next)) return;
-    inputProjections.set(sessionId, next);
-    emit();
+    bumpInputProjectionAuthorityEpoch(sessionId);
+    commitInputProjection(sessionId, next);
+  },
+
+  captureInputProjectionAuthorityEpoch(sessionId: string): number {
+    return inputProjectionAuthorityEpochs.get(sessionId) ?? inputProjectionAuthorityEpochFloor;
+  },
+
+  setInputProjectionIfCurrent(
+    sessionId: string,
+    projection: unknown,
+    expectedEpoch: number,
+  ): boolean {
+    const currentEpoch = inputProjectionAuthorityEpochs.get(sessionId) ?? inputProjectionAuthorityEpochFloor;
+    if (currentEpoch !== expectedEpoch) {
+      return false;
+    }
+    const next = normalizeInputProjection(projection, sessionId);
+    bumpInputProjectionAuthorityEpoch(sessionId);
+    commitInputProjection(sessionId, next);
+    return true;
+  },
+
+  invalidateInputProjectionAuthority(sessionId: string): void {
+    bumpInputProjectionAuthorityEpoch(sessionId);
   },
 
   setSessionRunning(
@@ -1458,6 +1896,24 @@ export const remoteSessionStore = {
     boundaryAgentMeta?: Record<string, unknown> | null,
   ): void {
     if (!sessionId) return;
+    // A maker turn boundary supersedes any projection query that started
+    // before it. This is the terminal fence for late owner snapshots.
+    bumpInputProjectionAuthorityEpoch(sessionId);
+    // The terminal event is also authoritative for the continuation owner. A
+    // paired projection clear push may be lost during a disconnect, so clear a
+    // known owner here instead of leaving the mobile row live until rehydrate.
+    let continuationOwnerCleared = false;
+    if (!running) {
+      const currentProjection = inputProjections.get(sessionId);
+      if (currentProjection?.continuationTurnClientId) {
+        const nextProjection: InputProjection = {
+          ...currentProjection,
+          continuationTurnClientId: null,
+        };
+        continuationOwnerCleared = !deepValueEqual(currentProjection, nextProjection);
+        if (continuationOwnerCleared) inputProjections.set(sessionId, nextProjection);
+      }
+    }
     // 本方法只被 maker 权威信号调用(done / terminal error / status-changed closed),
     // 与 maker turn 边界同步;activity / 快照流走 writeSessionRunStatus,不经过这里。
     // 边界变化必须独立参与 emit 判定:activity 流可能已把宽 run status 置 false,此时
@@ -1474,7 +1930,10 @@ export const remoteSessionStore = {
       sideTaskRunning: running ? current.sideTaskRunning : false,
       startedAt: running ? (current.startedAt ?? Date.now()) : null,
     };
-    if (writeSessionRunStatus(sessionId, next) || turnBoundaryChanged || streamingChanged) emit();
+    if (writeSessionRunStatus(sessionId, next)
+      || turnBoundaryChanged
+      || streamingChanged
+      || continuationOwnerCleared) emit();
   },
 
   captureActiveSessionSnapshotEpoch(): number {
@@ -1616,9 +2075,30 @@ export const remoteSessionStore = {
     emit();
   },
 
+  /**
+   * 单条 maker:event push payload 的消费(逐帧与微批拆包**共用**唯一实现——
+   * 两条路径若各自解析,批的语义就会随逐帧演进而漂移)。
+   */
+  applyMakerEventPush(payload: Record<string, unknown>): void {
+    const sessionId = readString(payload, 'sessionId');
+    const event = isRecord(payload.event) ? payload.event : null;
+    const persistId = readString(payload, 'persistId') ?? undefined;
+    if (sessionId && event) this.applyMakerEvent(sessionId, event, persistId);
+  },
+
   applyRemotePush(deviceId: string, channel: string, payload: unknown): void {
     if (channel === SESSION_ACTIVITY_CHANNEL) {
       this.applySessionActivity(deviceId, payload);
+      return;
+    }
+    if (channel === 'maker:new-maker-draft:changed') {
+      const enabled = readPushedNewMakerWorktreeEnabled(payload);
+      if (enabled !== null) this.setNewMakerWorktreePreference(deviceId, enabled);
+      return;
+    }
+    if (channel === 'maker:new-maker-worktree-branch:changed') {
+      const snapshot = readPushedNewMakerWorktreeBranchPreference(payload);
+      if (snapshot !== null) this.setNewMakerWorktreeBranchPreference(deviceId, snapshot);
       return;
     }
     if (channel === 'local-db:sessions:created') {
@@ -1680,6 +2160,9 @@ export const remoteSessionStore = {
           // session 页面监听到 pendingRefreshSessions 变化后调 load(),走 reopen 路径:
           // sync marker 已失效 → metaChanged=true → 拉最新消息窗口(含 error 行)整窗替换。
           sessionMessageSyncMarkers.delete(sessionId);
+          // 连续性结论随窗口一起失效:rewind 可能删掉中间的行,清空/回收更是整窗重来。
+          // 重置为未知,下一次最新窗口同步会重建(见 sessionWindowCoverage)。
+          forgetWindowCoverage(sessionId);
           pendingRefreshSessions.add(sessionId);
         } else {
           // 未缓存:清 sync marker + 标记待刷新。
@@ -1689,6 +2172,9 @@ export const remoteSessionStore = {
           // 触发同步失效 → metaChanged=true → 整窗替换，error 卡正常浮现。
           messages.delete(sessionId);
           sessionMessageSyncMarkers.delete(sessionId);
+          // 连续性结论随窗口一起失效:rewind 可能删掉中间的行,清空/回收更是整窗重来。
+          // 重置为未知,下一次最新窗口同步会重建(见 sessionWindowCoverage)。
+          forgetWindowCoverage(sessionId);
           pendingRefreshSessions.add(sessionId);
         }
         bumpMessageVersion();
@@ -1697,10 +2183,20 @@ export const remoteSessionStore = {
       return;
     }
     if (channel === 'maker:event' && isRecord(payload)) {
-      const sessionId = readString(payload, 'sessionId');
-      const event = isRecord(payload.event) ? payload.event : null;
-      const persistId = readString(payload, 'persistId') ?? undefined;
-      if (sessionId && event) this.applyMakerEvent(sessionId, event, persistId);
+      this.applyMakerEventPush(payload);
+      return;
+    }
+    // 微批帧:被控端把同一会话的连续 maker:event 合并成一帧(能力协商见
+    // CONTROLLER_CAPABILITY_MAKER_EVENT_BATCH_V1)。逐条按原顺序走与逐帧**完全
+    // 相同**的处理路径——批只是传输层的聚合,不引入新的应用语义;单条形状不符
+    // 时跳过该条而不丢整批。
+    if (channel === MAKER_EVENT_BATCH_CHANNEL) {
+      // 拆包与 fail-closed 的 topic 隔离判据在共享包里(desktop 作为控制端时也用
+      // 同一份,见 expandMakerEventBatchPayload 注释)。
+      for (const event of expandMakerEventBatchPayload(payload)) {
+        if (!isRecord(event)) continue;
+        this.applyMakerEventPush(event);
+      }
       return;
     }
     if (channel === 'maker:status-changed' && isRecord(payload)) {
@@ -1714,17 +2210,47 @@ export const remoteSessionStore = {
       const clientId = readString(payload, 'clientId');
       const turnMoney = normalizeRemoteMoney(payload.turnMoney);
       const turnCostUsd = readNumber(payload, 'turnCostUsd');
+      // 用量明细与金额各自独立:桌面算不出报价时只推 turnUsageDetails,操作行据此
+      // 退回显示本轮 token(与 messageNormalize.readTurnCost 同口径)。
+      const turnUsageDetails = isRecord(payload.turnUsageDetails)
+        ? payload.turnUsageDetails
+        : undefined;
+      // 用户轮累计与当前 segment 金额是两个独立事实:自动续跑的收尾轮只带 userTurnMoney
+      // (前面的 segment 记了账、收尾这个缺报价)。所以独立投影,由
+      // messageNormalize.readTurnCost 单点决定操作行显示哪一个
+      // (不变量正本见 apps/desktop/src/shared/turnCostPayload.ts)。
+      const userTurnMoney = normalizeRemoteMoney(payload.userTurnMoney);
+      const userTurnCostUsd = readNumber(payload, 'userTurnCostUsd');
+      const userTurnCostIsEstimate = payload.userTurnCostIsEstimate === true;
+      const basePatch: Record<string, unknown> = {
+        ...(turnUsageDetails ? { turnUsageDetails } : {}),
+      };
+      if (userTurnMoney && userTurnMoney.amount > 0) {
+        basePatch.userTurnCost = userTurnMoney;
+        if (userTurnMoney.currency === 'USD') {
+          basePatch.userTurnCostUsd = userTurnMoney.amount;
+        }
+        basePatch.userTurnCostIsEstimate =
+          userTurnCostIsEstimate || userTurnMoney.kind === 'value-estimate';
+      } else if (userTurnCostUsd !== null && userTurnCostUsd > 0) {
+        basePatch.userTurnCostUsd = userTurnCostUsd;
+        basePatch.userTurnCostIsEstimate = userTurnCostIsEstimate;
+      }
       if (sessionId && clientId && turnMoney && turnMoney.amount > 0) {
         this.patchMessageAgentMeta(sessionId, clientId, {
+          ...basePatch,
           turnCost: turnMoney,
           ...(turnMoney.currency === 'USD' ? { turnCostUsd: turnMoney.amount } : {}),
           turnCostIsEstimate: turnMoney.kind === 'value-estimate',
         });
       } else if (sessionId && clientId && turnCostUsd !== null && turnCostUsd > 0) {
         this.patchMessageAgentMeta(sessionId, clientId, {
+          ...basePatch,
           turnCostUsd,
           turnCostIsEstimate: payload.turnCostIsEstimate === true,
         });
+      } else if (sessionId && clientId && Object.keys(basePatch).length > 0) {
+        this.patchMessageAgentMeta(sessionId, clientId, basePatch);
       }
       return;
     }
@@ -1894,25 +2420,32 @@ export const remoteSessionStore = {
 
     // setSessionRunning owns the final flush/finalize and run-state transition;
     // keeping the done path in one call avoids notifying subscribers twice.
-    if (type === 'done' || isTerminalMakerErrorEvent(event)) {
+    if (
+      isProductTurnDoneEvent(event)
+      || (!isTurnContinuationBoundaryEvent(event) && isTerminalMakerErrorEvent(event))
+    ) {
       let terminalPlanChanged = false;
       if (type === 'done' && readString(event, 'source') === 'codex') {
         const data = isRecord(event.data) ? event.data : null;
         const rawTurn = isRecord(data?.raw) ? data.raw : null;
         const turnId = readString(rawTurn, 'id');
         const turnStatus = readString(rawTurn, 'status');
+        const turnCancelled = data?.cancelled === true;
         const currentMessages = messages.get(sessionId) ?? [];
         const completed = applyCodexPlanSnapshotOnDone(
           currentMessages,
           data?.plan,
           turnId,
           turnStatus,
+          undefined,
+          turnCancelled,
         );
         completeLivePlanSnapshotOnDone(
           sessionId,
           data?.plan,
           turnId,
           turnStatus,
+          turnCancelled,
         );
         terminalPlanChanged = completed.changed;
         if (completed.changed) {
@@ -1927,6 +2460,27 @@ export const remoteSessionStore = {
               completed.toolUseId,
               completedMessage.content,
             );
+          }
+        }
+      } else if (readString(event, 'source') === 'codex') {
+        // 没有 done 的 codex 终态 error:这一轮的计划行等不到章,也等不到
+        // persistCodexPlanOnDone 的 turnCompleted:false。与 desktop renderer 的
+        // markCodexPlanTurnFailed 同款补印记,否则全勾完的失败计划会按旧数据
+        // 兜底退场——任务还活着,用户正要接着指挥。
+        const currentMessages = messages.get(sessionId) ?? [];
+        const failed = markCodexPlanTurnFailed(currentMessages);
+        terminalPlanChanged = failed.changed;
+        if (failed.changed) {
+          messages.set(sessionId, [...failed.messages]);
+          const failedMessage = failed.messages.find((message) => {
+            if (message.toolUseId === failed.toolUseId) return true;
+            return readString(message.content, 'toolUseId') === failed.toolUseId;
+          });
+          // 印记也要进 live-plan 缓存:overlayLivePlanSnapshot 用缓存内容整体
+          // 替换 content,缓存不补就会把 main 随后广播的落库 turnCompleted:false
+          // 盖回去,本连接周期内再也纠不回来。
+          if (failed.toolUseId && isRecord(failedMessage?.content)) {
+            rememberLivePlanContent(sessionId, failed.toolUseId, failedMessage.content);
           }
         }
       }
@@ -1946,7 +2500,10 @@ export const remoteSessionStore = {
     if (type === 'error') {
       const data = isRecord(event.data) ? event.data : null;
       const reconnectAttempt = data?.willRetry === true
-        ? parseReconnectAttemptMessage(readString(data, 'message') ?? '')
+        ? parseReconnectAttemptMessage(
+            readString(data, 'message') ?? '',
+            readString(data, 'reason'),
+          )
         : null;
       const current = readSessionRunStatus(sessionId);
       const changed = writeSessionRunStatus(sessionId, {
@@ -1975,7 +2532,9 @@ export const remoteSessionStore = {
     }
     if (type === 'agent_task_update') {
       const rawSource = readString(event, 'source');
-      const source = rawSource === 'codex' || rawSource === 'claude-code' ? rawSource : undefined;
+      const source = rawSource === 'codex' || rawSource === 'claude-code' || rawSource === 'pi'
+        ? rawSource
+        : undefined;
       const next = applyAgentTaskUpdateEvent(
         recallParkedTaskUpdates(sessionId, event.data, source, sessionTaskUpdates.get(sessionId)),
         event.data,
@@ -2034,6 +2593,13 @@ export const remoteSessionStore = {
       const data = isRecord(event.data) ? event.data : null;
       const current = readSessionRunStatus(sessionId);
       const isRunning = typeof data?.isRunning === 'boolean' ? data.isRunning : current.isRunning;
+      if (!isRunning && isTurnContinuationBoundaryEvent(event)) {
+        // A claimed status(false) closes only the provider SDK segment. Keep the
+        // mobile product turn and its streaming projection alive until an
+        // unclaimed terminal event arrives, matching the desktop lifecycle.
+        if (textFlushed || reconnectCleared) emit();
+        return;
+      }
       const rawTokenUsage = readNumber(data, 'tokenUsage');
       const rawStatus = readString(data, 'status');
       // turn-start 检测用 maker 自己的边界(不用 current.isRunning):activity 推送 / 活跃
@@ -2082,8 +2648,41 @@ export const remoteSessionStore = {
     if (textFlushed || reconnectCleared) emit();
   },
 
+  /**
+   * 短暂离线只失效依赖实时连接的投影,保留 shard / session / messages / 路由索引。
+   * 恢复后会话页因此走 reopen(旧内容立即可见),而 marker 已删除会强制后台核对
+   * 最新消息窗口,不会把断线前缓存误判为 fresh。
+   */
+  markDeviceOffline(deviceId: string): void {
+    let changed = false;
+    for (const [sessionId, indexedDeviceId] of sessionDeviceIndex) {
+      if (indexedDeviceId !== deviceId) continue;
+      changed = sessionMessageSyncMarkers.delete(sessionId) || changed;
+      changed = livePlanSnapshots.delete(sessionId) || changed;
+      changed = pendingRefreshSessions.delete(sessionId) || changed;
+      changed = pendingInteractions.delete(sessionId) || changed;
+      // 投影没了,这份(空)列表就不再权威:重连拿到全量快照前不许据此做清理。
+      changed = pendingInteractionsAuthoritative.delete(sessionId) || changed;
+      changed = inputProjections.delete(sessionId) || changed;
+      bumpInputProjectionAuthorityEpoch(sessionId);
+      changed = sessionLiveActivity.delete(sessionId) || changed;
+      changed = sessionGoalStatus.delete(sessionId) || changed;
+      changed = sessionTaskUpdates.delete(sessionId) || changed;
+      changed = sessionParkedTaskUpdates.delete(sessionId) || changed;
+      changed = sessionMakerActivityEpochs.delete(sessionId) || changed;
+      changed = flushAndFinalizeRemoteStreamingMessages(sessionId) || changed;
+      changed = streamingAssistantClientIds.delete(sessionId) || changed;
+      changed = pendingLiveAssistantClientIds.delete(sessionId) || changed;
+      changed = writeMakerTurnRunning(sessionId, false) || changed;
+      changed = writeSessionRunStatus(sessionId, EMPTY_SESSION_RUN_STATUS) || changed;
+    }
+    if (changed) emit();
+  },
+
   removeDevice(deviceId: string): void {
     const hadShard = shards.delete(deviceId);
+    const hadWorktreePreference = newMakerWorktreePreferences.delete(deviceId);
+    const hadWorktreeBranchPreferences = newMakerWorktreeBranchPreferences.delete(deviceId);
     // Sweep per-session maps for this device regardless of whether the shard still exists, and
     // drop the index entries too — otherwise sessionDeviceIndex (and any maps it points at)
     // leak orphans when the shard was already pruned.
@@ -2093,12 +2692,19 @@ export const remoteSessionStore = {
         messages.delete(sessionId);
         livePlanSnapshots.delete(sessionId);
         pendingInteractions.delete(sessionId);
+        pendingInteractionsAuthoritative.delete(sessionId);
         inputProjections.delete(sessionId);
+        bumpInputProjectionAuthorityEpoch(sessionId);
         sessionLiveActivity.delete(sessionId);
         sessionRunning.delete(sessionId);
         sessionRunStatus.delete(sessionId);
         sessionMakerActivityEpochs.delete(sessionId);
         sessionMessageSyncMarkers.delete(sessionId);
+        // 连续性结论随窗口一起失效:rewind 可能删掉中间的行,清空/回收更是整窗重来。
+        // 重置为未知,下一次最新窗口同步会重建(见 sessionWindowCoverage)。
+        forgetWindowCoverage(sessionId);
+        // 会话镜像整体回收:它的 `session:<id>` 订阅也随之消失,ACK 记录不能留着给后面的页背书。
+        sessionLiveStreamAcked.delete(sessionId);
         sessionTaskUpdates.delete(sessionId);
         streamingAssistantClientIds.delete(sessionId);
         discardPendingTextDelta(sessionId);
@@ -2115,26 +2721,40 @@ export const remoteSessionStore = {
         removedSession = true;
       }
     }
-    if (!hadShard && !removedSession) return;
+    if (
+      !hadShard
+      && !removedSession
+      && !hadWorktreePreference
+      && !hadWorktreeBranchPreferences
+    ) return;
     bumpMessageVersion();
     recomputeSessions();
   },
 
   clear(): void {
     shards.clear();
+    newMakerWorktreePreferences.clear();
+    newMakerWorktreeBranchPreferences.clear();
     messages.clear();
     livePlanSnapshots.clear();
     pendingInteractions.clear();
+    pendingInteractionsAuthoritative.clear();
     inFlightInteractionResolves.clear();
     confirmedInteractionDismissals.clear();
     interactionRevisionFloors.clear();
     inputProjections.clear();
+    inputProjectionAuthorityEpochFloor = ++nextInputProjectionAuthorityEpoch;
+    inputProjectionAuthorityEpochs.clear();
+    // Keep authority tombstones monotonic across a global store reset so an
+    // old in-flight query cannot be accepted after the session is recreated.
     sessionLiveActivity.clear();
     sessionRunning.clear();
     sessionRunStatus.clear();
     sessionMakerActivityEpochs.clear();
     makerActivityEpoch = 0;
     sessionMessageSyncMarkers.clear();
+    sessionWindowCoverage.clear();
+    sessionLiveStreamAcked.clear();
     sessionTaskUpdates.clear();
     streamingAssistantClientIds.clear();
     pendingLiveAssistantClientIds.clear();
@@ -2192,8 +2812,95 @@ export const remoteSessionStore = {
     return storeVersion;
   },
 
+  setNewMakerWorktreePreference(deviceId: string, enabled: boolean): void {
+    if (!deviceId) return;
+    const current = newMakerWorktreePreferences.get(deviceId);
+    newMakerWorktreePreferences.set(deviceId, {
+      enabled,
+      revision: (current?.revision ?? 0) + 1,
+    });
+    // 同值 push 仍需推进 revision：它可能比在途 pull 更新，必须让旧响应失去写权。
+    emit();
+  },
+
+  getNewMakerWorktreePreference(
+    deviceId: string | null | undefined,
+  ): RemoteNewMakerWorktreePreference {
+    if (!deviceId) return EMPTY_NEW_MAKER_WORKTREE_PREFERENCE;
+    return newMakerWorktreePreferences.get(deviceId)
+      ?? EMPTY_NEW_MAKER_WORKTREE_PREFERENCE;
+  },
+
+  setNewMakerWorktreeBranchPreference(
+    deviceId: string,
+    snapshot: RemoteNewMakerWorktreeBranchPreference,
+  ): void {
+    if (!deviceId || snapshot === null) return;
+    const baseRepo = snapshot.baseRepo.trim();
+    const sourceBranch = snapshot.sourceBranch.trim();
+    if (
+      !baseRepo
+      || !sourceBranch
+      || !Number.isInteger(snapshot.revision)
+      || snapshot.revision < 0
+    ) return;
+
+    let byRepo = newMakerWorktreeBranchPreferences.get(deviceId);
+    const current = byRepo?.get(baseRepo);
+    if (current) {
+      // revision 由 host 按 canonical repo 单调递增。旧快照不能覆盖；相等只接受
+      // 完全相同的幂等 echo，同 revision 的冲突值也必须拒绝。
+      if (snapshot.revision < current.revision) return;
+      if (snapshot.revision === current.revision) return;
+    }
+    if (!byRepo) {
+      byRepo = new Map();
+      newMakerWorktreeBranchPreferences.set(deviceId, byRepo);
+    }
+    byRepo.set(baseRepo, {
+      baseRepo,
+      sourceBranch,
+      revision: snapshot.revision,
+    });
+    // 同一 sourceBranch 的新 host revision 也必须发布：它给在途 pull / apply 回包做 fence。
+    emit();
+  },
+
+  /**
+   * GET 的 null 是工作端对该 repo「当前没有偏好」的权威回答，不是漏包。
+   * 桌面进程重启后 host revision 会从头开始；先删掉手机保存的旧高 revision，
+   * 后续 rev1 snapshot / push 才有资格成为新进程的真相。
+   */
+  clearNewMakerWorktreeBranchPreference(
+    deviceId: string,
+    baseRepo: string,
+  ): void {
+    const normalizedBaseRepo = baseRepo.trim();
+    if (!deviceId || !normalizedBaseRepo) return;
+    const byRepo = newMakerWorktreeBranchPreferences.get(deviceId);
+    if (!byRepo?.delete(normalizedBaseRepo)) return;
+    if (byRepo.size === 0) newMakerWorktreeBranchPreferences.delete(deviceId);
+    emit();
+  },
+
+  getNewMakerWorktreeBranchPreference(
+    deviceId: string | null | undefined,
+    baseRepo: string | null | undefined,
+  ): RemoteNewMakerWorktreeBranchPreference {
+    if (!deviceId || !baseRepo?.trim()) return null;
+    return newMakerWorktreeBranchPreferences.get(deviceId)?.get(baseRepo.trim()) ?? null;
+  },
+
   getPendingInteractions(sessionId: string): PendingInteraction[] {
     return pendingInteractions.get(sessionId) ?? emptyPendingInteractions;
+  },
+
+  /**
+   * pending 列表当前是否权威(见 pendingInteractionsAuthoritative 的注释)。
+   * 空列表要用来做清理判断时必须先问这里。
+   */
+  hasAuthoritativePendingInteractions(sessionId: string): boolean {
+    return pendingInteractionsAuthoritative.has(sessionId);
   },
 
   getInputProjection(sessionId: string): InputProjection {
@@ -2317,17 +3024,30 @@ function parseAttemptPair(
 /**
  * 非终止 error 的 message → 重试进度。
  *
- * 两类各有自己的标记:
+ * 三类各有自己的标记:
  *  - 传输层重连: `Reconnecting... N/M`;
  *  - 上游过载退避重投: `(auto-retry N/M)`(maker-core 的
  *    agents/shared/overload-error.ts 统一后缀, Codex 与 Claude 两侧同款)。
+ *  - daemon 终态 429 外层重投: reason=`terminal-rate-limit-retry` +
+ *    `(rate-limit-retry N/M)`；reason 与 marker 必须同时命中。
  *
- * 后者不认的话, 整个退避窗口(交互式最长约 30s)手机端只显示笼统的「思考中」, 用户看不出
+ * 过载 marker 不认的话, 整个退避窗口(交互式最长约 30s)手机端只显示笼统的「思考中」, 用户看不出
  * 是在等上游容量(review #844 codex P1)。这里刻意在 mobile 侧独立实现一份判定, 与
  * renderer 的 utils/overloadError.ts 同规 —— maker-core 是 desktop/node 侧包, 不跨
  * bundle 共享。
  */
-function parseReconnectAttemptMessage(message: string): RemoteSessionReconnectAttempt | null {
+const TERMINAL_RATE_LIMIT_RETRY_REASON = 'terminal-rate-limit-retry';
+
+function parseReconnectAttemptMessage(
+  message: string,
+  reason?: string | null,
+): RemoteSessionReconnectAttempt | null {
+  if (reason === TERMINAL_RATE_LIMIT_RETRY_REASON) {
+    const rateLimit = parseAttemptPair(
+      /\(rate-limit-retry\s+(\d+)\s*\/\s*(\d+)\)\s*$/i.exec(message),
+    );
+    return rateLimit ? { ...rateLimit, kind: 'rate-limit' } : null;
+  }
   const reconnect = parseAttemptPair(
     /\bReconnecting(?:\.{3}|…)\s*(\d+)\s*\/\s*(\d+)\b/i.exec(message),
   );
@@ -2468,6 +3188,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function readPushedNewMakerWorktreeEnabled(payload: unknown): boolean | null {
+  if (!isRecord(payload)) return null;
+  for (const slot of ['claudeCode', 'codex'] as const) {
+    const defaults = payload[slot];
+    if (!isRecord(defaults)) continue;
+    const enabled = defaults.worktreeEnabled;
+    if (typeof enabled === 'boolean') return enabled;
+  }
+  return null;
+}
+
+function readPushedNewMakerWorktreeBranchPreference(
+  payload: unknown,
+): RemoteNewMakerWorktreeBranchPreference {
+  if (!isRecord(payload)) return null;
+  const baseRepo = payload.baseRepo;
+  const sourceBranch = payload.sourceBranch;
+  const revision = payload.revision;
+  if (
+    typeof baseRepo !== 'string'
+    || !baseRepo.trim()
+    || typeof sourceBranch !== 'string'
+    || !sourceBranch.trim()
+    || !Number.isInteger(revision)
+    || (revision as number) < 0
+  ) return null;
+  return {
+    baseRepo: baseRepo.trim(),
+    sourceBranch: sourceBranch.trim(),
+    revision: revision as number,
+  };
+}
+
 function hasDeviceLinkTruncationMarker(value: Record<string, unknown> | null): boolean {
   return value?.[DEVICE_LINK_TRUNCATED_FLAG] === true;
 }
@@ -2581,10 +3334,36 @@ export function useRemoteSessionStoreVersion(): number {
   return useSyncExternalStore(remoteSessionStore.subscribe, remoteSessionStore.getStoreVersion);
 }
 
+export function useRemoteNewMakerWorktreePreference(
+  deviceId: string | null | undefined,
+): RemoteNewMakerWorktreePreference {
+  return useSyncExternalStore(
+    remoteSessionStore.subscribe,
+    () => remoteSessionStore.getNewMakerWorktreePreference(deviceId),
+  );
+}
+
+export function useRemoteNewMakerWorktreeBranchPreference(
+  deviceId: string | null | undefined,
+  baseRepo: string | null | undefined,
+): RemoteNewMakerWorktreeBranchPreference {
+  return useSyncExternalStore(
+    remoteSessionStore.subscribe,
+    () => remoteSessionStore.getNewMakerWorktreeBranchPreference(deviceId, baseRepo),
+  );
+}
+
 export function useSessionPendingInteractions(sessionId: string): PendingInteraction[] {
   return useSyncExternalStore(
     remoteSessionStore.subscribe,
     () => remoteSessionStore.getPendingInteractions(sessionId),
+  );
+}
+
+export function useSessionPendingInteractionsAuthoritative(sessionId: string): boolean {
+  return useSyncExternalStore(
+    remoteSessionStore.subscribe,
+    () => remoteSessionStore.hasAuthoritativePendingInteractions(sessionId),
   );
 }
 

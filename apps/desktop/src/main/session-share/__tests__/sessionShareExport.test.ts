@@ -17,15 +17,32 @@ const workingDir = path.join(tmpRoot, 'proj');
 // ── mocks ──
 const sessionRowRef: { row: Record<string, unknown> | null } = { row: null };
 const messagesRef: { rows: Array<Record<string, unknown>> } = { rows: [] };
+// orca:active team / worker 列表 / worker 会话行与消息(按 SQL 分发)
+const activeTeamRef: { row: Record<string, unknown> | null } = { row: null };
+const getActiveTeamByLeadMock = vi.fn(async () => activeTeamRef.row);
+const workerRowsRef: { rows: Array<Record<string, unknown>> } = { rows: [] };
+const workerSessionsById = new Map<string, Record<string, unknown>>();
+const workerMessagesBySession = new Map<string, Array<Record<string, unknown>>>();
 
 vi.mock('electron', () => ({
   app: { getVersion: () => '9.9.9', getPath: () => tmpRoot },
 }));
 vi.mock('../../localDb/client/current.js', () => ({
   getDbClient: () => ({
-    queryOne: async () => sessionRowRef.row,
+    queryOne: async (_sql: string, params: unknown[]) => {
+      const id = params?.[0];
+      if (typeof id === 'string' && id !== 'xdt-session-1') {
+        return workerSessionsById.get(id) ?? null;
+      }
+      return sessionRowRef.row;
+    },
     // 模拟 readMessageRows 的 clearedAt 过滤(真实 SQL 是 created_at > ?)
     query: async (sql: string, params: unknown[]) => {
+      if (typeof sql === 'string' && sql.includes('FROM orca_workers')) return workerRowsRef.rows;
+      const sessionId = params?.[0];
+      if (typeof sessionId === 'string' && workerMessagesBySession.has(sessionId)) {
+        return workerMessagesBySession.get(sessionId);
+      }
       if (typeof sql === 'string' && sql.includes('created_at > ?')) {
         const clearedAt = params[1] as number;
         return messagesRef.rows.filter((r) => (r.createdAt as number) > clearedAt);
@@ -34,6 +51,9 @@ vi.mock('../../localDb/client/current.js', () => ({
     },
     exec: async () => undefined,
   }),
+}));
+vi.mock('../../localDb/orcaTeamStore.js', () => ({
+  getActiveTeamByLead: getActiveTeamByLeadMock,
 }));
 vi.mock('../../maker-host/claude-transcript-relocation.js', () => ({
   collectClaudeSdkSessionIds: async () => ({
@@ -140,6 +160,11 @@ describe('exportSessionShare', () => {
   beforeEach(async () => {
     sessionRowRef.row = baseSession();
     messagesRef.rows = baseMessages();
+    activeTeamRef.row = null;
+    getActiveTeamByLeadMock.mockClear();
+    workerRowsRef.rows = [];
+    workerSessionsById.clear();
+    workerMessagesBySession.clear();
     configDirCandidatesRef.dirs = [path.join(tmpRoot, 'claude-home')];
     const projKey = workingDir.replace(/[^a-zA-Z0-9]/g, '-');
     await fsp.mkdir(path.join(projectsRoot, projKey), { recursive: true });
@@ -230,6 +255,107 @@ describe('exportSessionShare', () => {
     expect(state.threads[0].id).toBe('thread-1');
   });
 
+  it('pi export replaces absolute session paths with portable ids', async () => {
+    const piSessionFile = path.join(tmpRoot, 'pi-agent-home', 'sessions', 'source-session.jsonl');
+    await fsp.mkdir(path.dirname(piSessionFile), { recursive: true });
+    await fsp.writeFile(piSessionFile, '{"type":"session"}\n');
+    sessionRowRef.row = {
+      ...baseSession(),
+      agentKind: 'pi',
+      sdkSessionId: piSessionFile,
+    };
+    messagesRef.rows = baseMessages().map((message, index) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: index === 1 ? JSON.stringify({ sdkSessionId: piSessionFile }) : null,
+    }));
+
+    const target = path.join(tmpRoot, 'out-pi.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.fidelity).toBe('full');
+
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.agentKind).toBe('pi');
+    expect(manifest.activeSdkSessionId).toMatch(/^pi-[a-f0-9]{32}\.jsonl$/);
+    expect(manifest.activeSdkSessionId).not.toContain(path.sep);
+    expect(manifest.sdkSessionIds).toEqual([manifest.activeSdkSessionId]);
+    const transcriptPath = `transcripts/pi/${manifest.activeSdkSessionId}`;
+    expect(await zip.file(transcriptPath)!.async('string')).toBe('{"type":"session"}\n');
+    expect(zip.file('codex-state/thread.json')).toBeNull();
+
+    const sessionJson = await zip.file('session.json')!.async('string');
+    const messagesJsonl = await zip.file('messages.jsonl')!.async('string');
+    expect(sessionJson).not.toContain(piSessionFile);
+    expect(messagesJsonl).not.toContain(piSessionFile);
+    expect(JSON.parse(messagesJsonl.split('\n')[1]).agentMeta).toContain(
+      manifest.activeSdkSessionId,
+    );
+  });
+
+  it('pi export changes the portable transcript id when the same session file content changes', async () => {
+    const piSessionFile = path.join(tmpRoot, 'pi-agent-home', 'sessions', 'changing-session.jsonl');
+    await fsp.mkdir(path.dirname(piSessionFile), { recursive: true });
+    sessionRowRef.row = { ...baseSession(), agentKind: 'pi', sdkSessionId: piSessionFile };
+    messagesRef.rows = baseMessages().map((message) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: JSON.stringify({ sdkSessionId: piSessionFile }),
+    }));
+
+    await fsp.writeFile(piSessionFile, '{"type":"session","revision":1}\n');
+    const firstTarget = path.join(tmpRoot, 'out-pi-content-v1.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: firstTarget }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'full' });
+    const firstZip = await unzipOf(firstTarget);
+    const firstManifest = validateManifest(JSON.parse(
+      await firstZip.file('manifest.json')!.async('string'),
+    ));
+
+    await fsp.writeFile(piSessionFile, '{"type":"session","revision":2}\n');
+    const secondTarget = path.join(tmpRoot, 'out-pi-content-v2.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: secondTarget }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'full' });
+    const secondZip = await unzipOf(secondTarget);
+    const secondManifest = validateManifest(JSON.parse(
+      await secondZip.file('manifest.json')!.async('string'),
+    ));
+
+    expect(secondManifest.activeSdkSessionId).not.toBe(firstManifest.activeSdkSessionId);
+    expect(await secondZip.file(`transcripts/pi/${secondManifest.activeSdkSessionId}`)!.async('string'))
+      .toContain('"revision":2');
+  });
+
+  it('pi export omits a missing transcript without leaking or hashing its absolute path', async () => {
+    const missingPiSessionFile = path.join(tmpRoot, 'private', 'missing-session.jsonl');
+    sessionRowRef.row = {
+      ...baseSession(),
+      agentKind: 'pi',
+      sdkSessionId: missingPiSessionFile,
+    };
+    messagesRef.rows = baseMessages().map((message) => ({
+      ...message,
+      agentKind: 'pi',
+      agentMeta: JSON.stringify({ sdkSessionId: missingPiSessionFile }),
+    }));
+
+    const target = path.join(tmpRoot, 'out-pi-missing.xdtshare');
+    await expect(exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target }))
+      .resolves.toMatchObject({ status: 'ok', fidelity: 'db-only' });
+    const zip = await unzipOf(target);
+    const manifestText = await zip.file('manifest.json')!.async('string');
+    const sessionText = await zip.file('session.json')!.async('string');
+    const messagesText = await zip.file('messages.jsonl')!.async('string');
+    const manifest = validateManifest(JSON.parse(manifestText));
+
+    expect(manifest.sdkSessionIds).toEqual([]);
+    expect(manifest.activeSdkSessionId).toBeNull();
+    expect(Object.keys(zip.files).filter((name) => name.startsWith('transcripts/pi/'))).toEqual([]);
+    expect(`${manifestText}\n${sessionText}\n${messagesText}`).not.toContain(missingPiSessionFile);
+  });
+
   it('oversize returns structured outcome without writing file', async () => {
     const target = path.join(tmpRoot, 'out-oversize.xdtshare');
     const outcome = await exportSessionShare({
@@ -307,13 +433,14 @@ describe('exportSessionShare', () => {
     expect(mediaMap.entries[0].zipPath).toBeNull();
   });
 
-  it('rejects remote / orca / deleted / empty sessions', async () => {
+  it('rejects remote / orca worker / deleted / empty sessions', async () => {
     sessionRowRef.row = { ...baseSession(), remoteHostId: 'host-1' };
     await expect(
       exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x1') }),
     ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
 
-    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    // Worker 子会话拒绝直接导出(入口应是所属 lead)
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'worker' };
     await expect(
       exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x2') }),
     ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
@@ -327,6 +454,114 @@ describe('exportSessionShare', () => {
     messagesRef.rows = [];
     await expect(
       exportSessionShare({ sessionId: 'xdt-session-1', targetPath: path.join(tmpRoot, 'x4') }),
+    ).rejects.toMatchObject({ code: 'SHARE_EXPORT_FAILED' });
+  });
+
+  it('orca lead without active team exports as a plain bundle', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    const target = path.join(tmpRoot, 'out-stale-lead.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(outcome.orcaWorkers).toBe(0);
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.formatVersion).toBe(1);
+    expect(manifest.minReaderVersion).toBe(1);
+    expect(manifest.orca).toBeUndefined();
+  });
+
+  it('orca lead export bundles workers under prefixes with team graph, minReaderVersion 2', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    activeTeamRef.row = { id: 'team-1', status: 'active' };
+    workerRowsRef.rows = [
+      { sessionId: 'worker-s-1', status: 'done', label: 'dev-1', role: 'developer', focused: 1 },
+      // 已归档 Worker 不在当前协同列表中,导出也应排除,避免导入后复活。
+      { sessionId: 'worker-s-archived', status: 'done', label: 'dev-2', role: 'reviewer', focused: 0 },
+    ];
+    workerSessionsById.set('worker-s-1', {
+      ...baseSession(),
+      id: 'worker-s-1',
+      title: 'Worker 1',
+      agentKind: 'codex',
+      orcaRole: 'worker',
+      sdkSessionId: 'thread-1',
+    });
+    workerSessionsById.set('worker-s-archived', {
+      ...baseSession(),
+      id: 'worker-s-archived',
+      status: 'archived',
+      orcaRole: 'worker',
+    });
+    workerMessagesBySession.set('worker-s-1', [
+      {
+        id: 'wm1',
+        clientId: 'wc1',
+        role: 'user',
+        content: JSON.stringify([{ type: 'text', text: '派活' }]),
+        toolUseId: null,
+        agentMeta: null,
+        agentKind: 'codex',
+        createdAt: 1700000000300,
+        rewindAt: null,
+      },
+    ]);
+    workerMessagesBySession.set('worker-s-archived', []);
+
+    const target = path.join(tmpRoot, 'out-orca.xdtshare');
+    const outcome = await exportSessionShare({ sessionId: 'xdt-session-1', targetPath: target });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    expect(getActiveTeamByLeadMock).toHaveBeenCalledWith('xdt-session-1');
+    expect(outcome.orcaWorkers).toBe(1);
+    expect(outcome.fidelity).toBe('full');
+
+    const zip = await unzipOf(target);
+    const manifest = validateManifest(JSON.parse(await zip.file('manifest.json')!.async('string')));
+    expect(manifest.formatVersion).toBe(2);
+    expect(manifest.minReaderVersion).toBe(2);
+    expect(manifest.agentKind).toBe('cc'); // 顶层仍描述 lead
+    expect(manifest.orca).toBeDefined();
+    expect(manifest.orca!.teamStatus).toBe('active');
+    expect(manifest.orca!.workers).toHaveLength(1);
+    const worker = manifest.orca!.workers[0];
+    expect(worker.index).toBe(0);
+    expect(worker.agentKind).toBe('codex');
+    expect(worker.role).toBe('developer');
+    expect(worker.label).toBe('dev-1');
+    expect(worker.status).toBe('done');
+    expect(worker.focused).toBe(true);
+    expect(worker.activeSdkSessionId).toBe('thread-1');
+    expect(worker.counts.messages).toBe(1);
+    expect(worker.transcripts).toEqual([
+      { sdkSessionId: 'thread-1', path: 'orca/workers/0/transcripts/codex/rollout-1-thread-1.jsonl' },
+    ]);
+
+    // Worker 数据落在前缀目录下,lead 顶层结构保持不变
+    expect(zip.file('orca/workers/0/session.json')).toBeTruthy();
+    expect(zip.file('orca/workers/0/messages.jsonl')).toBeTruthy();
+    expect(zip.file('orca/workers/0/transcripts/codex/rollout-1-thread-1.jsonl')).toBeTruthy();
+    expect(zip.file('orca/workers/0/codex-state/thread.json')).toBeTruthy();
+    expect(zip.file('session.json')).toBeTruthy();
+    expect(zip.file('transcripts/claude/sid-b.jsonl')).toBeTruthy();
+    const workerSnapshot = JSON.parse(
+      await zip.file('orca/workers/0/session.json')!.async('string'),
+    ) as Record<string, unknown>;
+    expect(workerSnapshot.agentKind).toBe('codex');
+  });
+
+  it('orca lead export fails closed when an active team Worker session is missing or deleted', async () => {
+    sessionRowRef.row = { ...baseSession(), orcaRole: 'lead' };
+    activeTeamRef.row = { id: 'team-broken', status: 'active' };
+    workerRowsRef.rows = [
+      { sessionId: 'worker-missing', status: 'error', label: 'broken', role: 'reviewer', focused: 0 },
+    ];
+
+    await expect(
+      exportSessionShare({
+        sessionId: 'xdt-session-1',
+        targetPath: path.join(tmpRoot, 'out-orca-broken.xdtshare'),
+      }),
     ).rejects.toMatchObject({ code: 'SHARE_EXPORT_FAILED' });
   });
 });

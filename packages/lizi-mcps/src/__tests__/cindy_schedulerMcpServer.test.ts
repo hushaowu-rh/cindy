@@ -24,7 +24,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { Scheduler } from '@cindy/maker-scheduler';
+import { SCHEDULER_RUN_ID_VENDOR_OPTION, Scheduler } from '@cindy/maker-scheduler';
 import type {
   CreateScheduleInput,
   ListFilter,
@@ -292,6 +292,26 @@ describe('cindy_scheduler MCP server (in-process smoke)', () => {
     expect(fromMcp).toEqual(fromScheduler);
     expect(fromMcp).toHaveLength(1);
     expect(fromMcp[0]).toEqual(createdData);
+
+    await h.cleanup();
+  });
+
+  it('call_tool(schedule_create) accepts agentKind: pi as a first-class scheduled agent', async () => {
+    const created = await h.client.callTool({
+      name: 'call_tool',
+      arguments: {
+        name: 'schedule_create',
+        args: { ...baseCreate, name: 'pi-scheduled', agentKind: 'pi' } as unknown as Record<string, unknown>,
+      },
+    });
+    const { envelope, isError } = parseToolResult(
+      created as { content: unknown[]; isError?: boolean },
+    );
+    expect(isError).toBe(false);
+    expect(envelope).toMatchObject({ ok: true });
+    if (!envelope.ok) throw new Error('unreachable');
+    const createdData = envelope.data as Schedule;
+    expect(createdData.agentKind).toBe('pi');
 
     await h.cleanup();
   });
@@ -758,13 +778,16 @@ describe('schedule_silence_current_run — runId resolution branches', () => {
   function setup(opts: {
     sessionId?: string;
     inflightRunForSession?: string | undefined;
-    silenceReturns?: boolean;
+    silenceReturns?: boolean | ((runId: string) => boolean);
+    vendorRunId?: string;
   }) {
     const fake: FakeScheduler = {
       resolveInflightRunForSession: () => opts.inflightRunForSession,
       silenceRun: (runId: string) => {
         fake.silencedArg = runId;
-        return opts.silenceReturns ?? true;
+        return typeof opts.silenceReturns === 'function'
+          ? opts.silenceReturns(runId)
+          : (opts.silenceReturns ?? true);
       },
     };
     const registry = new SchedulerToolRegistry();
@@ -772,6 +795,9 @@ describe('schedule_silence_current_run — runId resolution branches', () => {
       agentKind: 'claude-code',
       workingDir: '/x',
       sessionId: opts.sessionId,
+      vendorOptions: opts.vendorRunId
+        ? { [SCHEDULER_RUN_ID_VENDOR_OPTION]: opts.vendorRunId }
+        : undefined,
     };
     registerScheduleSilenceCurrentRunTool(
       registry,
@@ -814,6 +840,31 @@ describe('schedule_silence_current_run — runId resolution branches', () => {
     expect(fake.silencedArg).toBeUndefined(); // 未尝试静默任何 run
   });
 
+  it('session map 丢失 + host-owned runId 存在 → 静默权威 run', async () => {
+    const { fake, registry } = setup({
+      sessionId: 'sess-1',
+      inflightRunForSession: undefined,
+      vendorRunId: 'run-after-auto-resume',
+    });
+    const env = await callSilence(registry, { runId: 'run-incorrect' });
+    expect(env.ok).toBe(true);
+    expect(env.data).toMatchObject({ silenced: true, runId: 'run-after-auto-resume' });
+    expect(fake.silencedArg).toBe('run-after-auto-resume');
+  });
+
+  it('host-owned runId 已过期 + session map 已恢复 → 回退到当前 run', async () => {
+    const { fake, registry } = setup({
+      sessionId: 'sess-1',
+      inflightRunForSession: 'run-current',
+      vendorRunId: 'run-stale',
+      silenceReturns: (runId) => runId === 'run-current',
+    });
+    const env = await callSilence(registry, {});
+    expect(env.ok).toBe(true);
+    expect(env.data).toMatchObject({ silenced: true, runId: 'run-current' });
+    expect(fake.silencedArg).toBe('run-current');
+  });
+
   it('sessionId 未知 + 传了 runId → 回退用该 runId 静默', async () => {
     const { fake, registry } = setup({ sessionId: undefined });
     const env = await callSilence(registry, { runId: 'run-fallback' });
@@ -840,13 +891,16 @@ describe('schedule_notify_current_run — runId resolution branches', () => {
   function setup(opts: {
     sessionId?: string;
     inflightRunForSession?: string | undefined;
-    notifyReturns?: boolean;
+    notifyReturns?: boolean | ((runId: string) => boolean);
+    vendorRunId?: string;
   }) {
     const fake: FakeScheduler = {
       resolveInflightRunForSession: () => opts.inflightRunForSession,
       notifyRun: (runId: string) => {
         fake.notifiedArg = runId;
-        return opts.notifyReturns ?? true;
+        return typeof opts.notifyReturns === 'function'
+          ? opts.notifyReturns(runId)
+          : (opts.notifyReturns ?? true);
       },
     };
     const registry = new SchedulerToolRegistry();
@@ -854,6 +908,9 @@ describe('schedule_notify_current_run — runId resolution branches', () => {
       agentKind: 'claude-code',
       workingDir: '/x',
       sessionId: opts.sessionId,
+      vendorOptions: opts.vendorRunId
+        ? { [SCHEDULER_RUN_ID_VENDOR_OPTION]: opts.vendorRunId }
+        : undefined,
     };
     registerScheduleNotifyCurrentRunTool(
       registry,
@@ -892,6 +949,31 @@ describe('schedule_notify_current_run — runId resolution branches', () => {
     expect(env.ok).toBe(false);
     expect(env.code).toBe('NOT_FOUND');
     expect(fake.notifiedArg).toBeUndefined();
+  });
+
+  it('session map 丢失 + host-owned runId 存在 → 主动上报权威 run', async () => {
+    const { fake, registry } = setup({
+      sessionId: 'sess-1',
+      inflightRunForSession: undefined,
+      vendorRunId: 'run-after-auto-resume',
+    });
+    const env = await callNotify(registry, { runId: 'run-incorrect' });
+    expect(env.ok).toBe(true);
+    expect(env.data).toMatchObject({ notified: true, runId: 'run-after-auto-resume' });
+    expect(fake.notifiedArg).toBe('run-after-auto-resume');
+  });
+
+  it('host-owned runId 已过期 + session map 已恢复 → 回退到当前 run', async () => {
+    const { fake, registry } = setup({
+      sessionId: 'sess-1',
+      inflightRunForSession: 'run-current',
+      vendorRunId: 'run-stale',
+      notifyReturns: (runId) => runId === 'run-current',
+    });
+    const env = await callNotify(registry, {});
+    expect(env.ok).toBe(true);
+    expect(env.data).toMatchObject({ notified: true, runId: 'run-current' });
+    expect(fake.notifiedArg).toBe('run-current');
   });
 
   it('sessionId 未知 + 传了 runId → 回退用该 runId 主动上报', async () => {
@@ -969,6 +1051,97 @@ describe('schedule_create — bindToCurrentSession', () => {
     const env = await callCreate(registry, { targetSessionId: 'sess-explicit' });
     expect(env.ok).toBe(true);
     expect(created.input?.targetSessionId).toBe('sess-explicit');
+  });
+});
+
+// ── schedule_update: intervalMs / preRunHook.timeoutMs 的真 partial 边界翻译 ─────
+
+describe('schedule_update — partial 语义的 JSON 边界翻译', () => {
+  function setup(existing: Partial<Schedule> = {}) {
+    const updated: { id?: string; patch?: Record<string, unknown> } = {};
+    const fakeScheduler = {
+      updateFromCurrent: async (
+        id: string,
+        buildPatch: (current: Schedule) => Promise<Record<string, unknown>>,
+      ) => {
+        const patch = await buildPatch({ id, ...existing } as Schedule);
+        updated.id = id;
+        updated.patch = patch;
+        return { id, ...existing, ...patch };
+      },
+    };
+    const registry = new SchedulerToolRegistry();
+    registerScheduleUpdateTool(registry, {
+      getScheduler: () => fakeScheduler as never,
+      // 身份 stabilizer:hook 用例只验证 timeoutMs 的 partial 语义,不测路径固化
+      hookScript: { stabilizeCommand: async ({ command }: { command: string }) => command },
+    } as never);
+    return { updated, registry };
+  }
+
+  async function callUpdate(registry: SchedulerToolRegistry, extra: Record<string, unknown>) {
+    const res = await registry.call('schedule_update', { id: 'sch-1', ...extra });
+    return JSON.parse((res.content[0] as { text: string }).text) as { ok: boolean; code?: string };
+  }
+
+  it('只改 prompt → patch 不含 intervalMs key(真 partial,不再需要三件套)', async () => {
+    const { updated, registry } = setup({ intervalMs: 600_000 });
+    const env = await callUpdate(registry, { prompt: 'new prompt' });
+    expect(env.ok).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(updated.patch ?? {}, 'intervalMs')).toBe(false);
+  });
+
+  it('intervalMs: null → 翻译成带 key 的 undefined(显式清空,回到 cron 语义)', async () => {
+    const { updated, registry } = setup({ intervalMs: 600_000 });
+    const env = await callUpdate(registry, { intervalMs: null });
+    expect(env.ok).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(updated.patch ?? {}, 'intervalMs')).toBe(true);
+    expect(updated.patch?.intervalMs).toBeUndefined();
+  });
+
+  it('preRunHook 只改 command → 沿用任务现有 timeoutMs,不再静默清成不限时', async () => {
+    const { updated, registry } = setup({
+      preRunHook: { command: 'node /abs/old.mjs', timeoutMs: 180_000 },
+    });
+    const env = await callUpdate(registry, { preRunHook: { command: 'node /abs/new.mjs' } });
+    expect(env.ok).toBe(true);
+    expect(updated.patch?.preRunHook).toEqual({ command: 'node /abs/new.mjs', timeoutMs: 180_000 });
+  });
+
+  it('preRunHook.timeoutMs: null → 显式清除超时(patch 里不带 timeoutMs)', async () => {
+    const { updated, registry } = setup({
+      preRunHook: { command: 'node /abs/old.mjs', timeoutMs: 180_000 },
+    });
+    const env = await callUpdate(registry, {
+      preRunHook: { command: 'node /abs/old.mjs', timeoutMs: null },
+    });
+    expect(env.ok).toBe(true);
+    expect(updated.patch?.preRunHook).toEqual({ command: 'node /abs/old.mjs' });
+  });
+
+  it('interval 任务只 patch cronExpr 也校验表达式,无效 cron 不被静默写入', async () => {
+    // 真 partial 保留原 interval → 引擎按 now + intervalMs 重排、不解析 cron;
+    // 工具层必须无条件校验显式提供的 cronExpr,否则坏表达式潜伏到切回 cron 才爆。
+    const { updated, registry } = setup({ intervalMs: 600_000 });
+    const env = await callUpdate(registry, { cronExpr: 'not-a-cron' });
+    expect(env.ok).toBe(false);
+    expect(updated.patch).toBeUndefined();
+
+    const okEnv = await callUpdate(registry, { cronExpr: '*/10 * * * *' });
+    expect(okEnv.ok).toBe(true);
+  });
+
+  it('preRunHook.timeoutMs 带 key 的 undefined → 视作缺省沿用现有超时,不是清除', async () => {
+    // JSON 表达不出这个形态,但进程内调用能;只有 null 才是清除
+    // (copilot review 指出带 key undefined 曾漏进清空分支)。
+    const { updated, registry } = setup({
+      preRunHook: { command: 'node /abs/old.mjs', timeoutMs: 180_000 },
+    });
+    const env = await callUpdate(registry, {
+      preRunHook: { command: 'node /abs/new.mjs', timeoutMs: undefined },
+    });
+    expect(env.ok).toBe(true);
+    expect(updated.patch?.preRunHook).toEqual({ command: 'node /abs/new.mjs', timeoutMs: 180_000 });
   });
 });
 

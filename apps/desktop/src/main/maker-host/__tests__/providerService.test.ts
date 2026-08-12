@@ -16,7 +16,18 @@ describe('createProviderService', () => {
     });
     const providers = await svc.listProviders();
     const byId = Object.fromEntries(providers.map((p) => [p.id, p.connected]));
-    expect(byId).toEqual({ anthropic: false, openai: false, xai: false, xd: true });
+    // gemini(内置 API-key 供应商)未注入 builtinApiKeyConnected ⇒ 缺省未连接。
+    expect(byId).toEqual({ anthropic: false, openai: false, xai: false, xd: true, gemini: false });
+  });
+
+  it('builtin API-key provider connection follows builtinApiKeyConnected (2026-07 图像多来源)', async () => {
+    const svc = createProviderService({
+      getCatalog: bundledCatalog,
+      connection: { xd: () => false, anthropic: () => false, openai: () => false, xai: () => false },
+      builtinApiKeyConnected: (id) => id === 'gemini',
+    });
+    const providers = await svc.listProviders();
+    expect(providers.find((p) => p.id === 'gemini')?.connected).toBe(true);
   });
 
   it('reflects live connection changes (catalog read fresh each call)', async () => {
@@ -91,6 +102,57 @@ describe('createProviderService', () => {
     ).toBe(true);
     expect(checkModelRoute(await svc.listProviders({ catalog: fullCatalog }), agent, capabilityModel.id, 'xd'))
       .toEqual({ kind: 'reject', reason: 'capability-model' });
+  });
+
+  it('reads a lazy full-catalog override after async connection side effects settle', async () => {
+    const anthropic = BUNDLED_CATALOG.providers.find((provider) => provider.id === 'anthropic')!;
+    const modelSeed = BUNDLED_CATALOG.providers
+      .find((provider) => provider.id === 'xd')!
+      .models['claude-code']![0]!;
+    const discoveredModel = {
+      ...modelSeed,
+      id: 'claude-first-fire',
+      name: 'Claude First Fire',
+    };
+    const freshFullCatalog = {
+      ...BUNDLED_CATALOG,
+      providers: BUNDLED_CATALOG.providers.map((provider) =>
+        provider.id === 'anthropic'
+          ? {
+              ...provider,
+              models: {
+                ...provider.models,
+                'claude-code': [discoveredModel],
+              },
+            }
+          : provider,
+      ),
+    };
+    let releaseConnection!: () => void;
+    const connectionGate = new Promise<void>((resolve) => { releaseConnection = resolve; });
+    const getFullCatalog = vi.fn(() => freshFullCatalog);
+    const svc = createProviderService({
+      // Desktop's default catalog is the user-selectable projection; policy callers need
+      // a lazy full-catalog override without capturing a pre-claim snapshot.
+      getCatalog: bundledCatalog,
+      connection: {
+        xd: () => false,
+        anthropic: async () => {
+          await connectionGate;
+          return true;
+        },
+        openai: () => false,
+        xai: () => false,
+      },
+    });
+
+    const providersPromise = svc.listProviders({ getCatalog: getFullCatalog });
+    expect(getFullCatalog).not.toHaveBeenCalled();
+    releaseConnection();
+
+    const provider = (await providersPromise).find(({ id }) => id === anthropic.id);
+    expect(getFullCatalog).toHaveBeenCalledTimes(1);
+    expect(provider?.models['claude-code']).toEqual([discoveredModel]);
   });
 
   it('supports async connection readers (codex oauth)', async () => {

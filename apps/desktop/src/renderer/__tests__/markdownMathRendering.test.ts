@@ -94,6 +94,20 @@ describe('math rendering pipeline (remark-math + rehype-katex)', () => {
     expect(html).toContain('第二行');
   });
 
+  it('截图同形的非法 display LaTeX 保持正文色', () => {
+    const html = renderMath(String.raw`$$
+\boxed{\begin{array}{l}
+(\psi^{(0)},x_0) \xrightarrow{\text{流出}} \text{背景} \\
+\underset{\displaystyle \rotatebox[origin=c]{-90}{$\rightsquigarrow$}}{R_1}
+\end{array}}
+$$`);
+
+    expect(html).toContain('katex-error');
+    expect(html).toContain('\\rotatebox');
+    expect(html).toContain('style="color:inherit"');
+    expect(html).not.toContain('var(--error-fg)');
+  });
+
   it('非法单行 LaTeX 保持正文色,不使用错误红 token', () => {
     const html = renderMath('$\\frac{$');
     expect(html).toContain('katex-error');
@@ -131,8 +145,14 @@ describe('MarkdownRenderer — math 接线 source contract', () => {
   });
 
   it('normalizeMathDelimiters 在渲染前调用且 emitSourceLines 走保行数模式', () => {
+    // 输入是流式修复层的输出(repairStreamingMarkdown,跟随 streamFade 总开关:
+    // 关闭动效 / reduced-motion / 非流式时 repairedContent === throttledContent
+    // 原引用,与动效引入前的渲染路径逐位一致)。
     expect(source).toContain(
-      'normalizeMathDelimiters(throttledContent, { preserveLineCount: emitSourceLines })',
+      'normalizeMathDelimiters(repairedContent, { preserveLineCount: emitSourceLines })',
+    );
+    expect(source).toContain(
+      'streamFade ? repairStreamingMarkdown(throttledContent) : throttledContent',
     );
   });
 

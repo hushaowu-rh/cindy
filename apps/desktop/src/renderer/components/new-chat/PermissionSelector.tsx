@@ -24,7 +24,7 @@ import type { PermissionMode } from '@/lib/userPreferences.types';
 interface PermissionSelectorProps {
   permissionMode: PermissionMode;
   onPermissionModeChange: (mode: PermissionMode) => void;
-  vendorKey?: 'cc' | 'codex';
+  vendorKey?: 'cc' | 'codex' | 'pi';
   /** device-link 远程会话所属被控端 id;非空 = 权限档从被控端读(本地会话 undefined,行为不变)。 */
   deviceId?: string;
   /** 禁用 trigger。用于断线远程会话等只读 composer 状态。 */
@@ -49,6 +49,8 @@ interface PermissionSelectorProps {
   ariaContext?: string;
   /** Disable individual modes without forking the shared permission picker. */
   disabledModes?: Partial<Record<PermissionMode, string>>;
+  /** Restrict the shared picker to a smaller product-approved subset. */
+  allowedModes?: readonly PermissionMode[];
 }
 
 /**
@@ -64,8 +66,10 @@ const PERMISSION_ICONS: Record<string, typeof Hand> = {
   bypassPermissions: TriangleAlert,
 };
 
-function vendorKeyToAgentKind(v: 'cc' | 'codex'): AgentKind {
-  return v === 'codex' ? 'codex' : 'claude-code';
+function vendorKeyToAgentKind(v: 'cc' | 'codex' | 'pi'): AgentKind {
+  if (v === 'codex') return 'codex';
+  if (v === 'pi') return 'pi';
+  return 'claude-code';
 }
 
 /** Codex 不支持 acceptEdits/plan, 落到 ask 兜底 */
@@ -106,6 +110,7 @@ export function PermissionSelector({
   triggerVariant = 'chip',
   ariaContext,
   disabledModes,
+  allowedModes,
 }: PermissionSelectorProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -115,7 +120,9 @@ export function PermissionSelector({
   // device-link:deviceId 非空 → 权限档从被控端读(本地会话 undefined,行为不变)。
   const { capabilities } = useAgentCapabilities(agentKind, deviceId);
 
-  const options: PermissionModeDescriptor[] = capabilities?.permissionModes ?? [];
+  const options: PermissionModeDescriptor[] = (capabilities?.permissionModes ?? []).filter(
+    (option) => allowedModes === undefined || allowedModes.includes(option.id),
+  );
   const effectiveMode =
     options.length > 0 ? normalizeMode(permissionMode, options) : permissionMode;
   const current = options.find((o) => o.id === effectiveMode);
@@ -175,7 +182,7 @@ export function PermissionSelector({
             // min-w-0 让 span 能在 flex 容器里跌破内容宽度,truncate 才能在窄宽下出现 "完..."
             'min-w-0 font-normal text-current',
             'truncate',
-            isCreateAgentVariant ? 'text-[12px]' : dense ? 'text-[12.5px]' : 'text-[13px]',
+            isCreateAgentVariant ? 'text-12' : dense ? 'text-12' : 'text-13',
           )}
         >
           {triggerLabel}
@@ -341,7 +348,7 @@ export function PermissionSelector({
                 />
                 <span
                   className={cn(
-                    'min-w-0 flex-1 truncate text-left text-[14px] font-medium',
+                    'min-w-0 flex-1 truncate text-left text-14 font-medium',
                     selectedTone ? 'text-current' : 'text-[var(--model-item-text)]',
                   )}
                 >

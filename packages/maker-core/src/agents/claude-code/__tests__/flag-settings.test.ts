@@ -50,4 +50,39 @@ describe('buildClaudeFlagSettings', () => {
       'fastMode' in buildClaudeFlagSettings({ showThinkingSummaries: false, fastMode: false }),
     ).toBe(false);
   });
+
+  it('uses host-provided Claude SDK wire models over a user availableModels allowlist', () => {
+    const settings = buildClaudeFlagSettings({
+      showThinkingSummaries: false,
+      fastMode: false,
+      availableModels: ['claude-opus-4-6[1m]', 'claude-sonnet-5'],
+    });
+
+    expect(settings.availableModels).toEqual(['claude-opus-4-6[1m]', 'claude-sonnet-5']);
+  });
+
+  it('adds namespaced plugin skill overrides from the host routing policy', () => {
+    const settings = buildClaudeFlagSettings({
+      showThinkingSummaries: false,
+      fastMode: false,
+      capabilityRouting: {
+        overrides: [
+          {
+            capabilityId: 'feishu',
+            source: {
+              kind: 'harness-plugin',
+              harness: 'claude-code',
+              surface: 'skill',
+              id: 'feishu-delegate:message-feishu-coworkers',
+            },
+            invocation: 'explicit-only',
+          },
+        ],
+      },
+    });
+
+    expect(settings.skillOverrides).toEqual({
+      'feishu-delegate:message-feishu-coworkers': 'user-invocable-only',
+    });
+  });
 });

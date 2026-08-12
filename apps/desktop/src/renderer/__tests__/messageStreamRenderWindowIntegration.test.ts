@@ -31,8 +31,15 @@ import {
   buildRenderItems,
   groupWorkRuns,
   snapRenderWindowStartIdx,
+  isViewportAnchorWithinDefaultTail,
+  resolveAnchoredWindowItemCount,
+  resolveDefaultWindowStartIdx,
+  shouldBoostDefaultWindow,
+  clampTailWindowStartByBudget,
+  estimateRenderItemMountCost,
   RENDER_WINDOW_INITIAL_ITEMS,
   RENDER_WINDOW_FIRST_PAINT_ITEMS,
+  RENDER_WINDOW_FIRST_PAINT_BUDGET,
 } from '../components/chat/MessageStream';
 import {
   decideAutoFillAction,
@@ -94,14 +101,6 @@ const mkAskUser = (id: string): ChatMessage => ({
   clientId: id,
   role: 'ask_user',
   content: '',
-});
-
-const todoInput = (items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>) => ({
-  todos: items.map((t, idx) => ({
-    id: `todo-${idx}`,
-    content: t.content,
-    status: t.status,
-  })),
 });
 
 /**
@@ -281,12 +280,13 @@ describe('Scenario 2 — U1 short session full two-stage trace (build → decide
 // ── Scenario 2b: render-window 不从 Task/Todo 卡中间开窗 ───────────────────
 
 describe('Scenario 2b — render-window start snaps to user turn boundary', () => {
-  it('includes the preceding user message when the default 80-item window would start at a plan card', () => {
+  it('includes the preceding user message when the default 80-item window would start at a task card', () => {
     const messages: ChatMessage[] = [
       mkUser('u-before', 'before'),
       mkAssistant('a-before', 'before answer'),
       mkUser('u-task', 'fix the task card'),
-      mkTool('tw-task', 'TodoWrite', todoInput([{ content: 'fix the task card', status: 'completed' }])),
+      // 运行中的子 Agent 卡(无 result)—— 非 boundary item,窗口不该从它开窗。
+      mkTool('task-1', 'Task', { description: 'fix the task card' }),
       mkAssistant('a-task', 'done'),
     ];
     for (let i = 0; i < 39; i++) {
@@ -297,7 +297,7 @@ describe('Scenario 2b — render-window start snaps to user turn boundary', () =
     const allRenderItems = groupWorkRuns(buildRenderItems(messages).items, false);
     const rawStartIdx = Math.max(0, allRenderItems.length - RENDER_WINDOW_INITIAL_ITEMS);
 
-    expect(allRenderItems[rawStartIdx]?.type).toBe('agent_plan');
+    expect(allRenderItems[rawStartIdx]?.type).toBe('agent_task');
 
     const snappedStartIdx = snapRenderWindowStartIdx(allRenderItems, rawStartIdx);
     const firstVisible = allRenderItems[snappedStartIdx];
@@ -307,7 +307,7 @@ describe('Scenario 2b — render-window start snaps to user turn boundary', () =
       expect(firstVisible.message.role).toBe('user');
       expect(firstVisible.message.clientId).toBe('u-task');
     }
-    expect(allRenderItems[snappedStartIdx + 1]?.type).toBe('agent_plan');
+    expect(allRenderItems[snappedStartIdx + 1]?.type).toBe('agent_task');
   });
 });
 
@@ -478,5 +478,146 @@ describe('two-phase first-paint window', () => {
     expect(firstPaint[firstPaint.length - 1]?.key).toBe(
       allRenderItems[allRenderItems.length - 1]?.key,
     );
+  });
+});
+
+describe('anchored bounded window includes its target', () => {
+  it('adds boundary lookback distance to the desired forward count', () => {
+    // target 位于 turn 起点后第 24 个 item；15-item 窗口若不补 lookback 会漏掉 target。
+    const startIdx = 10;
+    const anchorIdx = startIdx + 24;
+    expect(resolveAnchoredWindowItemCount(startIdx, anchorIdx, 15)).toBe(39);
+    expect(startIdx + resolveAnchoredWindowItemCount(startIdx, anchorIdx, 15)).toBeGreaterThan(
+      anchorIdx,
+    );
+  });
+
+  it('does not inflate a window when snapping keeps the anchor as start', () => {
+    expect(resolveAnchoredWindowItemCount(20, 20, 15)).toBe(15);
+  });
+});
+
+describe('budget-clamped default window boost', () => {
+  it('boosts a short session when the byte budget hid some items', () => {
+    expect(
+      shouldBoostDefaultWindow({
+        allItemCount: 10,
+        visibleItemCount: 5,
+        defaultWindowItems: 15,
+      }),
+    ).toBe(true);
+  });
+
+  it('does not boost a genuinely complete short session', () => {
+    expect(
+      shouldBoostDefaultWindow({
+        allItemCount: 10,
+        visibleItemCount: 10,
+        defaultWindowItems: 15,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not boost after the default window already reached INITIAL', () => {
+    expect(
+      shouldBoostDefaultWindow({
+        allItemCount: RENDER_WINDOW_INITIAL_ITEMS + 20,
+        visibleItemCount: RENDER_WINDOW_INITIAL_ITEMS,
+        defaultWindowItems: RENDER_WINDOW_INITIAL_ITEMS,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('budget-clamped default window user expansion', () => {
+  it('uses the actual visible start when byte budget hid early items', () => {
+    expect(
+      resolveDefaultWindowStartIdx({
+        allItemCount: 10,
+        defaultWindowItems: 15,
+        visibleStartIdx: 5,
+        visibleItemCount: 5,
+      }),
+    ).toBe(5);
+  });
+
+  it('uses the declared tail capacity when the visible window is complete', () => {
+    expect(
+      resolveDefaultWindowStartIdx({
+        allItemCount: 100,
+        defaultWindowItems: 15,
+        visibleStartIdx: 85,
+        visibleItemCount: 15,
+      }),
+    ).toBe(85);
+  });
+});
+
+describe('first-paint content budget (clampTailWindowStartByBudget)', () => {
+  const mkItem = (id: string, contentSize: number) => ({
+    key: `message-${id}`,
+    type: 'message' as const,
+    message: mkAssistant(id, 'x'.repeat(contentSize)),
+  });
+
+  it('small messages never hit the budget — start index unchanged', () => {
+    const items = Array.from({ length: 15 }, (_, i) => mkItem(`s-${i}`, 500));
+    expect(clampTailWindowStartByBudget(items, 0)).toBe(0);
+  });
+
+  it('large messages shrink the window from the front', () => {
+    // 每条 12KB:64k 预算 ≈ 5 条(200 固定开销 + 12000)。15 条起点应收窄到只渲染约 5 条。
+    const items = Array.from({ length: 15 }, (_, i) => mkItem(`l-${i}`, 12_000));
+    const clamped = clampTailWindowStartByBudget(items, 0);
+    expect(clamped).toBeGreaterThan(0);
+    const rendered = items.length - clamped;
+    const cost = items.slice(clamped).reduce((acc, it) => acc + estimateRenderItemMountCost(it), 0);
+    expect(cost).toBeLessThanOrEqual(RENDER_WINDOW_FIRST_PAINT_BUDGET + 12_200);
+    expect(rendered).toBeGreaterThanOrEqual(5);
+    expect(rendered).toBeLessThan(8);
+  });
+
+  it('always keeps at least the last item even when a single item busts the budget', () => {
+    const items = [mkItem('huge', RENDER_WINDOW_FIRST_PAINT_BUDGET * 2)];
+    expect(clampTailWindowStartByBudget(items, 0)).toBe(0);
+  });
+
+  it('window tail is always the latest item', () => {
+    const items = Array.from({ length: 10 }, (_, i) => mkItem(`t-${i}`, 20_000));
+    const clamped = clampTailWindowStartByBudget(items, 0);
+    const rendered = items.slice(clamped);
+    expect(rendered[rendered.length - 1]?.key).toBe(items[items.length - 1]?.key);
+  });
+
+  it('non-message items use flat estimates and stay cheap', () => {
+    const seg = {
+      key: 'seg-a',
+      type: 'tool_segment' as const,
+      toolCalls: [mkTool('a')],
+      resultMap: new Map<string, string>(),
+      settledIds: new Set<string>(),
+      resultTsMap: new Map<string, number>(),
+    };
+    expect(estimateRenderItemMountCost(seg)).toBeLessThan(1000);
+  });
+});
+
+describe('restored default-tail window bound', () => {
+  const items = Array.from({ length: RENDER_WINDOW_INITIAL_ITEMS + 40 }, (_, i) => ({
+    key: `message-m-${i}`,
+    type: 'message' as const,
+    message: mkAssistant(`m-${i}`),
+  }));
+
+  it('accepts an anchor still inside the current default tail', () => {
+    expect(
+      isViewportAnchorWithinDefaultTail(items, items[items.length - RENDER_WINDOW_INITIAL_ITEMS].key),
+    ).toBe(true);
+    expect(isViewportAnchorWithinDefaultTail(items, items.at(-1)!.key)).toBe(true);
+  });
+
+  it('rejects an anchor pushed out of the tail by background appends', () => {
+    expect(isViewportAnchorWithinDefaultTail(items, items[0].key)).toBe(false);
+    expect(isViewportAnchorWithinDefaultTail(items, 'message-m-missing')).toBe(false);
   });
 });

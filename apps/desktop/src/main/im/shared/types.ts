@@ -25,10 +25,18 @@ import type {
   PermissionMode,
   TurnPermissionPolicy,
 } from '@cindy/maker-core';
-import type { ChannelIM, ImOutputDriver, IMMessageEvent, IMUnsupportedEntry } from '@cindy/im';
+import type { GroupHistoryAccessScope } from './groupHistoryAccess';
+import type { ImOutputDriver, IMMessageEvent, IMUnsupportedEntry, TextChannelIM } from '@cindy/im';
 
 /** 渠道名 — 同时是 sessions.source 列值与 IdentityKey.channel 的值域。 */
-export type ImChannelName = 'feishu' | 'slack' | 'discord' | 'wechat' | 'telegram';
+export type ImChannelName =
+  | 'feishu'
+  | 'slack'
+  | 'discord'
+  | 'wechat'
+  | 'telegram'
+  | 'dingtalk'
+  | 'wecom';
 
 /**
  * IM 编排层的产品默认配置(由 main/im/index.ts 产品接线层注入)。
@@ -85,7 +93,7 @@ export interface ImSessionNamespace {
    * 缺省时 threadScoped 渠道回落 FBot 前缀, 非 threadScoped 渠道不起名
    * (保持 defaultTitle)。接管 session 一律沿用 FBot 前缀, 不走这里。
    */
-  generatedTitlePrefix?: string;
+  generatedTitlePrefix?: string | (() => string);
 }
 
 /**
@@ -93,8 +101,8 @@ export interface ImSessionNamespace {
  */
 export interface ImChannelAdapter {
   channel: ImChannelName;
-  /** 收发能力(@cindy/im ChannelIM 契约)。 */
-  im: ChannelIM;
+  /** 所有渠道共有的文本收发能力；富卡片能力由 output.kind 显式收窄。 */
+  im: TextChannelIM;
   /** Terminal output strategy; existing channels use rich-card. */
   output: ImOutputDriver;
   config: ImOrchestratorConfig;
@@ -108,6 +116,11 @@ export interface ImChannelAdapter {
    * 缺省 = 全部按默认撤掉。仅真正跑过的 turn 生效, pre-dispatch 失败不放。
    */
   terminalReactionEmoji?(kind: 'done' | 'aborted' | 'error'): string | null;
+  /**
+   * 交互被作废(turn 收口 / session 清理 / 抢跑)时, 把它那张卡片正文改写成的失效
+   * 提示。缺省 = 不改写(该渠道保持原行为)。
+   */
+  interactionExpiredNotice?: string;
   /**
    * `/project` 项目切换开关(个人 Telegram: true)。开启后 slash 层放行
    * /project 命令: 列出 desktop 端项目工作区, 选中后把当前 (bot, user/lane)
@@ -136,7 +149,18 @@ export interface ImChannelAdapter {
   handleTextInteraction?(
     userId: string,
     request: InteractionRequest,
+    options?: { timeoutMs?: number },
   ): Promise<InteractionDecision>;
+  /**
+   * Cancel a channel-owned text interaction when the central route times out,
+   * the turn stops, or the session closes. Return true when the adapter found
+   * and resolved the matching pending request itself.
+   */
+  cancelTextInteraction?(
+    userId: string,
+    requestId: string,
+    decision: InteractionDecision,
+  ): boolean;
   /** Durable channels may promote task-scoped attachments after message persistence succeeds. */
   onUserMessagePersisted?(args: {
     sessionId: string;
@@ -144,22 +168,15 @@ export interface ImChannelAdapter {
     persisted: boolean;
   }): Promise<void>;
   /**
-   * 流式进度"只发正文"判定(按出站目标粒度)。Telegram 私聊的可编辑消息被
-   * 客户端渲染成带动画的 Rich draft, 过程时间线反复重排会清空重播 —— 返回
-   * true 时中间态只显示正文;零产出的过载重试窗口仍显示 notice 单行(否则
-   * 退避期间毫无反馈)。缺省 = 完整过程时间线(卡片渠道的既有行为)。
-   */
-  answerOnlyProgress?(userId: string): boolean;
-  /**
    * 送模型正文的改写钩子(群上下文拼装等): 返回 agentText 替换发给 agent 的
    * 文本 —— 落库与标题生成仍用渠道原文, 桌面 transcript 不被上下文前缀污染。
-   * commit 在路由解析成功(消息确定会被派发/排队)时调用, 是群窗口游标推进的
-   * 时机锚点; 路由失败(如鉴权缺失)不调用, 这批上下文下次仍会进入 prompt。
+   * commit 在消息完成鉴权、session wiring 且确定被派发/排队后调用, 是群窗口
+   * 游标推进的时机锚点; 受理前失败不调用, 这批上下文下次仍会进入 prompt。
    * 返回 null = 不改写。钩子抛错按"不改写"降级, 不阻断消息。
    */
   prepareAgentTurnText?(event: IMMessageEvent): Promise<{
     agentText: string;
-    commit?: () => void;
+    commit?: () => void | Promise<void>;
   } | null>;
   /**
    * 按入站事件给该轮挂 per-turn 权限策略(telegram 群成员触发 → 破坏性调用
@@ -168,6 +185,8 @@ export interface ImChannelAdapter {
    * 该轮(fail-closed), 不会静默放开。
    */
   turnPermissionPolicyFor?(event: IMMessageEvent): TurnPermissionPolicy | undefined;
+  /** Telegram 每轮的群历史检索授权；其它渠道不实现即 fail closed。 */
+  groupHistoryAccessFor?(event: IMMessageEvent): GroupHistoryAccessScope | undefined;
 }
 
 // ── UI 文案包 ─────────────────────────────────────────────────────────────────
@@ -183,6 +202,25 @@ export interface ImUiTextPack {
      */
     start?: string;
     unknownCommand: (cmd: string) => string;
+    /**
+     * Text-only channels use this when a slash command requires interactive
+     * cards. Missing copy falls back to unknownCommand.
+     */
+    interactiveCommandUnsupported?: (cmd: string) => string;
+    /**
+     * `/settings` 的只读总览。
+     *
+     * 官方 bot 的同名命令由服务端渲染成固定五行(项目 / Agent / 模型 / 强度 /
+     * 权限); 个人侧照同一结构给, 两个 bot 的用户看到的是同一份东西。缺省渠道
+     * 回 unknownCommand —— 没有会话配置概念的渠道不该硬造一个。
+     */
+    settings?: (info: {
+      workspace: string;
+      agent: string;
+      model: string;
+      effort: string;
+      permission: string;
+    }) => string;
     detachedBySlash: string;
     detachedByRevoke: string;
     notAttached: string;
@@ -213,6 +251,18 @@ export interface ImUiTextPack {
     scheduledTaskHeader: (name: string | null) => string;
     unsupportedOnly: (entries: IMUnsupportedEntry[]) => string;
     unsupportedNotice: (entries: IMUnsupportedEntry[]) => string;
+  };
+  /**
+   * 派发前失败文案。agentUnsupported 用于「所选 Agent 无法提供渠道所需的
+   * 逐条权限确认」(如 Pi 在个人微信),permissionModeUnsupported 用于
+   * 「当前权限模式在该 Agent 的 turnPermissionPolicy 排除清单里」。
+   * 可选:仅需要细分文案的渠道实现,其余渠道可不提供。
+   */
+  error?: {
+    agentUnsupported: string;
+    permissionModeUnsupported: string;
+    /** 换 Agent 后仍可能不兼容的权限模式(bypassPermissions / acceptEdits)时附加。 */
+    agentSwitchAlsoCheckPermissionMode?: string;
   };
   cards: {
     permission: {

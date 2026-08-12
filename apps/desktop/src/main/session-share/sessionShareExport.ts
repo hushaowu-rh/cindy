@@ -1,14 +1,22 @@
 /**
- * 会话分享导出编排:把一个本机会话(cc / codex)打成 .xdtshare 文件。
+ * 会话分享导出编排:把一个本机会话(cc / codex / pi)打成 .xdtshare 文件。
  *
  * 数据三层的收集策略:
  *   1. 本地 DB:session 行(白名单字段)+ messages(含 rewind 链,忠实快照;
  *      但遵守 clearedAt 边界——/clear 之前的消息全应用都不可见,分享包同样
  *      不得携带,否则用户清掉敏感内容后分享会静默泄漏);
  *   2. vendor 转录:cc 按三源并集 sdkSessionId 逐个定位 jsonl(fork 链全带),
- *      codex dump state 三表行 + rollout 文件;找不到的记 manifest(保真度降档);
+ *      codex dump state 三表行 + rollout 文件;Pi 将本机绝对 JSONL 路径映射为
+ *      便携 id 后落包;找不到的记 manifest(保真度降档);
  *   3. 媒体:5 种协议 URL 全收集,托管缓存类(image/video/model)与绝对路径
  *      引用类(file/audio)分别解析落包,单文件失败记缺失不阻断。
+ *
+ * Orca 协同:lead 会话可导出,active team 的全部 Worker 会话随包携带——每个
+ * Worker 以同样的三层策略收集,落在 zip 的 orca/workers/<i>/ 前缀下,关系图
+ * (team 状态 + Worker role/label/status/focused)写进 manifest.orca;此时
+ * minReaderVersion 提到 2,旧读端明确拒读而不是静默丢 Worker。Worker 会话
+ * 自身仍拒绝直接导出(入口应是 lead)。远端 Worker 的转录在远端机器,本地
+ * 找不到按缺失降档(消息历史仍全量携带)。
  *
  * 快照语义:导出不关闭活跃 handle、不加锁;流式输出中的会话可能差最后一轮。
  * 写盘用「同目录 .tmp + rename」保证目标文件原子出现。
@@ -22,6 +30,7 @@ import JSZip from 'jszip';
 import { findClaudeSessionJsonl } from '@cindy/maker-core';
 
 import { getDbClient } from '../localDb/client/current.js';
+import { getActiveTeamByLead } from '../localDb/orcaTeamStore.js';
 import { createLogger } from '../logger.js';
 import { collectClaudeSdkSessionIds } from '../maker-host/claude-transcript-relocation.js';
 import {
@@ -38,9 +47,12 @@ import { app } from 'electron';
 import {
   XDTSHARE_FORMAT_VERSION,
   XDTSHARE_MIN_READER_VERSION,
+  XDTSHARE_ORCA_MIN_READER_VERSION,
   type XdtshareFidelity,
   type XdtshareManifest,
   type XdtshareManifestEntry,
+  type XdtshareOrcaManifest,
+  type XdtshareOrcaWorkerManifest,
   type XdtshareTranscriptRef,
 } from './xdtshareFormat.pure.js';
 import { buildPlainFile, sealPayload } from './xdtshareCrypto.js';
@@ -80,6 +92,8 @@ export type SessionShareExportOutcome =
       missingTranscripts: string[];
       /** 引用了但文件已不存在的媒体数。 */
       mediaMissing: number;
+      /** 随包携带的协同 Worker 会话数(非协同包为 0)。 */
+      orcaWorkers: number;
     }
   | { status: 'oversize'; totalBytes: number; mediaBytes: number; limitBytes: number };
 
@@ -137,37 +151,88 @@ function codedError(code: string, message: string): Error {
   return Object.assign(new Error(message), { code });
 }
 
-export async function exportSessionShare(
-  opts: SessionShareExportOptions,
-): Promise<SessionShareExportOutcome> {
-  const session = await readSessionRow(opts.sessionId);
-  if (!session) throw codedError('NOT_FOUND', `session not found: ${opts.sessionId}`);
-  if (session.status === 'deleted') {
-    throw codedError('NOT_FOUND', 'session is deleted');
-  }
-  // remote / orca 会话的转录在远端机器或协同关系图里,本地打包必然缺,直接拒绝
-  // (renderer 侧菜单已隐藏,这里是双保险)。
-  if (session.remoteHostId) {
-    throw codedError('PRECONDITION_FAILED', 'remote sessions cannot be exported');
-  }
-  if (session.orcaRole) {
-    throw codedError('PRECONDITION_FAILED', 'orca team sessions cannot be exported');
-  }
-  if (session.agentKind !== 'cc' && session.agentKind !== 'codex') {
-    throw codedError('PRECONDITION_FAILED', `unsupported agentKind: ${session.agentKind}`);
-  }
+function portablePiSessionId(buffer: Buffer): string {
+  // 纳入**转录内容摘要**而非仅绝对路径:同一 Pi 会话后续产生消息后再导出时,路径不变但内容
+  // 已变。旧实现只散列路径 → id 不变,接收端若曾导入旧包、软删后再导入新包,导入器的
+  // writeIfMissing 会复用磁盘上同名旧转录,新 DB 消息被恢复到过期模型上下文(codex review P2)。
+  // 内容散列使「内容变 → id 变 → 落到新目标文件」,同内容仍同 id(重复导入正常去重)。
+  // ID 与真正打包的同一份冻结字节计算，避免“先 hash、后文件继续写、再 read”
+  // 的 TOCTOU 让清单 id 与包内内容不一致。读失败时不再用绝对路径摘要兜底：
+  // 那会复活 path-only 冲突，并把不可验证的转录伪装成可恢复。
+  const basis = createHash('sha256').update(buffer).digest('hex').slice(0, 32);
+  return `pi-${basis}.jsonl`;
+}
 
-  const messages = await readMessageRows(opts.sessionId, session.clearedAt);
-  if (messages.length === 0) {
-    throw codedError('SHARE_EXPORT_FAILED', 'session has no messages to share');
+/** Pi 的 agentMeta 不能把源机绝对 sessionFile 路径带进分享包。 */
+function rewritePiAgentMetaForExport(
+  agentMeta: string | null,
+  portableIds: ReadonlyMap<string, string>,
+): string | null {
+  if (!agentMeta) return agentMeta;
+  try {
+    const parsed = JSON.parse(agentMeta) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const meta = parsed as Record<string, unknown>;
+    if (typeof meta.sdkSessionId !== 'string') return agentMeta;
+    const portable = portableIds.get(meta.sdkSessionId);
+    if (portable) meta.sdkSessionId = portable;
+    else delete meta.sdkSessionId;
+    return JSON.stringify(meta);
+  } catch {
+    return null;
   }
+}
 
-  // ── 阶段 A:候选收集,只 stat 不读——体积门禁必须在任何大文件进内存之前判
-  //    (review bot 指出:先读后判会让超限媒体先把内存吃满,门禁形同虚设)。──
+/** 阶段 A 的转录候选(只 stat 不读,pi 的 zipPath 留空到阶段 B 定)。 */
+interface TranscriptCandidate {
+  sdkSessionId: string;
+  zipPath: string;
+  absPath: string;
+  bytes: number;
+}
+
+/** 单会话的阶段 A 收集结果(lead 与协同 Worker 复用同一套流程)。 */
+interface SessionPhaseA {
+  session: SessionRow;
+  messages: MessageRow[];
+  /** zip 内前缀:lead 为 '',Worker 为 `orca/workers/<i>/`。 */
+  zipPrefix: string;
+  sdkSessionIds: string[];
+  activeSdkSessionId: string | null;
+  candidates: TranscriptCandidate[];
+  refs: XdtshareTranscriptRef[];
+  codexState: CodexThreadStateDump | null;
+}
+
+/** 单会话的阶段 B 读入结果(pi 的便携 id / 消息 meta 重写在这里完成)。 */
+interface SessionPhaseB {
+  transcriptFiles: Array<{ zipPath: string; buffer: Buffer }>;
+  bundleMessages: MessageRow[];
+  sdkSessionIds: string[];
+  activeSdkSessionId: string | null;
+  refs: XdtshareTranscriptRef[];
+}
+
+/** 协同 Worker 的导出来源(orca_workers 记录 + 会话行 + 可见消息)。 */
+interface OrcaWorkerSource {
+  record: { status: string; label: string | null; role: string; focused: number };
+  session: SessionRow;
+  messages: MessageRow[];
+}
+
+/**
+ * 阶段 A:候选收集,只 stat 不读——体积门禁必须在任何大文件进内存之前判
+ * (review bot 指出:先读后判会让超限媒体先把内存吃满,门禁形同虚设)。
+ */
+async function collectSessionPhaseA(
+  session: SessionRow,
+  messages: MessageRow[],
+  zipPrefix: string,
+): Promise<SessionPhaseA> {
   let sdkSessionIds: string[] = [];
   let activeSdkSessionId: string | null = null;
-  const transcriptCandidates: Array<{ sdkSessionId: string; zipPath: string; absPath: string; bytes: number }> = [];
-  const transcriptRefs: XdtshareTranscriptRef[] = [];
+  const candidates: TranscriptCandidate[] = [];
+  const refs: XdtshareTranscriptRef[] = [];
   let codexState: CodexThreadStateDump | null = null;
 
   const statSize = async (absPath: string): Promise<number | null> => {
@@ -176,7 +241,7 @@ export async function exportSessionShare(
   };
 
   if (session.agentKind === 'cc') {
-    const collected = await collectClaudeSdkSessionIds(opts.sessionId);
+    const collected = await collectClaudeSdkSessionIds(session.id);
     sdkSessionIds = collected.ids;
     activeSdkSessionId = collected.activeId;
     // clearedAt 边界(review bot P1):collect 的三源并集含 pre-clear 消息
@@ -212,11 +277,35 @@ export async function exportSessionShare(
       }
       const bytes = jsonl ? await statSize(jsonl) : null;
       if (jsonl && bytes) {
-        const zipPath = `transcripts/claude/${sid}.jsonl`;
-        transcriptCandidates.push({ sdkSessionId: sid, zipPath, absPath: jsonl, bytes });
-        transcriptRefs.push({ sdkSessionId: sid, path: zipPath });
+        const zipPath = `${zipPrefix}transcripts/claude/${sid}.jsonl`;
+        candidates.push({ sdkSessionId: sid, zipPath, absPath: jsonl, bytes });
+        refs.push({ sdkSessionId: sid, path: zipPath });
       } else {
-        transcriptRefs.push({ sdkSessionId: sid, path: null });
+        refs.push({ sdkSessionId: sid, path: null });
+      }
+    }
+  } else if (session.agentKind === 'pi') {
+    // Pi SDK 返回的是本机 JSONL 绝对路径。分享包必须使用单路径段的便携 id，
+    // 否则既泄露源机 userData，又会在导入端被路径安全校验拒绝。
+    const absoluteIds = new Set<string>();
+    if (session.sdkSessionId && path.isAbsolute(session.sdkSessionId)) {
+      absoluteIds.add(session.sdkSessionId);
+    }
+    for (const message of messages) {
+      if (!message.agentMeta) continue;
+      try {
+        const sid = (JSON.parse(message.agentMeta) as { sdkSessionId?: unknown }).sdkSessionId;
+        if (typeof sid === 'string' && path.isAbsolute(sid)) absoluteIds.add(sid);
+      } catch {
+        // 历史坏 JSON 与其它 agentMeta 读取路径同口径容忍。
+      }
+    }
+    for (const absPath of absoluteIds) {
+      const bytes = await statSize(absPath);
+      if (bytes) {
+        // Pi 的便携 id 必须由阶段 B 真正打包的冻结 buffer 计算；此处只登记
+        // 尺寸候选，不提前读/散列，也不让绝对路径进入最终 manifest。
+        candidates.push({ sdkSessionId: absPath, zipPath: '', absPath, bytes });
       }
     }
   } else {
@@ -226,19 +315,179 @@ export async function exportSessionShare(
       codexState = await dumpCodexThreadStateRows(session.sdkSessionId);
       const bytes = codexState.rolloutPath ? await statSize(codexState.rolloutPath) : null;
       if (codexState.rolloutPath && bytes) {
-        const zipPath = `transcripts/codex/${path.basename(codexState.rolloutPath)}`;
-        transcriptCandidates.push({
+        const zipPath = `${zipPrefix}transcripts/codex/${path.basename(codexState.rolloutPath)}`;
+        candidates.push({
           sdkSessionId: session.sdkSessionId,
           zipPath,
           absPath: codexState.rolloutPath,
           bytes,
         });
-        transcriptRefs.push({ sdkSessionId: session.sdkSessionId, path: zipPath });
+        refs.push({ sdkSessionId: session.sdkSessionId, path: zipPath });
       } else {
-        transcriptRefs.push({ sdkSessionId: session.sdkSessionId, path: null });
+        refs.push({ sdkSessionId: session.sdkSessionId, path: null });
       }
     }
   }
+
+  return { session, messages, zipPrefix, sdkSessionIds, activeSdkSessionId, candidates, refs, codexState };
+}
+
+/**
+ * 阶段 B:真正读入。读失败(stat 后被删/权限/盘不可用)与缺失同等降档,
+ * 不让单文件问题炸掉整次导出;转录读失败同步把 ref 回落 null,保真度按
+ * 实际落包结果判。
+ */
+async function readSessionPhaseB(a: SessionPhaseA): Promise<SessionPhaseB> {
+  const { session, zipPrefix } = a;
+  const sdkSessionIds = [...a.sdkSessionIds];
+  const refs = a.refs.map((r) => ({ ...r }));
+  let activeSdkSessionId = a.activeSdkSessionId;
+  let bundleMessages = a.messages;
+  const transcriptFiles: Array<{ zipPath: string; buffer: Buffer }> = [];
+  const piPortableIds = new Map<string, string>();
+  const seenPiPortableIds = new Set<string>();
+  for (const candidate of a.candidates) {
+    const buffer = await fsp.readFile(candidate.absPath).catch(() => null);
+    if (buffer && buffer.length > 0) {
+      if (session.agentKind === 'pi') {
+        const portableId = portablePiSessionId(buffer);
+        piPortableIds.set(candidate.absPath, portableId);
+        if (!seenPiPortableIds.has(portableId)) {
+          seenPiPortableIds.add(portableId);
+          const zipPath = `${zipPrefix}transcripts/pi/${portableId}`;
+          sdkSessionIds.push(portableId);
+          refs.push({ sdkSessionId: portableId, path: zipPath });
+          transcriptFiles.push({ zipPath, buffer });
+        }
+      } else {
+        transcriptFiles.push({ zipPath: candidate.zipPath, buffer });
+      }
+    } else {
+      // Pi 读失败时没有内容可生成安全便携 id，直接省略该转录并把 message meta
+      // 的 sdkSessionId 清掉；其它 agent 保持既有“ref path=null”降档语义。
+      if (session.agentKind !== 'pi') {
+        const ref = refs.find((r) => r.path === candidate.zipPath);
+        if (ref) ref.path = null;
+      }
+    }
+  }
+  if (session.agentKind === 'pi') {
+    activeSdkSessionId = session.sdkSessionId
+      ? (piPortableIds.get(session.sdkSessionId) ?? null)
+      : null;
+    bundleMessages = a.messages.map((message) => ({
+      ...message,
+      agentMeta: rewritePiAgentMetaForExport(message.agentMeta, piPortableIds),
+    }));
+  }
+  return { transcriptFiles, bundleMessages, sdkSessionIds, activeSdkSessionId, refs };
+}
+
+/** lead 的 active team + Worker 会话收集;无 active team 返回 null(按普通会话导出)。 */
+async function collectOrcaWorkerSources(
+  leadSessionId: string,
+): Promise<{ teamStatus: XdtshareOrcaManifest['teamStatus']; workers: OrcaWorkerSource[] } | null> {
+  // 与运行期使用同一个 active team 选择与去重入口。历史 migration / drift
+  // 可能留下多个 active team；直接 LIMIT 1 会导出用户当前看不到的旧 Worker 图。
+  const team = await getActiveTeamByLead(leadSessionId);
+  if (!team) return null;
+  const workerRows = await getDbClient().query<{
+    sessionId: string;
+    status: string;
+    label: string | null;
+    role: string;
+    focused: number;
+  }>(
+    `SELECT session_id AS sessionId, status, label, role, focused
+     FROM orca_workers WHERE team_id = ? ORDER BY created_at ASC, id ASC`,
+    [team.id],
+  );
+  const workers: OrcaWorkerSource[] = [];
+  for (const record of workerRows) {
+    const workerSession = await readSessionRow(record.sessionId);
+    // active team 的可导出 Worker 必须与运行期 listWorkersByLead 同口径:
+    // 只接受存在且 status=active 的 session。关系悬空/deleted 表示数据异常,
+    // archived 表示用户已归档、当前协同不再展示；前两者不能静默产出缺成员包，
+    // 后者应明确排除而不是导入后复活成 active。
+    if (!workerSession || workerSession.status === 'deleted') {
+      throw codedError(
+        'SHARE_EXPORT_FAILED',
+        `orca worker session is missing or deleted: ${record.sessionId}`,
+      );
+    }
+    if (workerSession.status === 'archived') {
+      log.info('archived orca worker excluded from export', {
+        workerSessionId: record.sessionId,
+      });
+      continue;
+    }
+    if (
+      workerSession.agentKind !== 'cc' &&
+      workerSession.agentKind !== 'codex' &&
+      workerSession.agentKind !== 'pi'
+    ) {
+      throw codedError(
+        'SHARE_EXPORT_FAILED',
+        `unsupported agentKind for orca worker ${record.sessionId}: ${workerSession.agentKind}`,
+      );
+    }
+    workers.push({
+      record,
+      session: workerSession,
+      messages: await readMessageRows(workerSession.id, workerSession.clearedAt),
+    });
+  }
+  return { teamStatus: team.status as XdtshareOrcaManifest['teamStatus'], workers };
+}
+
+export async function exportSessionShare(
+  opts: SessionShareExportOptions,
+): Promise<SessionShareExportOutcome> {
+  const session = await readSessionRow(opts.sessionId);
+  if (!session) throw codedError('NOT_FOUND', `session not found: ${opts.sessionId}`);
+  if (session.status === 'deleted') {
+    throw codedError('NOT_FOUND', 'session is deleted');
+  }
+  // remote 会话的转录在远端机器,本地打包必然缺,直接拒绝(renderer 侧菜单已
+  // 隐藏,这里是双保险)。orca:lead 可导出(随包带整个协同),Worker 子会话
+  // 不能单独导出——它脱离 team 关系图没有意义,入口应是所属 lead。
+  if (session.remoteHostId) {
+    throw codedError('PRECONDITION_FAILED', 'remote sessions cannot be exported');
+  }
+  if (session.orcaRole === 'worker') {
+    throw codedError(
+      'PRECONDITION_FAILED',
+      'orca worker sessions cannot be exported directly; export the lead session',
+    );
+  }
+  if (session.agentKind !== 'cc' && session.agentKind !== 'codex' && session.agentKind !== 'pi') {
+    throw codedError('PRECONDITION_FAILED', `unsupported agentKind: ${session.agentKind}`);
+  }
+
+  const messages = await readMessageRows(opts.sessionId, session.clearedAt);
+  if (messages.length === 0) {
+    throw codedError('SHARE_EXPORT_FAILED', 'session has no messages to share');
+  }
+
+  // ── 协同收集:lead 的 active team 全部 Worker 随包(stale lead 无 active
+  //    team 时按普通会话导出)。Worker 允许 0 条消息(刚创建未派活)。──
+  const orcaSources =
+    session.orcaRole === 'lead' ? await collectOrcaWorkerSources(session.id) : null;
+  const workerSources = orcaSources?.workers ?? [];
+
+  // ── 阶段 A(lead + 每个 Worker) ──
+  const leadA = await collectSessionPhaseA(session, messages, '');
+  const workersA: SessionPhaseA[] = [];
+  for (let i = 0; i < workerSources.length; i += 1) {
+    workersA.push(
+      await collectSessionPhaseA(
+        workerSources[i].session,
+        workerSources[i].messages,
+        `orca/workers/${i}/`,
+      ),
+    );
+  }
+  const allA = [leadA, ...workersA];
 
   const mediaMap: MediaMapEntry[] = [];
   const mediaCandidates: Array<{
@@ -272,34 +521,49 @@ export async function exportSessionShare(
       if (!real) return false; // 路径不存在/不可达:按缺失处理
       return managedMediaRoots.some((r) => real === r || real.startsWith(r + path.sep));
     };
+    const statSize = async (absPath: string): Promise<number | null> => {
+      const stat = await fsp.stat(absPath).catch(() => null);
+      return stat?.isFile() && stat.size > 0 ? stat.size : null;
+    };
     const seenUrls = new Set<string>();
-    for (const message of messages) {
-      for (const { scheme, url } of collectMediaUrls(message.content)) {
-        if (seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const resolved = resolveMediaFile(scheme, url);
-        if (!resolved) continue; // 非法 URL:不进 map,导入端原样保留
-        const looseBlocked =
-          resolved.entry.kind === 'loose' &&
-          (!resolved.absPath || !(await isManagedMediaPath(resolved.absPath)));
-        const bytes = !looseBlocked && resolved.absPath ? await statSize(resolved.absPath) : null;
-        if (!bytes) {
-          mediaMap.push({ ...resolved.entry, zipPath: null });
-          continue;
+    // 协同包:媒体收集覆盖 lead 与全部 Worker 的消息(URL 全局去重,media-map
+    // 仍是包级单份——xdt-image 按 URL host 解析,与展示会话无关)。
+    for (const a of allA) {
+      for (const message of a.messages) {
+        for (const { scheme, url } of collectMediaUrls(message.content)) {
+          if (seenUrls.has(url)) continue;
+          seenUrls.add(url);
+          const resolved = resolveMediaFile(scheme, url);
+          if (!resolved) continue; // 非法 URL:不进 map,导入端原样保留
+          const looseBlocked =
+            resolved.entry.kind === 'loose' &&
+            (!resolved.absPath || !(await isManagedMediaPath(resolved.absPath)));
+          const bytes = !looseBlocked && resolved.absPath ? await statSize(resolved.absPath) : null;
+          if (!bytes) {
+            mediaMap.push({ ...resolved.entry, zipPath: null });
+            continue;
+          }
+          mediaCandidates.push({
+            entry: resolved.entry,
+            absPath: resolved.absPath!,
+            folder: resolved.folder,
+            bytes,
+          });
         }
-        mediaCandidates.push({
-          entry: resolved.entry,
-          absPath: resolved.absPath!,
-          folder: resolved.folder,
-          bytes,
-        });
       }
     }
   }
 
-  // ── 体积门禁(未压缩总量,基于 stat 尺寸,此时尚未读任何大文件) ──
-  const messagesBytes = messages.reduce((sum, m) => sum + Buffer.byteLength(m.content), 0);
-  const transcriptBytes = transcriptCandidates.reduce((sum, f) => sum + f.bytes, 0);
+  // ── 体积门禁(未压缩总量,基于 stat 尺寸,此时尚未读任何大文件;协同包把
+  //    lead 与全部 Worker 一起计入) ──
+  const messagesBytes = allA.reduce(
+    (sum, a) => sum + a.messages.reduce((s, m) => s + Buffer.byteLength(m.content), 0),
+    0,
+  );
+  const transcriptBytes = allA.reduce(
+    (sum, a) => sum + a.candidates.reduce((s, f) => s + f.bytes, 0),
+    0,
+  );
   const mediaBytes = mediaCandidates.reduce((sum, f) => sum + f.bytes, 0);
   const totalBytes = messagesBytes + transcriptBytes + mediaBytes;
   const limitBytes = opts.sizeLimitBytes ?? SHARE_EXPORT_SIZE_LIMIT_BYTES;
@@ -307,19 +571,12 @@ export async function exportSessionShare(
     return { status: 'oversize', totalBytes, mediaBytes, limitBytes };
   }
 
-  // ── 阶段 B:真正读入。读失败(stat 后被删/权限/盘不可用)与缺失同等降档,
-  //    不让单文件问题炸掉整次导出;转录读失败同步把 ref 回落 null,保真度按
-  //    实际落包结果判。──
-  const transcriptFiles: Array<{ zipPath: string; buffer: Buffer }> = [];
-  for (const candidate of transcriptCandidates) {
-    const buffer = await fsp.readFile(candidate.absPath).catch(() => null);
-    if (buffer && buffer.length > 0) {
-      transcriptFiles.push({ zipPath: candidate.zipPath, buffer });
-    } else {
-      const ref = transcriptRefs.find((r) => r.path === candidate.zipPath);
-      if (ref) ref.path = null;
-    }
-  }
+  // ── 阶段 B(lead + 每个 Worker) ──
+  const leadB = await readSessionPhaseB(leadA);
+  const workersB: SessionPhaseB[] = [];
+  for (const a of workersA) workersB.push(await readSessionPhaseB(a));
+  const allB = [leadB, ...workersB];
+
   const mediaFiles: Array<{ zipPath: string; buffer: Buffer }> = [];
   let mediaIndex = 0;
   for (const candidate of mediaCandidates) {
@@ -334,11 +591,12 @@ export async function exportSessionShare(
     mediaFiles.push({ zipPath, buffer });
   }
 
-  // ── 保真度判定(按实际读入结果) ──
-  const foundCount = transcriptRefs.filter((t) => t.path !== null).length;
+  // ── 保真度判定(按实际读入结果;协同包聚合 lead + 全部 Worker 的转录) ──
+  const allRefs = allB.flatMap((b) => b.refs);
+  const foundCount = allRefs.filter((t) => t.path !== null).length;
   let fidelity: XdtshareFidelity;
-  if (transcriptRefs.length === 0 || foundCount === 0) fidelity = 'db-only';
-  else if (foundCount === transcriptRefs.length) fidelity = 'full';
+  if (allRefs.length === 0 || foundCount === 0) fidelity = 'db-only';
+  else if (foundCount === allRefs.length) fidelity = 'full';
   else fidelity = 'partial';
 
   // ── 打 zip ──
@@ -363,45 +621,75 @@ export async function exportSessionShare(
     entries.push({ path: zipPath, bytes: buf.length, sha256: hash.digest('hex') });
   };
 
-  await addEntry(
-    'session.json',
-    JSON.stringify(buildSessionSnapshot(session, activeSdkSessionId), null, 2),
-  );
-  await addEntry('messages.jsonl', messages.map((m) => JSON.stringify(m)).join('\n'));
-  for (const f of transcriptFiles) await addEntry(f.zipPath, f.buffer);
-  if (codexState) {
+  const addSessionEntries = async (a: SessionPhaseA, b: SessionPhaseB): Promise<void> => {
     await addEntry(
-      'codex-state/thread.json',
-      JSON.stringify(
-        {
-          threads: codexState.threads,
-          threadDynamicTools: codexState.threadDynamicTools,
-          threadSpawnEdges: codexState.threadSpawnEdges,
-        },
-        null,
-        2,
-      ),
+      `${a.zipPrefix}session.json`,
+      JSON.stringify(buildSessionSnapshot(a.session, b.activeSdkSessionId), null, 2),
     );
-  }
+    await addEntry(
+      `${a.zipPrefix}messages.jsonl`,
+      b.bundleMessages.map((m) => JSON.stringify(m)).join('\n'),
+    );
+    for (const f of b.transcriptFiles) await addEntry(f.zipPath, f.buffer);
+    if (a.codexState) {
+      await addEntry(
+        `${a.zipPrefix}codex-state/thread.json`,
+        JSON.stringify(
+          {
+            threads: a.codexState.threads,
+            threadDynamicTools: a.codexState.threadDynamicTools,
+            threadSpawnEdges: a.codexState.threadSpawnEdges,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+  };
+
+  await addSessionEntries(leadA, leadB);
+  for (let i = 0; i < workersA.length; i += 1) await addSessionEntries(workersA[i], workersB[i]);
   for (const f of mediaFiles) await addEntry(f.zipPath, f.buffer);
   await addEntry('media-map.json', JSON.stringify({ entries: mediaMap }, null, 2));
 
+  const orcaSection: XdtshareOrcaManifest | undefined = orcaSources
+    ? {
+        teamStatus: orcaSources.teamStatus,
+        workers: workerSources.map((w, i): XdtshareOrcaWorkerManifest => ({
+          index: i,
+          agentKind: w.session.agentKind as 'cc' | 'codex' | 'pi',
+          title: w.session.title,
+          role: w.record.role,
+          label: w.record.label,
+          status: w.record.status as XdtshareOrcaWorkerManifest['status'],
+          focused: !!w.record.focused,
+          sdkSessionIds: workersB[i].sdkSessionIds,
+          activeSdkSessionId: workersB[i].activeSdkSessionId,
+          counts: { messages: workersB[i].bundleMessages.length },
+          transcripts: workersB[i].refs,
+        })),
+      }
+    : undefined;
+
   const manifest: XdtshareManifest = {
-    formatVersion: XDTSHARE_FORMAT_VERSION,
-    minReaderVersion: XDTSHARE_MIN_READER_VERSION,
+    formatVersion: orcaSection ? XDTSHARE_FORMAT_VERSION : XDTSHARE_MIN_READER_VERSION,
+    // 协同包必须让不认识 orca 段的旧读端拒读(否则静默丢全部 Worker);
+    // 普通包保持 1,旧读端照常可读。
+    minReaderVersion: orcaSection ? XDTSHARE_ORCA_MIN_READER_VERSION : XDTSHARE_MIN_READER_VERSION,
     appVersion: safeAppVersion(),
     platform: process.platform,
     exportedAt: new Date().toISOString(),
-    agentKind: session.agentKind as 'cc' | 'codex',
+    agentKind: session.agentKind as 'cc' | 'codex' | 'pi',
     title: session.title,
     workspaceKind: session.workspaceKind === 'dialogue' ? 'dialogue' : 'project',
     originalWorkingDir: session.workingDir,
-    sdkSessionIds,
-    activeSdkSessionId,
+    sdkSessionIds: leadB.sdkSessionIds,
+    activeSdkSessionId: leadB.activeSdkSessionId,
     exportFidelity: fidelity,
-    counts: { messages: messages.length, media: mediaFiles.length },
+    counts: { messages: leadB.bundleMessages.length, media: mediaFiles.length },
     entries,
-    transcripts: transcriptRefs,
+    transcripts: leadB.refs,
+    ...(orcaSection ? { orca: orcaSection } : {}),
   };
   zip.file('manifest.json', JSON.stringify(manifest, null, 2));
 
@@ -427,21 +715,29 @@ export async function exportSessionShare(
     throw err;
   }
 
-  const missingTranscripts = transcriptRefs.filter((t) => t.path === null).map((t) => t.sdkSessionId);
+  const missingTranscripts = allRefs.filter((t) => t.path === null).map((t) => t.sdkSessionId);
   const mediaMissing = mediaMap.filter((m) => m.zipPath === null).length;
   log.info('session share exported', {
     sessionId: opts.sessionId,
     agentKind: session.agentKind,
     fidelity,
     messages: messages.length,
-    transcripts: transcriptFiles.length,
+    orcaWorkers: workerSources.length,
+    transcripts: allB.reduce((sum, b) => sum + b.transcriptFiles.length, 0),
     missingTranscripts: missingTranscripts.length,
     media: mediaFiles.length,
     mediaMissing,
     encrypted: !!opts.password,
     fileBytes: fileBytes.length,
   });
-  return { status: 'ok', filePath: opts.targetPath, fidelity, missingTranscripts, mediaMissing };
+  return {
+    status: 'ok',
+    filePath: opts.targetPath,
+    fidelity,
+    missingTranscripts,
+    mediaMissing,
+    orcaWorkers: workerSources.length,
+  };
 }
 
 /**
@@ -459,7 +755,12 @@ function buildSessionSnapshot(
     model: session.model,
     effort: session.effort,
     permissionMode: session.permissionMode,
-    sdkSessionId: activeSdkSessionId ?? session.sdkSessionId,
+    // Pi 的 DB 值是源机绝对路径，只能写入上面生成的便携 id。转录缺失时
+    // 保持 null，避免 fallback 又把绝对路径塞回包内。
+    sdkSessionId:
+      session.agentKind === 'pi'
+        ? activeSdkSessionId
+        : (activeSdkSessionId ?? session.sdkSessionId),
     totalTokenUsage: session.totalTokenUsage,
     totalCostUsd: session.totalCostUsd,
     contextTokens: session.contextTokens,

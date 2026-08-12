@@ -15,6 +15,16 @@ export * from './interfaces/index.js';
 
 // agents
 export * from './agents/index.js';
+export { evaluatePiProjectTrust, piProjectKey } from './agents/pi/project-trust.js';
+export {
+  assertReviewMessageContentPaths,
+  buildReviewReadGrants,
+  pathIsWithinReviewGrant,
+  reviewFileLinkLayoutIsSafe,
+  resolveReviewReadPath,
+  type ReviewReadGrant,
+} from './agents/shared/review-read-scope.js';
+export { isReviewSensitiveCredentialPath } from './agents/shared/sensitive-credential-paths.js';
 
 // codex app-server transport interface — host 实现自定义 transport (e.g. SSH-bridged
 // for remote codex) 时需要这个接口形状。
@@ -25,7 +35,10 @@ export type {
   CloseHandler as CodexAppServerCloseHandler,
   TransportCloseInfo as CodexAppServerCloseInfo,
 } from './agents/codex/app-server/transport.js';
-export type { CodexModelListItem } from './agents/codex/app-server/protocol.js';
+export type {
+  CodexModelListItem,
+  DynamicToolCallResponse,
+} from './agents/codex/app-server/protocol.js';
 
 // core
 export * from './session.js';
@@ -68,6 +81,8 @@ export { MAKER_MEMORY_RULES } from './memory/system-prompt.js';
 
 // maker contacts (agent-native 智能通讯录, 全局人物实体库)
 export * from './contacts/types.js';
+export * from './contacts/sync/types.js';
+export { createContactsSyncDelta } from './contacts/sync/merge.js';
 export {
   CONTACTS_RULES_DISABLED,
   CONTACTS_RULES_ENABLED,

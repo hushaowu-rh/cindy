@@ -1,10 +1,10 @@
 /**
  * 上次成功获取的端点清单在本地的落盘缓存。
  *
- * 语义边界(重要,勿放宽):这份缓存**只服务于用户在阻断框上显式选择的「用上次配置
- * 启动」**,不是自动回退。启动主路径仍然是「清单即唯一事实源」——拉不到就阻断,
- * 解析/校验不过就阻断,任何路径都不会静默拿缓存顶上。加它是因为原设计连
- * 「用户明知自己离线、只想打开应用看看本地对话」都没有出口,只能反复弹框或退出。
+ * 语义边界(重要,勿放宽):这份缓存只用于**远端清单传输失败**后的完整清单回退。
+ * 正式 CDN 启动路径在自动重试预算用尽后可自动使用它;通用 resolver 也可保留由用户
+ * 在阻断框上显式选择「用上次配置启动」的模式。解析/校验错误仍阻断,任何路径都不会
+ * 用缓存掩盖远端配置事故。
  *
  * 因此:
  *  - 只在**不是本仓配置错**的失败上才允许作为出口(判定以 clientEndpointsService 的
@@ -234,14 +234,15 @@ export const REGION_ENDPOINT_DOMAIN: Readonly<Record<'cn' | 'global', string>> =
 };
 
 /**
- * 跨区共享的 hook 服务:两份清单(含 CN)都指向 cindy.app,所以只有这两个 key 允许
- * 落在 Global 域。**别往这里加 key** —— 每加一个就等于允许该端点跨区,而这个集合之外
+ * 跨区共享的 hook 服务:两份清单(含 CN)都指向 cindy.app,所以只有这几个 hook key
+ * 允许落在 Global 域。**别往这里加 key** —— 每加一个就等于允许该端点跨区,而这个集合之外
  * 的所有端点(尤其 auth / device-link / oauth-broker / model-access / voice)必须锁在
  * 本构建区域,否则就回到上面说的跨区 token 误发。
  */
 export const CROSS_REGION_ENDPOINT_KEYS: ReadonlySet<string> = new Set([
   'slackHookWsUrl',
   'telegramHookWsUrl',
+  'xHookWsUrl',
 ]);
 
 /** 缓存端点的来源策略:按 key 决定它允许落在哪个域。 */

@@ -31,7 +31,8 @@ const log = createLogger('desktop-commands');
  * 执行结果(stdout / stderr / exitCode / elapsedMs / cmdLine / cwd / timedOut)。
  */
 export interface DesktopCommandTriggeredPayload {
-  command: 'help' | 'clear' | 'cmd' | 'issue' | 'jump-session' | 'goal' | 'workflows' | 'learn';
+  command:
+    'help' | 'clear' | 'cmd' | 'issue' | 'review' | 'jump-session' | 'goal' | 'workflows' | 'learn';
   sessionId?: string;
   workingDir?: string;
   args?: string;
@@ -343,8 +344,11 @@ export function registerBuiltinDesktopCommands(
 
   registry.register({
     name: 'clear',
+    // 实现是 renderer 收到 DESKTOP_COMMAND_TRIGGERED 后调 clearSession() →
+    // clearSessionAfterGuard:**原地**清空当前任务的对话上下文,不新建、也不切走
+    // (help-knowledge/{commands,sessions-and-chat}.md 写的才是对的)。
     description:
-      'Equivalent of the sidebar\'s "New Chat" button — opens a fresh empty draft and switches to it. Discards the current conversation context.',
+      'Clears the current session context in place — wipes its messages and state without creating or switching to a new session. The session stays in the sidebar.',
     execute: (ctx) => broadcastDesktopCommand(buildPayload('clear', ctx)),
   });
 
@@ -436,6 +440,19 @@ export function registerBuiltinDesktopCommands(
       `File feedback to the ${BRAND_NAME} team — the agent helps clarify details, then submits a GitHub issue after your confirmation. Usage: /issue [initial description]`,
     execute: (ctx) => {
       sendDesktopCommandToSender(ctx, buildPayload('issue', ctx));
+    },
+  });
+
+  registry.register({
+    name: 'review',
+    description:
+      'Review the current task in a fresh, memory-free, read-only reviewer task. Supports code changes, files, documents, and images. Usage: /review [focus or path]',
+    execute: () => {
+      // ChatInput invokes maker:start-review directly so its exact attachment
+      // snapshot crosses the durable Main boundary before the view can unmount.
+      // Refuse any unbound registry invocation instead of silently broadcasting
+      // an event that may have no mounted consumer.
+      throw new Error('/review must be started from a task composer');
     },
   });
 
@@ -573,7 +590,7 @@ export function registerBuiltinDesktopCommands(
 
   registry.register({
     name: 'jump-session',
-    description: '输入 sessionId 后直接跳转到该会话。',
+    description: '输入 sessionId 后直接跳转到该任务。',
     // 实际执行在 renderer 本地拦截(navigationCommands.ts)；这里仅负责让命令出现在
     // `/` 菜单并提供描述，不走 executeDesktopCommand broadcast。
     execute: () => {},

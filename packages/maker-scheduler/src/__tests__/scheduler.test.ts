@@ -160,6 +160,10 @@ interface Harness {
 function makeHarness(opts?: {
   runnerImpl?: (s: Schedule, ctx: FireContext) => Promise<FireResult>;
   isManagedWorkspaceDir?: (dir: string) => boolean;
+  validateTargetSession?: (
+    targetSessionId: string,
+    operation: 'create' | 'update' | 'fire',
+  ) => Promise<void>;
   /** 传入共享 storage / clock 模拟"两个 app 实例共用同一 DB"的双开场景。 */
   storage?: InMemoryStorage;
   clock?: FakeClock;
@@ -191,6 +195,7 @@ function makeHarness(opts?: {
     generateId: opts?.generateId ?? makeIdGen(),
     tickIntervalMs: 60_000_000, // effectively disabled; tests call tick() manually
     isManagedWorkspaceDir: opts?.isManagedWorkspaceDir,
+    validateTargetSession: opts?.validateTargetSession,
     passive: opts?.passive,
     maxConcurrentRuns: opts?.maxConcurrentRuns,
     runStallMs: opts?.runStallMs,
@@ -258,6 +263,75 @@ describe('Scheduler', () => {
     // 空白串 workingDir 等同未传 → dialogue
     const blankDir = await h.scheduler.create({ ...baseInput, workingDir: '  ' });
     expect(blankDir.workspaceKind).toBe('dialogue');
+  });
+
+  it('rejects persisted Review targets at create, update, automatic fire, and runNow after restart', async () => {
+    const sourceBySessionId = new Map<string, string>([
+      ['session-normal', 'desktop'],
+      ['session-review', 'review'],
+    ]);
+    const operations: Array<{ targetSessionId: string; operation: string }> = [];
+    const validateTargetSession = async (
+      targetSessionId: string,
+      operation: 'create' | 'update' | 'fire',
+    ): Promise<void> => {
+      operations.push({ targetSessionId, operation });
+      if (sourceBySessionId.get(targetSessionId) === 'review') {
+        throw new Error('Review tasks cannot be targets of scheduled automations');
+      }
+    };
+    const local = makeHarness({ validateTargetSession });
+
+    await expect(
+      local.scheduler.create({ ...baseInput, targetSessionId: 'session-review' }),
+    ).rejects.toThrow('Review tasks cannot be targets');
+    expect(local.storage.schedules.size).toBe(0);
+
+    const schedule = await local.scheduler.create({
+      ...baseInput,
+      targetSessionId: 'session-normal',
+    });
+    await expect(
+      local.scheduler.update(schedule.id, { targetSessionId: 'session-review' }),
+    ).rejects.toThrow('Review tasks cannot be targets');
+    expect((await local.storage.get(schedule.id))?.targetSessionId).toBe('session-normal');
+
+    // The source is durable session state, so a target that becomes a Review
+    // task after scheduling must still be rejected by a restarted host.
+    sourceBySessionId.set('session-normal', 'review');
+    const restarted = makeHarness({
+      storage: local.storage,
+      clock: local.clock,
+      validateTargetSession,
+    });
+    await restarted.scheduler.start();
+    try {
+      local.clock.setTo(Date.UTC(2026, 0, 1, 0, 1, 0));
+      await restarted.scheduler.tick();
+      expect(restarted.runner.fire).not.toHaveBeenCalled();
+      expect(await restarted.scheduler.listRuns(schedule.id)).toMatchObject([
+        {
+          status: 'failed',
+          errorMsg: 'Review tasks cannot be targets of scheduled automations',
+        },
+      ]);
+
+      await restarted.scheduler.runNow(schedule.id);
+      expect(restarted.runner.fire).not.toHaveBeenCalled();
+      const runs = await restarted.scheduler.listRuns(schedule.id);
+      expect(runs).toHaveLength(2);
+      expect(runs.every((run) => run.status === 'failed')).toBe(true);
+    } finally {
+      await restarted.scheduler.stop();
+    }
+
+    expect(operations.map((entry) => entry.operation)).toEqual([
+      'create',
+      'create',
+      'update',
+      'fire',
+      'fire',
+    ]);
   });
 
   it('create()/update() 把 app 管理工作区目录归一成对话任务(host 注入谓词)', async () => {
@@ -648,6 +722,153 @@ describe('Scheduler', () => {
     await h.scheduler.stop();
   });
 
+  it('start() isolates legacy invalid interval cron records instead of blocking valid schedules', async () => {
+    const warn = vi.fn();
+    const local = makeHarness({ logger: { warn } });
+    local.storage.schedules.set('legacy-invalid', {
+      id: 'legacy-invalid',
+      name: 'legacy invalid cron',
+      prompt: 'p',
+      kind: 'cron',
+      cronExpr: '5abc * * * *',
+      timezone: 'UTC',
+      recurring: true,
+      manual: false,
+      intervalMs: 5 * 60_000,
+      agentKind: 'claude-code',
+      workspaceKind: 'project',
+      useWorktree: false,
+      notify: { desktop: false, feishu: false },
+      status: 'active',
+      createdAt: 0,
+      updatedAt: 0,
+      nextFireAt: Date.UTC(2020, 0, 1, 0, 0, 0),
+    });
+    local.storage.schedules.set('valid', {
+      id: 'valid',
+      name: 'valid cron',
+      prompt: 'p',
+      kind: 'cron',
+      cronExpr: '0 9 * * *',
+      timezone: 'UTC',
+      recurring: true,
+      manual: false,
+      agentKind: 'claude-code',
+      workspaceKind: 'project',
+      useWorktree: false,
+      notify: { desktop: false, feishu: false },
+      status: 'active',
+      createdAt: 0,
+      updatedAt: 0,
+      nextFireAt: Date.UTC(2020, 0, 1, 0, 0, 0),
+    });
+
+    await expect(local.scheduler.start()).resolves.toBeUndefined();
+
+    expect((await local.storage.get('legacy-invalid'))?.nextFireAt).toBeUndefined();
+    expect((await local.storage.get('valid'))?.nextFireAt).toBe(
+      Date.UTC(2026, 0, 1, 9, 0, 0),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      'scheduler: skipped invalid active schedule during startup',
+      expect.objectContaining({ scheduleId: 'legacy-invalid' }),
+    );
+
+    await local.scheduler.stop();
+  });
+
+  it('keeps a legacy invalid cron quarantined when clearing its stale fire time fails', async () => {
+    const local = makeHarness({ logger: { warn: vi.fn() } });
+    const staleFireAt = Date.UTC(2020, 0, 1, 0, 0, 0);
+    local.storage.schedules.set('legacy-invalid', {
+      id: 'legacy-invalid',
+      name: 'legacy invalid cron',
+      prompt: 'p',
+      kind: 'cron',
+      cronExpr: '5abc * * * *',
+      timezone: 'UTC',
+      recurring: true,
+      manual: false,
+      agentKind: 'claude-code',
+      workspaceKind: 'project',
+      useWorktree: false,
+      notify: { desktop: false, feishu: false },
+      status: 'active',
+      createdAt: 0,
+      updatedAt: 0,
+      nextFireAt: staleFireAt,
+    });
+    vi.spyOn(local.storage, 'update').mockRejectedValueOnce(new Error('database is locked'));
+
+    await local.scheduler.start();
+    expect((await local.storage.get('legacy-invalid'))?.nextFireAt).toBe(staleFireAt);
+
+    local.clock.advance(30_000);
+    await local.scheduler.tick();
+
+    expect(local.runner.fire).not.toHaveBeenCalled();
+    expect(await local.scheduler.listRuns('legacy-invalid')).toHaveLength(0);
+    await local.scheduler.stop();
+  });
+
+  it('quarantines an invalid interval cron first discovered during periodic DB sync', async () => {
+    const local = makeHarness({ logger: { warn: vi.fn() } });
+    await local.scheduler.start();
+    local.storage.schedules.set('late-invalid', {
+      id: 'late-invalid',
+      name: 'late invalid cron',
+      prompt: 'p',
+      kind: 'cron',
+      cronExpr: '5abc * * * *',
+      timezone: 'UTC',
+      recurring: true,
+      manual: false,
+      intervalMs: 5 * 60_000,
+      agentKind: 'claude-code',
+      workspaceKind: 'project',
+      useWorktree: false,
+      notify: { desktop: false, feishu: false },
+      status: 'active',
+      createdAt: 0,
+      updatedAt: 0,
+      nextFireAt: Date.UTC(2020, 0, 1, 0, 0, 0),
+    });
+
+    local.clock.advance(30_000);
+    await local.scheduler.tick();
+
+    expect(local.runner.fire).not.toHaveBeenCalled();
+    expect(await local.scheduler.listRuns('late-invalid')).toHaveLength(0);
+
+    await local.storage.update('late-invalid', {
+      cronExpr: '* * * * *',
+      nextFireAt: local.clock.now(),
+    });
+    local.clock.advance(30_000);
+    await local.scheduler.tick();
+
+    expect(local.runner.fire).toHaveBeenCalledTimes(1);
+    await local.scheduler.stop();
+  });
+
+  it('does not execute a schedule whose cron becomes malformed after cache sync but before due-fire claim', async () => {
+    const local = makeHarness({ logger: { warn: vi.fn() } });
+    await local.scheduler.start();
+    const sch = await local.scheduler.create({ ...baseInput, intervalMs: 10_000 });
+
+    // Simulate a second instance writing invalid metadata while retaining the
+    // same due time. The first instance still has the valid cached copy and
+    // reaches claimDueFire before its 30s DB refresh.
+    await local.storage.update(sch.id, { cronExpr: '5abc * * * *' });
+    local.clock.advance(10_000);
+    await local.scheduler.tick();
+
+    expect(local.runner.fire).not.toHaveBeenCalled();
+    expect(await local.scheduler.listRuns(sch.id)).toHaveLength(0);
+    expect((await local.storage.get(sch.id))?.nextFireAt).toBeUndefined();
+    await local.scheduler.stop();
+  });
+
   // ── intervalMs（"上次完成 + N" 语义）──
   // 这条线和 cron-槽位 完全分支：fireOne / start / resume / create 都要分别覆盖。
 
@@ -656,6 +877,61 @@ describe('Scheduler', () => {
     const sch = await h.scheduler.create({ ...baseInput, intervalMs: 5 * 60_000 });
     expect(sch.nextFireAt).toBe(Date.UTC(2026, 0, 1, 0, 5, 30));
     expect(sch.intervalMs).toBe(5 * 60_000);
+  });
+
+  it('create() rejects invalid cron metadata even when intervalMs controls the first fire', async () => {
+    await expect(h.scheduler.create({
+      ...baseInput,
+      cronExpr: '5abc * * * *',
+      intervalMs: 5 * 60_000,
+    })).rejects.toThrow();
+    expect(h.storage.schedules.size).toBe(0);
+  });
+
+  it('rejects enabling a legacy manual interval schedule with malformed cron metadata', async () => {
+    const schedule = await h.scheduler.create({
+      ...baseInput,
+      manual: true,
+      intervalMs: 5 * 60_000,
+    });
+    await h.storage.update(schedule.id, { cronExpr: '5abc * * * *' });
+
+    await expect(h.scheduler.update(schedule.id, { manual: false })).rejects.toThrow();
+    expect(await h.storage.get(schedule.id)).toMatchObject({
+      manual: true,
+      cronExpr: '5abc * * * *',
+    });
+  });
+
+  it('rejects reactivating an expired interval schedule with malformed cron metadata', async () => {
+    const schedule = await h.scheduler.create({
+      ...baseInput,
+      intervalMs: 5 * 60_000,
+    });
+    await h.storage.update(schedule.id, {
+      status: 'expired',
+      cronExpr: '5abc * * * *',
+    });
+
+    await expect(h.scheduler.update(schedule.id, { name: 'try to reactivate' })).rejects.toThrow();
+    expect(await h.storage.get(schedule.id)).toMatchObject({
+      status: 'expired',
+      cronExpr: '5abc * * * *',
+      name: schedule.name,
+    });
+  });
+
+  it('resume() keeps an interval schedule paused when legacy cron metadata is invalid', async () => {
+    const sch = await h.scheduler.create({
+      ...baseInput,
+      cronExpr: '*/10 * * * *',
+      intervalMs: 10 * 60_000,
+    });
+    await h.scheduler.pause(sch.id);
+    await h.storage.update(sch.id, { cronExpr: '5abc * * * *' });
+
+    await expect(h.scheduler.resume(sch.id)).rejects.toThrow();
+    expect((await h.storage.get(sch.id))?.status).toBe('paused');
   });
 
   it('intervalMs recurring fire schedules nextFireAt at finishedAt + intervalMs', async () => {
@@ -806,32 +1082,74 @@ describe('Scheduler', () => {
     expect(after?.intervalMs).toBeUndefined();
   });
 
-  // ── update(cronExpr) 不带 intervalMs 时一律清空、按字面壁钟语义执行 ──
-  // MCP 工具的 schema 不暴露 intervalMs，patch 只有 cronExpr。修复前旧 intervalMs
-  // 原样保留并继续获胜 → 改 cron 形同虚设（PR 跟进任务退避阶梯被永久冻结在 10min）。
-  // 注意**不做**"按形态推导 interval"：cron 就是 cron，interval 语义只属于显式
-  // 传 intervalMs 的调用方（与 create() 对称，避免壁钟意图被静默转 interval）。
+  // ── intervalMs 真 partial 契约：没带 key 就不动，显式带 key(undefined)才清空 ──
+  // 历史演进（两个方向都栽过，改这里前先读完）：
+  //   1. 最早：cronExpr-only patch 保留旧 intervalMs → interval 永远获胜，改 cron
+  //      形同虚设（当时 MCP schema 不暴露 intervalMs，调用方无法表达清空）。
+  //   2. 于是加了隐式清空：cronExpr 在场且没带 intervalMs key → 清。intervalMs 对
+  //      调用方开放后，它反过来成为静默事故源：只更新 prompt + cronExpr（cadence
+  //      展示对齐的常见形态）就把 interval 任务打回 cron 槽位语义（2026-07-29 #211
+  //      心跳实测），所有调用方被迫背「三件套一起带」。
+  //   3. 现在：真 partial。清空唯一表达 = 显式带 key 且值 undefined（JSON 边界为
+  //      null，由 MCP 工具层翻译）。GUI 表单恒带 key，行为不变。
+  // 仍然**不做**"按形态推导 interval"：cron 就是 cron，与 create() 对称。
 
-  it('update(cronExpr only) clears stale intervalMs when new cron is wall-clock', async () => {
+  it('update(cronExpr only) keeps interval authority and re-arms from now', async () => {
     const sch = await h.scheduler.create({ ...baseInput, cronExpr: '*/10 * * * *', intervalMs: 10 * 60_000 });
     h.clock.setTo(Date.UTC(2026, 0, 1, 0, 1, 0));
-    // 模拟 MCP patch：只带 cronExpr，没有 intervalMs key
-    await h.scheduler.update(sch.id, { cronExpr: '0 9 * * *' });
-    const after = await h.storage.get(sch.id);
-    expect(after?.intervalMs).toBeUndefined();
-    // 按新 cron 的壁钟槽位排，而不是 now + 旧10min = 00:11:00
-    expect(after?.nextFireAt).toBe(Date.UTC(2026, 0, 1, 9, 0, 0));
-  });
-
-  it('update(cronExpr only) clears intervalMs even when new cron is interval-shaped', async () => {
-    const sch = await h.scheduler.create({ ...baseInput, cronExpr: '*/10 * * * *', intervalMs: 10 * 60_000 });
-    h.clock.setTo(Date.UTC(2026, 0, 1, 0, 1, 0));
+    // 模拟 MCP patch：只带 cronExpr（cadence 展示对齐），没有 intervalMs key
     await h.scheduler.update(sch.id, { cronExpr: '*/30 * * * *' });
     const after = await h.storage.get(sch.id);
-    // 不按形态推导：interval 形态的 cron 同样回到纯壁钟语义
+    // interval 语义保持权威，不被隐式清空
+    expect(after?.intervalMs).toBe(10 * 60_000);
+    // 触发字段变了 → 按 interval 冷启动重排：now + 10min = 00:11:00（不是 */30 壁钟槽位）
+    expect(after?.nextFireAt).toBe(Date.UTC(2026, 0, 1, 0, 11, 0));
+  });
+
+  it('rejects an invalid cronExpr update even when interval scheduling remains authoritative', async () => {
+    const sch = await h.scheduler.create({
+      ...baseInput,
+      cronExpr: '*/10 * * * *',
+      intervalMs: 10 * 60_000,
+    });
+
+    await expect(h.scheduler.update(sch.id, { cronExpr: '5abc * * * *' })).rejects.toThrow();
+
+    const stored = await h.storage.get(sch.id);
+    expect(stored).toMatchObject({
+      cronExpr: '*/10 * * * *',
+      intervalMs: 10 * 60_000,
+    });
+  });
+
+  it('rejects interval-only re-arms when legacy cron metadata is malformed', async () => {
+    const sch = await h.scheduler.create({ ...baseInput, intervalMs: 10 * 60_000 });
+    await h.storage.update(sch.id, { cronExpr: '5abc * * * *' });
+    const before = await h.storage.get(sch.id);
+
+    await expect(h.scheduler.update(sch.id, { intervalMs: 5 * 60_000 })).rejects.toThrow();
+    expect(await h.storage.get(sch.id)).toEqual(before);
+  });
+
+  it('update(prompt only) leaves intervalMs and nextFireAt completely untouched', async () => {
+    // 2026-07-29 #211 事故形态的回归：改 prompt 绝不能动 interval 语义
+    const sch = await h.scheduler.create({ ...baseInput, cronExpr: '*/10 * * * *', intervalMs: 10 * 60_000 });
+    h.clock.setTo(Date.UTC(2026, 0, 1, 0, 1, 0));
+    await h.scheduler.update(sch.id, { prompt: 'new prompt' });
+    const after = await h.storage.get(sch.id);
+    expect(after?.intervalMs).toBe(10 * 60_000);
+    expect(after?.nextFireAt).toBe(Date.UTC(2026, 0, 1, 0, 10, 30));
+  });
+
+  it('update with explicit intervalMs:undefined key alone clears and falls back to cron slots', async () => {
+    const sch = await h.scheduler.create({ ...baseInput, cronExpr: '*/10 * * * *', intervalMs: 10 * 60_000 });
+    h.clock.setTo(Date.UTC(2026, 0, 1, 0, 1, 0));
+    // 显式清空不需要同时改 cronExpr
+    await h.scheduler.update(sch.id, { intervalMs: undefined });
+    const after = await h.storage.get(sch.id);
     expect(after?.intervalMs).toBeUndefined();
-    // 下一个 */30 壁钟槽位 = 00:30:00（不是 now+30min=00:31:00，更不是 now+旧10min）
-    expect(after?.nextFireAt).toBe(Date.UTC(2026, 0, 1, 0, 30, 0));
+    // 回到现有 cron 的壁钟槽位：下一个 */10 = 00:10:00
+    expect(after?.nextFireAt).toBe(Date.UTC(2026, 0, 1, 0, 10, 0));
   });
 
   it('update with explicit intervalMs key still wins over cron-derived value', async () => {
@@ -3852,5 +4170,200 @@ describe('Scheduler: 排队不占槽与卡死守卫', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ── #1016:attempt 生命周期状态机(转移统一入口 + 单一出口清单) ──────────────
+describe('Scheduler: attempt 生命周期状态机(#1016)', () => {
+  function spyLogger(): { logger: Logger; warns: unknown[][] } {
+    const warns: unknown[][] = [];
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn((...args: unknown[]) => warns.push(args)),
+      error: vi.fn(),
+      debug: vi.fn(),
+    } as unknown as Logger;
+    return { logger, warns };
+  }
+
+  it('完整生命周期(含排队往返)合法收口:零非法转移、出口零残留告警', async () => {
+    const { logger, warns } = spyLogger();
+    let ctxRef: FireContext | undefined;
+    let release: (() => void) | undefined;
+    const h = makeHarness({
+      logger,
+      runnerImpl: (_s, ctx) =>
+        new Promise<FireResult>((resolve) => {
+          ctxRef = ctx;
+          ctx.onQueueWaitStart?.();
+          release = () => {
+            // 排队 → 回收槽位 → 正常完成:覆盖 running→queued→running→finalizing 全链。
+            expect(ctx.endQueueWait?.(true)).toBe(true);
+            resolve({ sessionId: 'sess-full-lifecycle' });
+          };
+        }),
+    });
+    const sch = await h.scheduler.create({ ...baseInput, manual: true });
+    const p = h.scheduler.runNow(sch.id);
+    await vi.waitFor(() => expect(ctxRef).toBeDefined());
+    expect(h.scheduler.getRuntimeSnapshot().inFlightRuns[0]?.phase).toBe('queued');
+    release?.();
+    await p;
+    const snap = h.scheduler.getRuntimeSnapshot();
+    expect(snap.inFlight).toBe(0);
+    expect(snap.slotsInUse).toBe(0);
+    // 单一出口清单未发现任何残留登记(残留 = 某条路径漏了收口,响亮告警)。
+    expect(
+      warns.some((args) => String(args[0]).includes('unreaped registrations')),
+    ).toBe(false);
+    await h.scheduler.stop();
+  });
+
+  it('排队中 runner 直接抛错(不经过 endQueueWait)→ queued→finalizing 合法收口为 failed', async () => {
+    const { logger, warns } = spyLogger();
+    let reject: ((err: Error) => void) | undefined;
+    const h = makeHarness({
+      logger,
+      runnerImpl: (_s, ctx) =>
+        new Promise<FireResult>((_resolve, rej) => {
+          ctx.onQueueWaitStart?.();
+          reject = rej;
+        }),
+    });
+    const sch = await h.scheduler.create({ ...baseInput, manual: true });
+    const p = h.scheduler.runNow(sch.id);
+    await vi.waitFor(() => expect(reject).toBeDefined());
+    reject?.(new Error('queued turn interrupted'));
+    await p;
+    const runs = await h.storage.listRuns(sch.id);
+    expect(runs[0]?.status).toBe('failed');
+    expect(h.scheduler.getRuntimeSnapshot().inFlight).toBe(0);
+    expect(
+      warns.some((args) => String(args[0]).includes('unreaped registrations')),
+    ).toBe(false);
+    await h.scheduler.stop();
+  });
+
+  it('强制收口后 runner 迟到调用 onQueueWaitStart → no-op,不抛非法转移(#1016 review)', async () => {
+    vi.useFakeTimers();
+    try {
+      let ctxRef: FireContext | undefined;
+      const h = makeHarness({
+        runStallMs: 60_000,
+        runStallAbortGraceMs: 30_000,
+        runnerImpl: (_s, ctx) =>
+          new Promise<FireResult>(() => {
+            ctxRef = ctx;
+          }),
+      });
+      await h.scheduler.create({ ...baseInput, intervalMs: 3_600_000 });
+      h.clock.advance(3_600_000);
+      void h.scheduler.tick();
+      await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().slotsInUse).toBe(1));
+      h.clock.advance(60_001);
+      await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_INTERVAL_MS);
+      h.clock.advance(30_001);
+      await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_INTERVAL_MS);
+      await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().inFlight).toBe(0));
+      // 强制收口已完成,runner 的 continuation 迟到调排队回调:必须是安静的 no-op。
+      expect(() => ctxRef?.onQueueWaitStart?.()).not.toThrow();
+      expect(() => ctxRef?.endQueueWait?.(true)).not.toThrow();
+      await h.scheduler.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('强制收口后迟到的 onTurnActive/onSessionBound 不留悬挂登记(#1016 review)', async () => {
+    vi.useFakeTimers();
+    try {
+      let ctxRef: FireContext | undefined;
+      const h = makeHarness({
+        runStallMs: 60_000,
+        runStallAbortGraceMs: 30_000,
+        runnerImpl: (_s, ctx) =>
+          new Promise<FireResult>(() => {
+            ctxRef = ctx;
+          }),
+      });
+      const sch = await h.scheduler.create({ ...baseInput, intervalMs: 3_600_000 });
+      h.clock.advance(3_600_000);
+      void h.scheduler.tick();
+      await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().slotsInUse).toBe(1));
+      h.clock.advance(60_001);
+      await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_INTERVAL_MS);
+      h.clock.advance(30_001);
+      await vi.advanceTimersByTimeAsync(RUN_HEARTBEAT_INTERVAL_MS);
+      await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().inFlight).toBe(0));
+      // attempt 已删并 reap:迟到的 turn-active / session-bound 上报必须整体 no-op,
+      // 不写 session 映射 / 绑定映射(悬挂登记会让下一次 begin 的不变量断言抛错)。
+      expect(() => ctxRef?.onTurnActive?.('sess-late-turn')).not.toThrow();
+      await ctxRef?.onSessionBound?.('sess-late-bind');
+      expect(h.scheduler.resolveInflightRunForSession('sess-late-turn')).toBeUndefined();
+      // 下一轮 fire 的 beginInflightAttempt 会跑 assertAttemptRegistryInvariants
+      // (含 bound-session / silenced 覆盖)——迟到写入若真落了账,这里会响亮抛错。
+      h.clock.advance(3_600_000);
+      void h.scheduler.tick();
+      await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().slotsInUse).toBe(1));
+      expect(sch.id).toBeTruthy();
+      await h.scheduler.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() 清 silencedRuns:静默 run 执行中停机后再 runNow 不被不变量断言误杀(#1016 review)', async () => {
+    const h = makeHarness({
+      runnerImpl: () => new Promise<FireResult>(() => {}),
+    });
+    const sch = await h.scheduler.create({ ...baseInput, silentWhenIdle: true });
+    const first = h.scheduler.runNow(sch.id);
+    first.catch(() => {});
+    await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().inFlight).toBe(1));
+    const [running] = await h.scheduler.listRuns(sch.id);
+    expect(h.scheduler.isRunSilenced(running.id)).toBe(true);
+    await h.scheduler.stop();
+    // stop 清空 attempts 的同时必须一并清 silencedRuns:留着的话,同实例后续第一次
+    // beginInflightAttempt 的不变量断言会把它当悬挂登记抛错(codex review P1)。
+    expect(h.scheduler.isRunSilenced(running.id)).toBe(false);
+    const second = h.scheduler.runNow(sch.id);
+    second.catch(() => {});
+    await vi.waitFor(() => expect(h.scheduler.getRuntimeSnapshot().inFlight).toBe(1));
+    await h.scheduler.stop();
+  });
+
+  it('stop() 打在前置 await 期间:恢复的 continuation 不登记悬挂 controller(#1016 review)', async () => {
+    // stop() 清 attempt 时 continuation 还没有 controller,无从 abort;恢复后若照常
+    // registerInflight,controller/索引就成了没有 attempt 的悬挂登记,此后同实例每次
+    // begin 都被不变量断言拦下(codex review P1)。守卫应放弃本轮并(runNow 契约)抛错。
+    const storage = new InMemoryStorage();
+    let releaseInsert: (() => void) | null = null;
+    let gated = true;
+    const realInsertRun = storage.insertRun.bind(storage);
+    storage.insertRun = (run: ScheduleRun) => {
+      if (!gated) return realInsertRun(run);
+      return new Promise<ScheduleRun>((resolve) => {
+        releaseInsert = () => resolve(realInsertRun(run));
+      });
+    };
+    const h = makeHarness({
+      storage,
+      runnerImpl: async () => ({ sessionId: 'sess-after-stop' }),
+    });
+    const sch = await h.scheduler.create({ ...baseInput });
+    const first = h.scheduler.runNow(sch.id);
+    const firstOutcome = first.then(
+      () => 'resolved',
+      (e) => String(e),
+    );
+    await vi.waitFor(() => expect(releaseInsert).not.toBeNull());
+    await h.scheduler.stop();
+    gated = false;
+    releaseInsert!();
+    expect(await firstOutcome).toMatch(/stopped while starting runNow/);
+    // 无悬挂登记:同实例再 runNow,begin 的不变量断言不抛,run 正常收尾。
+    const second = await h.scheduler.runNow(sch.id);
+    expect(second.runId).toBeTruthy();
+    await h.scheduler.stop();
   });
 });

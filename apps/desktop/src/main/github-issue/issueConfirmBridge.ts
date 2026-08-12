@@ -23,6 +23,7 @@ import type { CindyRegion } from '@cindy/maker-shared/brand-identity';
 
 import { normalizeIssuePublicName } from '../../shared/issuePublicName.js';
 import { MAKER_PUSH } from '../maker-ipc/channels';
+import { HOST_CONFIRM_TIMEOUT_MS } from '../maker-ipc/hostConfirmTiming.js';
 
 export interface IssueDraft {
   title: string;
@@ -47,6 +48,12 @@ export interface IssueEnvInfo {
 export type IssueSubmissionIdentity =
   { kind: 'github-user'; login: string } | { kind: 'platform'; login: string };
 
+/** 平台 Bot 永远存在；验证到可用 GitHub 账号时才追加本人身份选项。 */
+export interface IssueSubmissionChoices {
+  platform: Extract<IssueSubmissionIdentity, { kind: 'platform' }>;
+  githubUser?: Extract<IssueSubmissionIdentity, { kind: 'github-user' }>;
+}
+
 export type IssueConfirmDecision =
   | {
       confirmed: true;
@@ -54,6 +61,8 @@ export type IssueConfirmDecision =
       title: string;
       body: string;
       type: 'bug' | 'feature';
+      /** 用户在确认卡片中明确选择的提交身份；旧 renderer 缺失时按平台默认处理。 */
+      submissionIdentity?: IssueSubmissionIdentity;
       /** 平台代发时由用户确认的公开署名；GitHub 用户直发时不存在。 */
       publicName?: string;
       /** renderer 当前界面语言(i18n.language);main 侧 OS locale 仅作 fallback。 */
@@ -64,9 +73,22 @@ export type IssueConfirmDecision =
       reason: 'cancelled' | 'timeout' | 'session_closed' | 'session_aborted';
     };
 
+/** Renderer 可重放的提交确认请求；主进程持有它直到确认流程 settle。 */
+export interface IssueConfirmInteractionSnapshot {
+  kind: 'issue_confirm';
+  requestId: string;
+  draft: IssueDraft;
+  env: IssueEnvInfo;
+  /** 默认提交身份；保留字段名以兼容只认识单身份的旧 renderer。 */
+  submissionIdentity: Extract<IssueSubmissionIdentity, { kind: 'platform' }>;
+  /** 仅当当前已验证到可用 GitHub 账号时存在。 */
+  githubUserIdentity?: Extract<IssueSubmissionIdentity, { kind: 'github-user' }>;
+  suggestedPublicName?: string;
+}
+
 export interface IssueConfirmBridgeDeps {
   broadcast: (channel: string, payload: unknown) => void;
-  /** 确认超时,默认 10 分钟(对齐 permission prompt 的超时语义)。测试注小值。 */
+  /** 确认超时,默认 9 分钟,须早于外层 MCP 的 10 分钟 deadline。测试注小值。 */
   timeoutMs?: number;
   logger?: { warn: (...args: unknown[]) => void };
   /**
@@ -77,11 +99,10 @@ export interface IssueConfirmBridgeDeps {
   onDesktopOnlyConfirmPending?: (sessionId: string) => void;
 }
 
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
-
 interface PendingConfirmEntry {
   sessionId: string;
-  requiresPublicName: boolean;
+  request: IssueConfirmInteractionSnapshot;
+  submissionChoices: IssueSubmissionChoices;
   resolve: (decision: IssueConfirmDecision) => void;
   timeoutId: ReturnType<typeof setTimeout>;
 }
@@ -96,31 +117,34 @@ export class IssueConfirmBridge {
     sessionId: string,
     draft: IssueDraft,
     env: IssueEnvInfo,
-    submissionIdentity: IssueSubmissionIdentity,
+    submissionChoices: IssueSubmissionChoices,
     suggestedPublicName?: string,
   ): Promise<IssueConfirmDecision> {
     const requestId = randomUUID();
+    const request: IssueConfirmInteractionSnapshot = {
+      kind: 'issue_confirm',
+      requestId,
+      draft,
+      env,
+      submissionIdentity: submissionChoices.platform,
+      ...(submissionChoices.githubUser ? { githubUserIdentity: submissionChoices.githubUser } : {}),
+      suggestedPublicName,
+    };
     return new Promise<IssueConfirmDecision>((resolve) => {
-      const timeoutMs = this.deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      const timeoutMs = this.deps.timeoutMs ?? HOST_CONFIRM_TIMEOUT_MS;
       const timeoutId = setTimeout(() => {
         this.settle(requestId, { confirmed: false, reason: 'timeout' }, 'timeout');
       }, timeoutMs);
       this.pending.set(requestId, {
         sessionId,
-        requiresPublicName: submissionIdentity.kind === 'platform',
+        request,
+        submissionChoices,
         resolve,
         timeoutId,
       });
       this.deps.broadcast(MAKER_PUSH.INTERACTION_REQUEST, {
         sessionId,
-        request: {
-          kind: 'issue_confirm',
-          requestId,
-          draft,
-          env,
-          submissionIdentity,
-          suggestedPublicName,
-        },
+        request,
       });
       try {
         this.deps.onDesktopOnlyConfirmPending?.(sessionId);
@@ -135,6 +159,16 @@ export class IssueConfirmBridge {
     });
   }
 
+  /** 打开、重连或刷新会话时供 renderer 补回错过的确认卡。 */
+  pendingSnapshots(sessionId?: string): Array<{
+    sessionId: string;
+    request: IssueConfirmInteractionSnapshot;
+  }> {
+    return Array.from(this.pending.values())
+      .filter((entry) => sessionId === undefined || entry.sessionId === sessionId)
+      .map((entry) => ({ sessionId: entry.sessionId, request: entry.request }));
+  }
+
   /**
    * renderer 经 RESOLVE_INTERACTION 回包。返回是否命中本桥的 pending
    * (false = requestId 不属于本桥,调用方继续走原有 resolver 查找/告警)。
@@ -142,7 +176,7 @@ export class IssueConfirmBridge {
   resolve(requestId: string, rawDecision: unknown): boolean {
     const entry = this.pending.get(requestId);
     if (!entry) return false;
-    let decision = parseDecision(rawDecision, entry.requiresPublicName);
+    let decision = parseDecision(rawDecision, entry.submissionChoices);
     if (!decision) {
       // shape 非法按取消兜底,避免 tool handler 永久挂起。
       this.deps.logger?.warn('issue-confirm: invalid decision shape, fallback to cancelled', {
@@ -164,10 +198,7 @@ export class IssueConfirmBridge {
   }
 
   /** 会话关闭/中止时清掉该会话所有 pending,并让 renderer 收卡。 */
-  cleanupForSession(
-    sessionId: string,
-    reason: 'session_closed' | 'session_aborted',
-  ): void {
+  cleanupForSession(sessionId: string, reason: 'session_closed' | 'session_aborted'): void {
     for (const [requestId, entry] of Array.from(this.pending.entries())) {
       if (entry.sessionId !== sessionId) continue;
       this.settle(requestId, { confirmed: false, reason }, reason);
@@ -202,7 +233,10 @@ export class IssueConfirmBridge {
   }
 }
 
-function parseDecision(raw: unknown, requiresPublicName: boolean): IssueConfirmDecision | null {
+function parseDecision(
+  raw: unknown,
+  submissionChoices: IssueSubmissionChoices,
+): IssueConfirmDecision | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
   if (obj.confirmed === false) {
@@ -216,16 +250,44 @@ function parseDecision(raw: unknown, requiresPublicName: boolean): IssueConfirmD
     obj.body.trim().length > 0 &&
     (obj.type === 'bug' || obj.type === 'feature')
   ) {
-    const publicName = requiresPublicName ? normalizeIssuePublicName(obj.publicName) : undefined;
-    if (requiresPublicName && !publicName) return null;
+    const submissionIdentity = parseSelectedIdentity(obj.submissionIdentity, submissionChoices);
+    if (!submissionIdentity) return null;
+    const publicName =
+      submissionIdentity.kind === 'platform' ? normalizeIssuePublicName(obj.publicName) : undefined;
+    if (submissionIdentity.kind === 'platform' && !publicName) return null;
     return {
       confirmed: true,
       title: obj.title.trim(),
       body: obj.body.trim(),
       type: obj.type,
+      submissionIdentity,
       ...(publicName ? { publicName } : {}),
       uiLanguage: typeof obj.uiLanguage === 'string' ? obj.uiLanguage : undefined,
     };
+  }
+  return null;
+}
+
+/**
+ * Renderer 只能选择 Main 在本次确认请求里提供的身份。旧 renderer 不回传该字段时
+ * 继续落到平台默认值，保证升级中途的 pending 卡片仍可安全提交。
+ */
+function parseSelectedIdentity(
+  raw: unknown,
+  choices: IssueSubmissionChoices,
+): IssueSubmissionIdentity | null {
+  if (raw === undefined) return choices.platform;
+  if (!raw || typeof raw !== 'object') return null;
+  const identity = raw as Record<string, unknown>;
+  if (identity.kind === 'platform' && identity.login === choices.platform.login) {
+    return choices.platform;
+  }
+  if (
+    identity.kind === 'github-user' &&
+    choices.githubUser &&
+    identity.login === choices.githubUser.login
+  ) {
+    return choices.githubUser;
   }
   return null;
 }

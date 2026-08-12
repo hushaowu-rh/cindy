@@ -10,6 +10,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MobileMakerTransport } from '@/device-link/mobileMakerTransport';
 
+const recoveryStorage = vi.hoisted(() => new Map<string, string>());
+const recoveryAsyncStorage = vi.hoisted(() => ({
+  getItem: vi.fn(async (key: string) => recoveryStorage.get(key) ?? null),
+  setItem: vi.fn(async (key: string, value: string) => {
+    recoveryStorage.set(key, value);
+  }),
+  removeItem: vi.fn(async (key: string) => {
+    recoveryStorage.delete(key);
+  }),
+}));
+
+vi.mock('@react-native-async-storage/async-storage', () => ({
+  default: recoveryAsyncStorage,
+}));
+
 // expo-crypto 是原生模块(createUuid 的 CSPRNG 兜底;node 环境有 crypto.randomUUID
 // 不会走到),node 下 import 副作用不可控,mock 掉。
 vi.mock('expo-crypto', () => ({
@@ -17,14 +32,22 @@ vi.mock('expo-crypto', () => ({
 }));
 import {
   dismissNewSessionCreation,
+  drainStashedNewSessionDraft,
   getNewSessionCreationTask,
+  prepareNewSessionCreationForEdit,
   retryNewSessionCreation,
   shouldBlockSessionSync,
+  stashNewSessionDraftForEdit,
   startNewSessionCreation,
   type NewSessionCreationParams,
 } from '@/session/newSessionCreation';
 import { remoteSessionStore } from '@/session/remoteSessionStore';
 import { sessionFromCreateResult, type NewSessionDraft } from '@/session/newSession';
+import {
+  __testing as recoveryTesting,
+  listPendingPrecreatedWorktrees,
+  registerPendingPrecreatedWorktree,
+} from '@/session/precreatedWorktreeRecovery';
 
 const DRAFT: NewSessionDraft = {
   agentKind: 'claude-code',
@@ -44,6 +67,9 @@ interface MakerMock {
   listMessages: ReturnType<typeof vi.fn>;
   setPlanMode: ReturnType<typeof vi.fn>;
   setPermissionMode: ReturnType<typeof vi.fn>;
+  worktree: {
+    discardPrecreated: ReturnType<typeof vi.fn>;
+  };
   input: {
     enqueue: ReturnType<typeof vi.fn>;
     getProjection: ReturnType<typeof vi.fn>;
@@ -59,6 +85,9 @@ function makeMaker(overrides: Partial<MakerMock> = {}): MakerMock {
     listMessages: vi.fn(async () => []),
     setPlanMode: vi.fn(async () => undefined),
     setPermissionMode: vi.fn(async () => undefined),
+    worktree: {
+      discardPrecreated: vi.fn(async () => ({ discarded: true })),
+    },
     ...overrides,
     input: {
       enqueue: vi.fn(async () => ({ sessionId: 's', pendingQueue: [] })),
@@ -77,7 +106,7 @@ function makeParams(sessionId: string, maker: MakerMock, patch: Partial<NewSessi
     attachments: [],
     planModeArm: false,
     legacyPlanRestore: null,
-    confirmUnauthenticated: () => Promise.resolve(false),
+    confirmUnauthenticated: () => Promise.resolve({ unauthenticated: false, fresh: null }),
     authGateHint: '请先在电脑端完成登录。',
     onUnauthenticated: () => undefined,
     transport: {
@@ -101,10 +130,38 @@ async function flushPipeline(): Promise<void> {
 }
 
 describe('newSessionCreation pipeline', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await recoveryTesting.drainMutations();
+    recoveryStorage.clear();
+    recoveryTesting.resetVolatileLedgers();
     remoteSessionStore.clear();
+    drainStashedNewSessionDraft();
     // 清残留 task(上个用例失败态)。
-    for (const id of ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12']) dismissNewSessionCreation(id);
+    for (const id of [
+      's1',
+      's2',
+      's3',
+      's4',
+      's5',
+      's6',
+      's7',
+      's8',
+      's9',
+      's10',
+      's11',
+      's12',
+      's13',
+      's14',
+      's15',
+      's16',
+      's17',
+      's18',
+      's19',
+      's20',
+      's21',
+      's22',
+      's23',
+    ]) dismissNewSessionCreation(id);
   });
 
   it('start 同步段即入 store:合成行带 pendingLocalCreation,首条消息以排队气泡上屏', () => {
@@ -223,6 +280,158 @@ describe('newSessionCreation pipeline', () => {
       expect.anything(),
     );
     expect(getNewSessionCreationTask('s11')).toBeNull();
+  });
+
+  it('started 写盘后二次重验修正草稿 + getSession 失败 → 乐观行回写修正版(codex P1)', async () => {
+    // 首次 auth 刷新 fail-open(fresh:null → 管线内 draftPatch 保持 null),但
+    // started 写盘后二次重验拿到 fresh 并修正 (model, providerId);getSession
+    // 失败走合成 fallback——若乐观行回写只认 draftPatch,此处会跳过,UI/后续
+    // 发送仍用已删除来源;排队 lazy-create 材料与乐观行同源,必须一并修正。
+    let authCalls = 0;
+    const maker = makeMaker();
+    startNewSessionCreation(makeParams('s21', maker, {
+      draft: {
+        ...DRAFT,
+        workingDir: '/repo/.cindy-worktrees/auto-one',
+        providerId: 'provider-a',
+        model: 'model-a',
+      },
+      precreatedWorktree: {
+        path: '/repo/.cindy-worktrees/auto-one',
+        recoveryKey: 'recovery-key-1234567890',
+        originalWorkingDir: '/repo',
+      },
+      precreatedWorktreeAccountId: 'owner-a',
+      confirmUnauthenticated: async () => {
+        authCalls += 1;
+        return authCalls === 1
+          ? { unauthenticated: false, fresh: null }
+          : { unauthenticated: false, fresh: { providers: [] } };
+      },
+      revalidateDraftAfterAuth: async () => ({ providerId: 'provider-b', model: 'model-b' }),
+    }));
+    await flushPipeline();
+    expect(authCalls).toBe(2);
+    // 乐观行回写修正版(不修则 UI 显示 provider-a)
+    const row = remoteSessionStore.getSessions().find((s) => s.id === 's21');
+    expect(row?.providerId).toBe('provider-b');
+    expect(row?.model).toBe('model-b');
+    // 排队 lazy-create 材料与乐观行同源
+    expect(maker.input.enqueue).toHaveBeenCalledWith(
+      's21',
+      expect.objectContaining({
+        createOpts: expect.objectContaining({ providerId: 'provider-b', model: 'model-b' }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('started 写盘后二次鉴权中止:账本降回 precreated,任务可返回编辑(codex P2)', async () => {
+    // 首次鉴权通过、precreated 账本写成 session-create-started 后,二次鉴权发现
+    // 来源全断开——createSession 尚未调用,必须先把账本降回 precreated 再失败:
+    // 否则 precreatedWorktreeSessionCreateStarted=true 会让 retry 拒绝重试、
+    // prepareForEdit 拒绝返回编辑、recovery 不回收未认领的 started 记录,
+    // 用户被困失败页且 worktree 无法自动回收(codex review P2 补强)。
+    const precreated = {
+      sessionId: 's22',
+      deviceId: 'dev-1',
+      path: '/repo/.cindy-worktrees/auto-two',
+      recoveryKey: 'recovery-key-2222222222',
+      originalWorkingDir: '/repo',
+    };
+    let authCalls = 0;
+    const maker = makeMaker();
+    startNewSessionCreation(makeParams('s22', maker, {
+      draft: { ...DRAFT, workingDir: precreated.path },
+      precreatedWorktree: precreated,
+      precreatedWorktreeAccountId: 'owner-a',
+      // 第 1 次 = 管线内鉴权(persist 之前):通过,fresh fail-open;
+      // 第 2 次 = started 写盘后二次鉴权(persist 之后):来源全断开 → 中止,
+      // 但 createSession 尚未调用,必须先降级账本。
+      confirmUnauthenticated: async () => {
+        authCalls += 1;
+        return authCalls === 1
+          ? { unauthenticated: false, fresh: null }
+          : { unauthenticated: true, fresh: null };
+      },
+      // 二次鉴权分支的开关:revalidateDraftAfterAuth 非空才执行 started 写盘后重验
+      revalidateDraftAfterAuth: async () => null,
+    }));
+    await flushPipeline();
+    expect(getNewSessionCreationTask('s22')?.status).toBe('create-failed');
+    expect(maker.createSession).not.toHaveBeenCalled();
+    // 账本降回 precreated(recovery 可回收未认领 worktree)
+    const pending = await listPendingPrecreatedWorktrees('owner-a');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      sessionId: 's22',
+      deviceId: 'dev-1',
+      path: precreated.path,
+      recoveryKey: 'recovery-key-2222222222',
+      phase: 'precreated',
+    });
+    // 任务可返回编辑(不再 retain-only 拒绝)——prepare 会 discard + forget
+    const prepared = await prepareNewSessionCreationForEdit('s22');
+    expect(prepared).not.toBeNull();
+    expect(maker.worktree.discardPrecreated).toHaveBeenCalled();
+    await expect(listPendingPrecreatedWorktrees('owner-a')).resolves.toEqual([]);
+  });
+
+  it('started 二次鉴权中止 + 账本降级写盘失败:任务不锁死,可返回编辑(codex P1)', async () => {
+    // 降级(写回 precreated)罕见失败时,resolveStartedDowngradeOrCommit 走 commit
+    // 分支(restoreStarted 把账本写回 started)——第 60 轮无条件抛错会保留
+    // sessionCreateStarted=true → retry 拒绝/prepareForEdit 报 cleanup pending/
+    // recovery 不回收 = 永久锁死(codex review P1)。修复后两种结果都复位任务。
+    const rec = await import('@/session/precreatedWorktreeRecovery');
+    const original = rec.registerPendingPrecreatedWorktree;
+    let precreatedWrites = 0;
+    const spy = vi.spyOn(rec, 'registerPendingPrecreatedWorktree')
+      .mockImplementation(async (accountId, record) => {
+        if (record.phase === 'precreated') {
+          precreatedWrites += 1;
+          // 首次降级写盘失败(commit 分支),中止前重试一次持久降级成功——重试
+          // 必须真正走 original 写盘,否则调用方以为成功但账本未变。
+          if (precreatedWrites <= 1) return false;
+          return original(accountId, record);
+        }
+        return original(accountId, record);
+      });
+    try {
+      const precreated = {
+        sessionId: 's23',
+        deviceId: 'dev-1',
+        path: '/repo/.cindy-worktrees/auto-three',
+        recoveryKey: 'recovery-key-3333333333',
+        originalWorkingDir: '/repo',
+      };
+      let authCalls = 0;
+      const maker = makeMaker();
+      startNewSessionCreation(makeParams('s23', maker, {
+        draft: { ...DRAFT, workingDir: precreated.path },
+        precreatedWorktree: precreated,
+        precreatedWorktreeAccountId: 'owner-a',
+        confirmUnauthenticated: async () => {
+          authCalls += 1;
+          return authCalls === 1
+            ? { unauthenticated: false, fresh: null }
+            : { unauthenticated: true, fresh: null };
+        },
+        revalidateDraftAfterAuth: async () => null,
+      }));
+      await flushPipeline();
+      expect(getNewSessionCreationTask('s23')?.status).toBe('create-failed');
+      expect(maker.createSession).not.toHaveBeenCalled();
+      // 降级失败 → 中止前重试一次持久降级成功 → 账本回 precreated(recovery 可
+      // 回收未认领 worktree),且任务可返回编辑(codex review P2)
+      const pending = await listPendingPrecreatedWorktrees('owner-a');
+      expect(pending[0]?.phase).toBe('precreated');
+      expect(precreatedWrites).toBeGreaterThanOrEqual(2);
+      const prepared = await prepareNewSessionCreationForEdit('s23');
+      expect(prepared).not.toBeNull();
+      expect(maker.worktree.discardPrecreated).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('createSession 返回的 id 与预生成 id 不一致 → 确定性 create-failed,不把首条消息发进错误会话', async () => {
@@ -355,5 +564,350 @@ describe('newSessionCreation pipeline', () => {
     // store 对 status:'deleted' 的 patch 是直接把行移出 shard(首页不再可见)。
     expect(remoteSessionStore.getSessions().find((s) => s.id === 's1')).toBeUndefined();
     expect(remoteSessionStore.getInputProjection('s1').pendingQueue).toHaveLength(0);
+  });
+
+  it('create-failed 返回编辑前回收预创建 worktree，并把原项目目录放回草稿', async () => {
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVALID_PARAMS: cannot create session');
+      }),
+    });
+    const params = makeParams('s13', maker, {
+      draft: {
+        ...DRAFT,
+        workingDir: '/repo/.cindy-worktrees/auto-one',
+      },
+      precreatedWorktree: {
+        path: '/repo/.cindy-worktrees/auto-one',
+        recoveryKey: 'recovery-key-1234567890',
+        originalWorkingDir: '/repo',
+      },
+    });
+    startNewSessionCreation(params);
+    await flushPipeline();
+
+    const failed = getNewSessionCreationTask('s13');
+    expect(failed?.status).toBe('create-failed');
+
+    const prepared = await prepareNewSessionCreationForEdit('s13');
+    expect(prepared).not.toBeNull();
+    expect(params.transport.openLink).toHaveBeenCalledWith('dev-1');
+    expect(maker.worktree.discardPrecreated).toHaveBeenCalledWith({
+      sessionId: 's13',
+      recoveryKey: 'recovery-key-1234567890',
+    });
+
+    stashNewSessionDraftForEdit(prepared!);
+    expect(drainStashedNewSessionDraft()?.draft.workingDir).toBe('/repo');
+  });
+
+  it('带回创建期间后续消息时仍恢复预创建 worktree 的原项目目录', async () => {
+    const task = {
+      ...makeParams('s13-override', makeMaker(), {
+        draft: {
+          ...DRAFT,
+          workingDir: '/repo/.cindy-worktrees/auto-override',
+        },
+        precreatedWorktree: {
+          path: '/repo/.cindy-worktrees/auto-override',
+          recoveryKey: 'recovery-key-override-123456',
+          originalWorkingDir: '/repo',
+        },
+      }),
+      status: 'create-failed' as const,
+      error: 'create failed',
+      firstMessageClientId: 'client-override',
+    };
+
+    stashNewSessionDraftForEdit(task, {
+      draft: {
+        ...task.draft,
+        firstMessage: 'hello world\n\nfollow up',
+      },
+    });
+
+    expect(drainStashedNewSessionDraft()?.draft).toMatchObject({
+      workingDir: '/repo',
+      firstMessage: 'hello world\n\nfollow up',
+    });
+  });
+
+  it('create-failed cleanup preserves the task when the new channel fails', async () => {
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVALID_PARAMS: cannot create session');
+      }),
+      worktree: {
+        discardPrecreated: vi.fn(async () => {
+          throw Object.assign(new Error('registered path mismatch'), {
+            code: 'PERMISSION_DENIED',
+          });
+        }),
+      },
+    });
+    startNewSessionCreation(makeParams('s14', maker, {
+      draft: {
+        ...DRAFT,
+        workingDir: '/repo/.cindy-worktrees/auto-two',
+      },
+      precreatedWorktree: {
+        path: '/repo/.cindy-worktrees/auto-two',
+        recoveryKey: 'recovery-key-1234567890',
+        originalWorkingDir: '/repo',
+      },
+    }));
+    await flushPipeline();
+
+    await expect(
+      prepareNewSessionCreationForEdit('s14'),
+    ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    expect(getNewSessionCreationTask('s14')?.status).toBe('create-failed');
+  });
+
+  it('old desktop without discard-precreated keeps the cleanup obligation fail-closed', async () => {
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVALID_PARAMS: cannot create session');
+      }),
+      worktree: {
+        discardPrecreated: vi.fn(async () => {
+          throw Object.assign(new Error('channel not allowed remotely'), {
+            code: 'CHANNEL_NOT_ALLOWED',
+          });
+        }),
+      },
+    });
+    startNewSessionCreation(makeParams('s15', maker, {
+      draft: {
+        ...DRAFT,
+        workingDir: '/repo/.cindy-worktrees/auto-three',
+      },
+      precreatedWorktree: {
+        path: '/repo/.cindy-worktrees/auto-three',
+        recoveryKey: 'recovery-key-1234567890',
+        originalWorkingDir: '/repo',
+      },
+    }));
+    await flushPipeline();
+
+    await expect(
+      prepareNewSessionCreationForEdit('s15'),
+    ).rejects.toMatchObject({ code: 'CHANNEL_NOT_ALLOWED' });
+    expect(maker.worktree.discardPrecreated).toHaveBeenCalledTimes(1);
+    expect(getNewSessionCreationTask('s15')?.status).toBe('create-failed');
+  });
+
+  it('回收发现会话已认领时重新对账真实会话，不把用户困在 create-failed', async () => {
+    const worktreePath = '/repo/.cindy-worktrees/auto-four';
+    const claimedSession = sessionFromCreateResult(
+      { sessionId: 's16', workDir: worktreePath },
+      DRAFT,
+    );
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVALID_PARAMS: create response lost');
+      }),
+      getSession: vi.fn(async () => claimedSession),
+      worktree: {
+        discardPrecreated: vi.fn(async () => {
+          throw Object.assign(new Error('session already owns worktree'), {
+            code: 'PRECONDITION_FAILED',
+          });
+        }),
+      },
+    });
+    startNewSessionCreation(makeParams('s16', maker, {
+      draft: { ...DRAFT, workingDir: worktreePath },
+      precreatedWorktree: {
+        path: worktreePath,
+        recoveryKey: 'recovery-key-1234567890',
+        originalWorkingDir: '/repo',
+      },
+    }));
+    await flushPipeline();
+    expect(getNewSessionCreationTask('s16')?.status).toBe('create-failed');
+
+    await expect(prepareNewSessionCreationForEdit('s16')).resolves.toBeNull();
+    expect(getNewSessionCreationTask('s16')?.status).toBe('enqueue-failed');
+    expect(remoteSessionStore.getSessions().find((s) => s.id === 's16')).toMatchObject({
+      id: 's16',
+      workingDir: worktreePath,
+      pendingLocalCreation: false,
+    });
+    expect(remoteSessionStore.getInputProjection('s16').pendingQueue).toHaveLength(0);
+  });
+
+  it('managed create 的 wrong-id + malformed ownership probe 持久进入 retain-only，禁止重试或返回编辑删除', async () => {
+    const createdAt = Date.now();
+    const precreated = {
+      sessionId: 's18',
+      deviceId: 'dev-1',
+      path: '/repo/.cindy-worktrees/auto-unsafe',
+      recoveryKey: 'recovery-key-unsafe-123456',
+      createdAt,
+      phase: 'precreated' as const,
+    };
+    await registerPendingPrecreatedWorktree('owner-a', precreated);
+    const maker = makeMaker({
+      createSession: vi.fn(async () => ({ sessionId: 'wrong-session-id' })),
+      getSession: vi.fn(async () => null),
+    });
+    startNewSessionCreation(makeParams('s18', maker, {
+      draft: { ...DRAFT, workingDir: precreated.path },
+      precreatedWorktree: {
+        path: precreated.path,
+        recoveryKey: precreated.recoveryKey,
+        originalWorkingDir: '/repo',
+        createdAt,
+      },
+      precreatedWorktreeAccountId: 'owner-a',
+    }));
+    await flushPipeline();
+
+    expect(getNewSessionCreationTask('s18')).toMatchObject({
+      status: 'create-failed',
+    });
+    expect(maker.createSession).toHaveBeenCalledTimes(1);
+    expect(maker.input.enqueue).not.toHaveBeenCalled();
+    retryNewSessionCreation('s18');
+    await flushPipeline();
+    expect(maker.createSession).toHaveBeenCalledTimes(1);
+    await expect(prepareNewSessionCreationForEdit('s18')).rejects.toThrow(
+      'worktree',
+    );
+    expect(maker.worktree.discardPrecreated).not.toHaveBeenCalled();
+    await expect(listPendingPrecreatedWorktrees('owner-a')).resolves.toEqual([{
+      ...precreated,
+      phase: 'session-create-started',
+    }]);
+  });
+
+  it.each([
+    ['null', null],
+    ['empty object', {}],
+    ['wrong id', { id: 'another-session' }],
+  ])('managed create 丢 ACK 后 probe %s 仍 retain-only，不重建、不入队、不回收', async (_label, probeResult) => {
+    const createdAt = Date.now();
+    const precreated = {
+      sessionId: 's20',
+      deviceId: 'dev-1',
+      path: '/repo/.cindy-worktrees/auto-unknown',
+      recoveryKey: 'recovery-key-unknown-123456',
+      createdAt,
+      phase: 'precreated' as const,
+    };
+    await registerPendingPrecreatedWorktree('owner-a', precreated);
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVOKE_TIMEOUT');
+      }),
+      getSession: vi.fn(async () => probeResult),
+    });
+    startNewSessionCreation(makeParams('s20', maker, {
+      draft: { ...DRAFT, workingDir: precreated.path },
+      precreatedWorktree: {
+        path: precreated.path,
+        recoveryKey: precreated.recoveryKey,
+        originalWorkingDir: '/repo',
+        createdAt,
+      },
+      precreatedWorktreeAccountId: 'owner-a',
+    }));
+    await flushPipeline();
+
+    expect(getNewSessionCreationTask('s20')?.status).toBe('create-failed');
+    expect(maker.createSession).toHaveBeenCalledTimes(1);
+    expect(maker.getSession).toHaveBeenCalledTimes(1);
+    expect(maker.input.enqueue).not.toHaveBeenCalled();
+    retryNewSessionCreation('s20');
+    await flushPipeline();
+    expect(maker.createSession).toHaveBeenCalledTimes(1);
+    expect(maker.getSession).toHaveBeenCalledTimes(1);
+    await expect(prepareNewSessionCreationForEdit('s20')).rejects.toThrow('worktree');
+    expect(maker.worktree.discardPrecreated).not.toHaveBeenCalled();
+    await expect(listPendingPrecreatedWorktrees('owner-a')).resolves.toEqual([{
+      ...precreated,
+      phase: 'session-create-started',
+    }]);
+  });
+
+  it.each([
+    ['null', null],
+    ['empty object', {}],
+    ['negative ACK', { discarded: false }],
+    ['invalid branchDeleted', { discarded: true, branchDeleted: 'yes' }],
+  ])('返回编辑只接受完整 discard ACK：%s 回包保留 task 与账本', async (_label, discardAck) => {
+    const createdAt = Date.now();
+    const maker = makeMaker({
+      worktree: {
+        discardPrecreated: vi.fn(async () => discardAck),
+      },
+    });
+    startNewSessionCreation(makeParams('s19', maker, {
+      draft: { ...DRAFT, workingDir: '/repo/.cindy-worktrees/auto-ack' },
+      precreatedWorktree: {
+        path: '/repo/.cindy-worktrees/auto-ack',
+        recoveryKey: 'recovery-key-ack-123456',
+        originalWorkingDir: '/repo',
+        createdAt,
+      },
+      precreatedWorktreeAccountId: 'owner-a',
+      confirmUnauthenticated: async () => ({ unauthenticated: true, fresh: null }),
+    }));
+    await flushPipeline();
+    await expect(prepareNewSessionCreationForEdit('s19')).rejects.toThrow();
+    expect(getNewSessionCreationTask('s19')?.status).toBe('create-failed');
+    expect(maker.worktree.discardPrecreated).toHaveBeenCalledWith({
+      sessionId: 's19',
+      recoveryKey: 'recovery-key-ack-123456',
+    });
+  });
+
+  it('账号在 create retry 等待期间切换时停止旧任务并保留旧账号 recovery ledger', async () => {
+    const record = {
+      sessionId: 's17',
+      deviceId: 'dev-1',
+      path: '/repo/.cindy-worktrees/auto-owner-a',
+      recoveryKey: 'recovery-key-owner-a-123456',
+      createdAt: Date.now(),
+      phase: 'precreated' as const,
+    };
+    await expect(
+      registerPendingPrecreatedWorktree('owner-a', record),
+    ).resolves.toBe(true);
+
+    let currentOwner = 'owner-a';
+    const maker = makeMaker({
+      createSession: vi.fn(async () => {
+        throw new Error('INVOKE_TIMEOUT');
+      }),
+      getSession: vi.fn(async () => {
+        currentOwner = 'owner-b';
+        throw new Error('NOT_FOUND');
+      }),
+    });
+
+    startNewSessionCreation(makeParams('s17', maker, {
+      draft: { ...DRAFT, workingDir: record.path },
+      precreatedWorktree: {
+        path: record.path,
+        recoveryKey: record.recoveryKey,
+        originalWorkingDir: '/repo',
+        createdAt: record.createdAt,
+      },
+      precreatedWorktreeAccountId: 'owner-a',
+      isCurrentOwner: () => currentOwner === 'owner-a',
+    }));
+    await flushPipeline();
+
+    expect(maker.createSession).toHaveBeenCalledTimes(1);
+    expect(maker.getSession).toHaveBeenCalledTimes(1);
+    expect(maker.input.enqueue).not.toHaveBeenCalled();
+    expect(getNewSessionCreationTask('s17')).toBeNull();
+    expect(remoteSessionStore.getSessions().find((session) => session.id === 's17')).toBeUndefined();
+    await expect(listPendingPrecreatedWorktrees('owner-a')).resolves.toEqual([{
+      ...record,
+      phase: 'session-create-started',
+    }]);
   });
 });

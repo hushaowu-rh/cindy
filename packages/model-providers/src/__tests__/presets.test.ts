@@ -3,13 +3,13 @@
  *
  * 关键不变量：
  *   - presets 是纯 UI 模板数据，坏条目**逐条丢弃**，绝不让整份目录 parse 失败回退 bundled；
- *   - mergeWithBundled：远端带 presets 用远端的，远端没带回落 bundled 的；
+ *   - mergeWithBundled：远端与 bundled 按 id 合并，同 id 远端优先、bundled 补缺；
  *   - BUNDLED_CATALOG 自带的首批预设本身合法（每条至少一个 runtime、字段完整）。
  */
 
 import { describe, it, expect } from 'vitest';
 
-import { BUNDLED_CATALOG, parseCatalog, presetDisplayName, sanitizePresets, sortPresetsForLocale } from '../catalog.js';
+import { BUNDLED_CATALOG, parseCatalog, presetDisplayName, sanitizePresets, sortPresetsForRegion } from '../catalog.js';
 import { mergeWithBundled } from '../source.js';
 import type { Catalog } from '../types.js';
 
@@ -45,6 +45,63 @@ const VALID_PRESET = {
 };
 
 describe('sanitizePresets', () => {
+  it('accepts explicit Pi reasoning metadata and rejects ambiguous capability declarations', () => {
+    const piReasoning = {
+      ...VALID_PRESET,
+      id: 'pi-reasoning',
+      runtimes: {
+        pi: {
+          baseUrl: 'https://example.com/v1',
+          wireProtocol: 'openai-responses',
+          models: [
+            {
+              id: 'reasoner',
+              name: 'Reasoner',
+              reasoning: true,
+              reasoningEfforts: ['low', 'high', 'xhigh'],
+            },
+          ],
+        },
+      },
+    };
+    expect(sanitizePresets([piReasoning])).toEqual([piReasoning]);
+    expect(
+      sanitizePresets([
+        {
+          ...piReasoning,
+          id: 'missing-efforts',
+          runtimes: {
+            pi: {
+              ...piReasoning.runtimes.pi,
+              models: [{ id: 'reasoner', name: 'Reasoner', reasoning: true }],
+            },
+          },
+        },
+      ]),
+    ).toEqual([]);
+    expect(
+      sanitizePresets([
+        {
+          ...piReasoning,
+          id: 'wrong-runtime',
+          runtimes: {
+            codex: {
+              baseUrl: 'https://example.com/v1',
+              models: [
+                {
+                  id: 'reasoner',
+                  name: 'Reasoner',
+                  reasoning: true,
+                  reasoningEfforts: ['high'],
+                },
+              ],
+            },
+          },
+        },
+      ]),
+    ).toEqual([]);
+  });
+
   it('保留合法条目、丢弃坏条目，不抛错', () => {
     const out = sanitizePresets([
       VALID_PRESET,
@@ -112,6 +169,29 @@ describe('sanitizePresets', () => {
     }])).toEqual([]);
   });
 
+  it('Pi 图片输入能力只接受显式布尔值', () => {
+    const visual = {
+      id: 'visual-pi',
+      name: 'Visual Pi',
+      runtimes: {
+        pi: {
+          baseUrl: 'http://127.0.0.1:11434/v1',
+          models: [{ id: 'vision', name: 'Vision', supportsImageInput: true }],
+        },
+      },
+    };
+    expect(sanitizePresets([visual])).toEqual([visual]);
+    expect(sanitizePresets([{
+      ...visual,
+      runtimes: {
+        pi: {
+          ...visual.runtimes.pi,
+          models: [{ id: 'vision', name: 'Vision', supportsImageInput: 'yes' }],
+        },
+      },
+    }])).toEqual([]);
+  });
+
   it('requestPath 合法时保留；跨主机、fragment 与 CRLF 形态剥字段但保留预设', () => {
     const runtime = (requestPath: unknown) => ({
       codex: {
@@ -147,9 +227,15 @@ describe('parseCatalog presets 容错', () => {
 });
 
 describe('mergeWithBundled presets 兜底', () => {
-  it('远端带 presets → 用远端的', () => {
+  it('远端 presets 与 bundled 按 id 合并：远端同 id 优先，bundled 缺项不丢', () => {
     const merged = mergeWithBundled(minimalCatalog({ presets: [VALID_PRESET] }));
-    expect(merged.presets?.map((p) => p.id)).toEqual(['openrouter']);
+    expect(merged.presets?.find((preset) => preset.id === 'openrouter')).toEqual(VALID_PRESET);
+    expect(merged.presets?.map((preset) => preset.id)).toEqual(
+      BUNDLED_CATALOG.presets?.map((preset) => preset.id),
+    );
+    expect(merged.presets?.map((preset) => preset.id)).toEqual(
+      expect.arrayContaining(['zhipu-coding-plan-cn', 'zai-coding-plan-global']),
+    );
   });
 
   it('远端没带 presets → 回落 bundled 的', () => {
@@ -157,18 +243,103 @@ describe('mergeWithBundled presets 兜底', () => {
     expect(merged.presets).toEqual(BUNDLED_CATALOG.presets);
     expect(merged.presets?.length ?? 0).toBeGreaterThan(0);
   });
+
+  it('远端独有 preset 按远端原序追加在 bundled 之后', () => {
+    const remoteOnly = { ...VALID_PRESET, id: 'remote-only' };
+    const merged = mergeWithBundled(minimalCatalog({ presets: [remoteOnly] }));
+    expect(merged.presets?.at(-1)).toEqual(remoteOnly);
+  });
+
+  it('同 id 远端保留 runtime/model 时回填 bundled contextWindow，不复活被移除的 runtime/model', () => {
+    const remoteMiniMax = {
+      id: 'minimax-global',
+      name: 'Remote MiniMax',
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://remote.example/anthropic',
+          models: [{ id: 'MiniMax-M3', name: 'Remote M3' }],
+        },
+      },
+    };
+    const merged = mergeWithBundled(minimalCatalog({ presets: [remoteMiniMax] }));
+    const preset = merged.presets?.find((candidate) => candidate.id === 'minimax-global');
+    expect(preset).toEqual({
+      ...remoteMiniMax,
+      runtimes: {
+        'claude-code': {
+          ...remoteMiniMax.runtimes['claude-code'],
+          models: [{ id: 'MiniMax-M3', name: 'Remote M3', contextWindow: 1_000_000 }],
+        },
+      },
+    });
+    expect(preset?.runtimes.codex).toBeUndefined();
+  });
+
+  it('远端显式 contextWindow 优先于 bundled', () => {
+    const remoteMiniMax = {
+      id: 'minimax-global',
+      name: 'Remote MiniMax',
+      runtimes: {
+        'claude-code': {
+          baseUrl: 'https://remote.example/anthropic',
+          models: [{ id: 'MiniMax-M3', name: 'Remote M3', contextWindow: 512_000 }],
+        },
+      },
+    };
+    const merged = mergeWithBundled(minimalCatalog({ presets: [remoteMiniMax] }));
+    expect(
+      merged.presets
+        ?.find((candidate) => candidate.id === 'minimax-global')
+        ?.runtimes['claude-code']
+        ?.models[0]
+        ?.contextWindow,
+    ).toBe(512_000);
+  });
+
+  it('旧远端同 id preset 缺少 nameZhTW 时从 bundled 回填，显式远端值仍优先', () => {
+    const bundled = BUNDLED_CATALOG.presets?.find((preset) => preset.id === 'zhipu-glm-cn');
+    expect(bundled?.nameZhTW).toBe('智譜 GLM（中國大陸）');
+
+    const remoteBase = {
+      ...bundled!,
+      name: 'Remote GLM',
+      nameEn: 'Remote GLM',
+    };
+    const { nameZhTW: _missing, ...remoteWithoutZhTW } = remoteBase;
+    const backfilled = mergeWithBundled(minimalCatalog({ presets: [remoteWithoutZhTW] }));
+    expect(backfilled.presets?.find((preset) => preset.id === 'zhipu-glm-cn')).toMatchObject({
+      name: 'Remote GLM',
+      nameEn: 'Remote GLM',
+      nameZhTW: '智譜 GLM（中國大陸）',
+    });
+
+    const explicit = mergeWithBundled(
+      minimalCatalog({ presets: [{ ...remoteWithoutZhTW, nameZhTW: '遠端繁中名稱' }] }),
+    );
+    expect(explicit.presets?.find((preset) => preset.id === 'zhipu-glm-cn')?.nameZhTW).toBe(
+      '遠端繁中名稱',
+    );
+  });
 });
 
 describe('presetDisplayName', () => {
-  it('中文 locale 用 name;其它 locale 优先 nameEn,缺省回落 name', () => {
-    const p = { name: '智谱 GLM(中国大陆)', nameEn: 'Zhipu GLM (China)' };
+  it('简中用 name，繁中优先 nameZhTW，其它语言优先 nameEn', () => {
+    const p = {
+      name: '智谱 GLM(中国大陆)',
+      nameEn: 'Zhipu GLM (China)',
+      nameZhTW: '智譜 GLM(中國大陸)',
+    };
     expect(presetDisplayName(p, 'zh-CN')).toBe('智谱 GLM(中国大陆)');
+    expect(presetDisplayName(p, 'zh-TW')).toBe('智譜 GLM(中國大陸)');
+    expect(presetDisplayName(p, 'zh-Hant-TW')).toBe('智譜 GLM(中國大陸)');
+    expect(presetDisplayName(p, 'ZH_HANT_TW')).toBe('智譜 GLM(中國大陸)');
     expect(presetDisplayName(p, 'zh')).toBe('智谱 GLM(中国大陆)');
     expect(presetDisplayName(p, 'en')).toBe('Zhipu GLM (China)');
     expect(presetDisplayName(p, 'ja')).toBe('Zhipu GLM (China)');
     // 无 nameEn(全球厂商预设本就是英文名)→ 一律回落 name。
     expect(presetDisplayName({ name: 'DeepSeek' }, 'en')).toBe('DeepSeek');
     expect(presetDisplayName({ name: 'DeepSeek' }, 'zh-CN')).toBe('DeepSeek');
+    expect(presetDisplayName({ name: 'DeepSeek' }, 'zh-TW')).toBe('DeepSeek');
   });
 });
 
@@ -195,6 +366,16 @@ describe('regionHint 归一化与 locale 排序', () => {
     expect(out[2]!.regionHint).toBeUndefined();
   });
 
+  it('非法 nameZhTW(非字符串/空白串)剥字段，不影响预设本体', () => {
+    const out = sanitizePresets([
+      { ...VALID_PRESET, id: 'a', nameZhTW: 42 } as never,
+      { ...VALID_PRESET, id: 'b', nameZhTW: '   ' } as never,
+      { ...VALID_PRESET, id: 'c', nameZhTW: '繁中名稱' },
+    ]);
+    expect(out).toHaveLength(3);
+    expect(out.map((p) => p.nameZhTW)).toEqual([undefined, undefined, '繁中名稱']);
+  });
+
   it('厂商按首字母分组排序；同厂商 cn/global 相邻，组内按语言排先后', () => {
     const presets = sanitizePresets([
       mk('zhipu-glm-global', 'global'),
@@ -204,31 +385,31 @@ describe('regionHint 归一化与 locale 排序', () => {
       mk('minimax-cn', 'cn'),
       mk('minimax-global', 'global'),
     ]);
-    // zh：厂商序 deepseek < minimax < openrouter < zhipu-glm；组内 cn 在前。
-    expect(sortPresetsForLocale(presets, 'zh-CN').map((p) => p.id)).toEqual([
+    // cn 版本：厂商序 deepseek < minimax < openrouter < zhipu-glm；组内 cn 在前。
+    expect(sortPresetsForRegion(presets, 'cn').map((p) => p.id)).toEqual([
       'deepseek', 'minimax-cn', 'minimax-global', 'openrouter', 'zhipu-glm-cn', 'zhipu-glm-global',
     ]);
-    // en/ja：厂商序不变，组内 global 在前。
-    expect(sortPresetsForLocale(presets, 'en').map((p) => p.id)).toEqual([
+    // global 版本：厂商序不变，组内 global 在前。
+    expect(sortPresetsForRegion(presets, 'global').map((p) => p.id)).toEqual([
       'deepseek', 'minimax-global', 'minimax-cn', 'openrouter', 'zhipu-glm-global', 'zhipu-glm-cn',
     ]);
-    expect(sortPresetsForLocale(presets, 'ja').map((p) => p.id)).toEqual(
-      sortPresetsForLocale(presets, 'en').map((p) => p.id),
+    expect(sortPresetsForRegion(presets, 'dev').map((p) => p.id)).toEqual(
+      sortPresetsForRegion(presets, 'cn').map((p) => p.id),
     );
   });
 
-  it('智谱与 Z.AI Coding Plan 使用同一厂商分组并按 locale 排区域顺序', () => {
+  it('智谱与 Z.AI Coding Plan 使用同一厂商分组并按构建区域排顺序', () => {
     const presets = sanitizePresets([
       mk('zai-coding-plan-global', 'global'),
       mk('zhipu-coding-plan-cn', 'cn'),
       mk('volcengine-coding-plan'),
     ]);
-    expect(sortPresetsForLocale(presets, 'zh-CN').map((p) => p.id)).toEqual([
+    expect(sortPresetsForRegion(presets, 'cn').map((p) => p.id)).toEqual([
       'volcengine-coding-plan',
       'zhipu-coding-plan-cn',
       'zai-coding-plan-global',
     ]);
-    expect(sortPresetsForLocale(presets, 'en').map((p) => p.id)).toEqual([
+    expect(sortPresetsForRegion(presets, 'global').map((p) => p.id)).toEqual([
       'volcengine-coding-plan',
       'zai-coding-plan-global',
       'zhipu-coding-plan-cn',
@@ -375,6 +556,10 @@ describe('MiniMax OpenAI Responses 预设契约 (issue #345)', () => {
     const preset = BUNDLED_CATALOG.presets?.find((candidate) => candidate.id === id);
     expect(preset?.docsUrl).toBe(docsUrl);
     expect(preset?.runtimes['claude-code']?.baseUrl).toMatch(/\/anthropic$/);
+    expect(preset?.runtimes['claude-code']?.models).toEqual([
+      { id: 'MiniMax-M3', name: 'MiniMax M3', contextWindow: 1_000_000 },
+      { id: 'MiniMax-M2.5', name: 'MiniMax M2.5' },
+    ]);
     expect(preset?.runtimes.codex).toEqual({
       baseUrl: codexBaseUrl,
       models: [
@@ -425,6 +610,102 @@ describe('官方渠道预设契约', () => {
       wireProtocol: 'openai-chat',
     }));
   });
+
+  it('阿里云百炼 Coding Plan 与 Token Plan 使用专属端点，个人/团队版分开锁定模型窗口', () => {
+    const codingPlan = preset('aliyun-bailian-coding');
+    const personalTokenPlan = preset('aliyun-bailian-token-plan-cn');
+    const teamTokenPlan = preset('aliyun-bailian-token-plan-team-cn');
+    const codingPlanModels = [
+      { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus' },
+      { id: 'qwen3-coder-next', name: 'Qwen3 Coder Next' },
+      { id: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus' },
+    ];
+    const personalTokenPlanModels = [
+      { id: 'qwen3.8-max-preview', name: 'Qwen 3.8 Max Preview', contextWindow: 983_616 },
+      { id: 'qwen3.7-max', name: 'Qwen 3.7 Max', contextWindow: 992_000 },
+      { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus', contextWindow: 1_000_000 },
+      { id: 'qwen3.6-flash', name: 'Qwen 3.6 Flash', contextWindow: 1_000_000 },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000 },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576 },
+    ];
+    const teamTokenPlanModels = [
+      { id: 'qwen3.8-max-preview', name: 'Qwen 3.8 Max Preview', contextWindow: 983_616 },
+      { id: 'qwen3.7-max', name: 'Qwen 3.7 Max', contextWindow: 992_000 },
+      { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus', contextWindow: 1_000_000 },
+      { id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus', contextWindow: 1_000_000 },
+      { id: 'qwen3.6-flash', name: 'Qwen 3.6 Flash', contextWindow: 1_000_000 },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576 },
+      { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576 },
+      { id: 'deepseek-v3.2', name: 'DeepSeek V3.2', contextWindow: 131_072 },
+      { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: 262_144 },
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144 },
+      { id: 'kimi-k2.5', name: 'Kimi K2.5', contextWindow: 262_144 },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000 },
+      { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 202_752 },
+      { id: 'glm-5', name: 'GLM-5', contextWindow: 202_752 },
+      { id: 'MiniMax-M2.5', name: 'MiniMax M2.5', contextWindow: 196_608 },
+    ];
+    const tokenPlanModelsUrl =
+      'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models';
+
+    expect(codingPlan).toEqual(expect.objectContaining({
+      name: '阿里云百炼 Coding Plan（包月）',
+      nameEn: 'Alibaba Cloud Bailian Coding Plan',
+      docsUrl: 'https://help.aliyun.com/zh/model-studio/coding-plan',
+      regionHint: 'cn',
+    }));
+    expect(personalTokenPlan).toEqual(expect.objectContaining({
+      name: '阿里云百炼 Token Plan（个人版）',
+      nameEn: 'Alibaba Cloud Bailian Token Plan (Personal)',
+      docsUrl: 'https://help.aliyun.com/zh/model-studio/token-plan-personal-overview',
+      regionHint: 'cn',
+    }));
+    expect(teamTokenPlan).toEqual(expect.objectContaining({
+      name: '阿里云百炼 Token Plan（团队版）',
+      nameEn: 'Alibaba Cloud Bailian Token Plan (Team)',
+      docsUrl: 'https://help.aliyun.com/zh/model-studio/token-plan-team-overview',
+      regionHint: 'cn',
+    }));
+    expect(codingPlan?.runtimes['claude-code']).toEqual({
+      baseUrl: 'https://coding.dashscope.aliyuncs.com/apps/anthropic',
+      modelsUrl: 'https://coding.dashscope.aliyuncs.com/v1/models',
+      models: codingPlanModels,
+    });
+    expect(codingPlan?.runtimes.codex).toEqual({
+      baseUrl: 'https://coding.dashscope.aliyuncs.com/v1',
+      wireProtocol: 'openai-chat',
+      models: codingPlanModels,
+    });
+    for (const [tokenPlan, models] of [
+      [personalTokenPlan, personalTokenPlanModels],
+      [teamTokenPlan, teamTokenPlanModels],
+    ] as const) {
+      expect(tokenPlan?.runtimes['claude-code']).toEqual({
+        baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic',
+        modelsUrl: tokenPlanModelsUrl,
+        models,
+      });
+      expect(tokenPlan?.runtimes.codex).toEqual({
+        baseUrl: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+        wireProtocol: 'openai-chat',
+        modelsUrl: tokenPlanModelsUrl,
+        models,
+      });
+    }
+  });
+
+  it.each(['zhipu-coding-plan-cn', 'zai-coding-plan-global'])(
+    '%s 的 Claude Code GLM-5.2 1M 入口保留完整窗口元数据',
+    (id) => {
+      expect(
+        preset(id)?.runtimes['claude-code']?.models.find((model) => model.id === 'glm-5.2[1m]'),
+      ).toEqual({
+        id: 'glm-5.2[1m]',
+        name: 'GLM-5.2 (1M)',
+        contextWindow: 1_000_000,
+      });
+    },
+  );
 
   it('小米按量与 Token Plan 凭证不会混用端点', () => {
     expect(preset('xiaomi-mimo-api-cn')?.runtimes.codex?.baseUrl)

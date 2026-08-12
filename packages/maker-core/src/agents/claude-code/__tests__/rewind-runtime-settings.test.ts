@@ -237,6 +237,23 @@ afterEach(async () => {
 });
 
 describe('ClaudeCodeAgent runtime settings during rewind window', () => {
+  it('keeps the selected and catalog Claude wire models available for a live model switch', async () => {
+    const { handle, firstQuery } = await startRewindableSession();
+
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { settings?: { availableModels?: string[] } };
+    };
+    expect(startArgs.options.settings?.availableModels).toEqual([
+      'claude-opus-4-6[1m]',
+      'claude-sonnet-5',
+    ]);
+
+    await handle.setModel?.('claude-sonnet-5');
+    expect(firstQuery.setModel).toHaveBeenCalledWith('claude-sonnet-5');
+
+    await handle.close();
+  });
+
   it('passes max through when changing effort in a live Sonnet 5 session', async () => {
     const { handle, firstQuery } = await startRewindableSession();
 
@@ -353,7 +370,9 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as { options: Record<string, unknown> };
     // fixture 把 sonnet-5 配成 500K 窗口 → 窗口驱动的 wire 规则不带 [1m](<1M 不带)。
     expect(rebuildArgs.options.model).toBe('claude-sonnet-5');
-    expect(rebuildArgs.options.permissionMode).toBe('auto');
+    // Cindy 档 'auto'(Auto-review)映射到 SDK 'default' —— 不透传 'auto' 给 CC,改由
+    // canUseTool + Cindy 策略审查(见 toSdkPermissionMode)。
+    expect(rebuildArgs.options.permissionMode).toBe('default');
     expect(rebuildArgs.options.forkSession).toBe(true);
     expect(rebuildArgs.options.resumeSessionAt).toBe('assistant-uuid-1');
 
@@ -1734,7 +1753,8 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     expect(secondQuery.setModel).toHaveBeenCalledWith('claude-opus-4-6[1m]');
     expect(secondQuery.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'xhigh' });
     expect(secondQuery.applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
-    expect(secondQuery.setPermissionMode).toHaveBeenCalledWith('auto');
+    // Cindy 档 'auto' 映射到 SDK 'default'(见 toSdkPermissionMode)。
+    expect(secondQuery.setPermissionMode).toHaveBeenCalledWith('default');
 
     await handle.close();
   });

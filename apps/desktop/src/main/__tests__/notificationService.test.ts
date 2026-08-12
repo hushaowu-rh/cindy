@@ -104,7 +104,9 @@ vi.mock('../device-link', () => ({
 
 // mobile 正文素材:最近一条 assistant 内容(真实实现走 localDb)。默认空 = 无摘要,
 // 既有用例的调用断言不带 detail;内容用例单独 mockResolvedValueOnce。
-const latestMessageText = vi.fn(async (_sessionId: string, _role: string) => '');
+const latestMessageText = vi.fn<
+  (sessionId: string, role: string) => Promise<string>
+>(async () => '');
 vi.mock('../localDb/latestMessageText', () => ({
   latestMessageText: (sessionId: string, role: string) => latestMessageText(sessionId, role),
 }));
@@ -137,7 +139,11 @@ async function freshService() {
   getMobileNotifyGeneration.mockClear();
   latestMessageText.mockClear();
   drainPersistQueue.mockClear();
-  return import('../notificationService');
+  const service = await import('../notificationService');
+  const { setMainLocale } = await import('../i18n');
+  // 既有分发断言以简中为基准；需要验证其它语言的用例会在调用前显式切换。
+  setMainLocale('zh-CN');
+  return service;
 }
 
 async function invokeHandler(payload: unknown): Promise<void> {
@@ -395,7 +401,7 @@ describe('notificationService — channels 分发', () => {
     // 文案断言 — 锁住对外可见的飞书消息格式,后续如要改文案需主动调整测试。
     expect(feishuIm.sendMarkdownText).toHaveBeenCalledWith(
       'ou_owner',
-      'Cindy · 会话「Hello」需要你回复',
+      'Cindy · 任务「Hello」需要你回复',
     );
   });
 
@@ -415,7 +421,7 @@ describe('notificationService — channels 分发', () => {
     expect(feishuIm.sendMarkdownText).toHaveBeenCalledTimes(1);
     expect(feishuIm.sendMarkdownText).toHaveBeenCalledWith(
       'ou_owner',
-      'Cindy · 会话「Hello」已完成 ✓',
+      'Cindy · 任务「Hello」已完成 ✓',
     );
   });
 
@@ -439,7 +445,42 @@ describe('notificationService — channels 分发', () => {
     );
     expect(feishuIm.sendMarkdownText).toHaveBeenCalledWith(
       'ou_owner',
-      'Cindy · 会话「Broken model」执行失败',
+      'Cindy · 任务「Broken model」执行失败',
+    );
+  });
+
+  it('zh-TW → 桌面与飞书使用繁中，空标题兜底也跟随当前语言', async () => {
+    const { initNotificationService, showDesktopSessionEvent } = await freshService();
+    const { setMainLocale } = await import('../i18n');
+    const feishuIm = makeFeishuIm('ou_owner');
+    initNotificationService(baseDeps(feishuIm));
+    setMainLocale('zh-TW');
+
+    await invokeHandler({
+      sessionId: 's1',
+      title: '整理報告',
+      kind: 'needs-reply',
+      channels: { desktop: true, feishu: true },
+    });
+
+    expect(notificationCtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Cindy · 整理報告',
+        body: '需要你回覆',
+      }),
+    );
+    expect(feishuIm.sendMarkdownText).toHaveBeenCalledWith(
+      'ou_owner',
+      'Cindy · 任務「整理報告」需要你回覆',
+    );
+
+    notificationCtor.mockClear();
+    showDesktopSessionEvent(() => null, { sessionId: '', title: '', kind: 'error' });
+    expect(notificationCtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Cindy · 未命名任務',
+        body: '執行失敗',
+      }),
     );
   });
 

@@ -29,6 +29,8 @@
  */
 
 import type { Settings } from '@anthropic-ai/claude-agent-sdk';
+import type { CapabilityRoutingPolicy } from '../../types/capability-routing.js';
+import { buildClaudeSkillOverrides } from './capability-routing.js';
 
 export interface ClaudeFlagSettingsInput {
   /** reasoning summary 展示开关(displayReasoning === 'summarized')。 */
@@ -43,10 +45,18 @@ export interface ClaudeFlagSettingsInput {
    * 缺省时整字段不出现 → 与未升级行为逐字节一致,零缓存影响。
    */
   fastMode: boolean;
+  /** Host-owned policy for colliding downstream skills. */
+  capabilityRouting?: CapabilityRoutingPolicy;
+  /**
+   * Final Claude SDK wire model strings that Cindy allows for this session.
+   * This highest-priority list replaces any stale user availableModels list.
+   */
+  availableModels?: readonly string[];
 }
 
 /** 装配 startSession 注入的 flag settings 对象。纯函数 —— 每次调用读最新输入值。 */
 export function buildClaudeFlagSettings(input: ClaudeFlagSettingsInput): Settings {
+  const skillOverrides = buildClaudeSkillOverrides(input.capabilityRouting);
   return {
     showThinkingSummaries: input.showThinkingSummaries,
     // 屏蔽用户级 apiKeyHelper,防止它劫持 oauth-spawn 的订阅鉴权(见文件头注释)。
@@ -56,5 +66,9 @@ export function buildClaudeFlagSettings(input: ClaudeFlagSettingsInput): Setting
       autoDreamEnabled: input.memoryOverride,
     }),
     ...(input.fastMode && { fastMode: true }),
+    ...(input.availableModels && input.availableModels.length > 0 && {
+      availableModels: [...new Set(input.availableModels)],
+    }),
+    ...(Object.keys(skillOverrides).length > 0 && { skillOverrides }),
   };
 }

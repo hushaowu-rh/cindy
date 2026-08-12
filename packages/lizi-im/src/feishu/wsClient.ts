@@ -16,11 +16,19 @@
  *
  * Inbound flow:
  *   im.message.receive_v1
- *     → drop if chat_type ≠ 'p2p'
- *     → if no owner yet: TOFU-claim sender as owner + send welcome
- *     → drop if sender open_id ≠ owner
- *     → parse content + download attachments
- *     → emit IMMessageEvent
+ *     p2p:
+ *       → if no owner yet: TOFU-claim sender as owner + send welcome
+ *       → drop if sender open_id ≠ owner
+ *       → parse content + download attachments
+ *       → emit IMMessageEvent
+ *     group:
+ *       → drop if not @-mentioning this bot (bot open_id fetched via
+ *         /open-apis/bot/v3/info after connect; unknown → drop all group msgs)
+ *       → drop if no owner bound yet (群里绝不 TOFU 认主 — 钉钉同款)
+ *       → non-owner @bot → polite notice (per-user cooldown), no turn
+ *       → owner @bot → strip mention placeholders, senderId = lane id
+ *         `g/{chatId}[/{threadId}]`, speaker = owner, record reply anchor,
+ *         emit IMMessageEvent
  *
  *   card.action.trigger(_v1)
  *     → drop if sender not in whitelist
@@ -38,12 +46,10 @@ import * as storage from './storage.js';
 import { parseIncoming } from './incomingContent.js';
 import { downloadAttachments } from './attachmentDownloader.js';
 import { parseCardAction } from './cardActionParser.js';
+import { encodeLaneUserId } from './codec.js';
 import { getLog } from './moduleScope.js';
 import { messages as transportMessages } from './messages.js';
-import type {
-  BotCredentials,
-  FeishuConnectionStatus,
-} from './internal-types.js';
+import type { BotCredentials, FeishuConnectionStatus } from './internal-types.js';
 
 // ── module state ──────────────────────────────────────────────────────────────
 
@@ -58,8 +64,24 @@ let conflictTransitionGeneration: number | null = null;
 let lifecycleAnnouncementEnabled = true;
 let pendingOfflineNotice = false;
 
+/**
+ * 本 bot 在自己 app 视角下的 open_id — 群消息判 @ 用(mentions[].id.open_id
+ * 对比)。连接成功后从 /open-apis/bot/v3/info 拉取; null = 未知, 此时群消息
+ * 一律丢弃(惰性失效, 不影响私聊)。换凭证/断开时清空。
+ */
+let botOpenId: string | null = null;
+
+/** 非 owner 群 @ 的礼貌回应 per-user 冷却(open_id → 上次回应 ts)。 */
+const STRANGER_NOTICE_COOLDOWN_MS = 60_000;
+const strangerNoticeAt = new Map<string, number>();
+
 const DEFAULT_OFFLINE_ANNOUNCE_TIMEOUT_MS = 1500;
 export const QUIT_OFFLINE_ANNOUNCE_TIMEOUT_MS = 4500;
+
+// The SDK disables its ping watchdog when this value is omitted. Keep the
+// timeout finite so a locally OPEN but silent connection is forced through the
+// existing reconnect flow instead of dropping inbound messages indefinitely.
+const FEISHU_WS_PING_TIMEOUT_SECONDS = 30;
 
 function emitRendererStatus(error?: string): void {
   feishuEvents.emit('status', {
@@ -98,6 +120,37 @@ export function setLifecycleAnnouncement(enabled: boolean): void {
   getLog().info(`[feishu/wsClient] lifecycleAnnouncement set to ${enabled}`);
 }
 
+/**
+ * 拉取 bot 自身 open_id(判群 @ 用)。SDK 无专用封装, 走 Client.request 通用
+ * 通道。失败只 log warn — 群功能惰性失效(群消息全丢), 私聊不受影响。
+ */
+async function fetchBotOpenId(): Promise<void> {
+  const log = getLog();
+  const c = outbound.getBoundClient();
+  if (!c) return;
+  try {
+    const res = await c.request<{ bot?: { open_id?: string } }>({
+      method: 'GET',
+      url: '/open-apis/bot/v3/info',
+    });
+    const openId = res?.bot?.open_id;
+    if (typeof openId === 'string' && openId) {
+      botOpenId = openId;
+      log.info(`[feishu/wsClient] bot open_id resolved ...${openId.slice(-8)}`);
+    } else {
+      log.warn('[feishu/wsClient] bot/v3/info returned no open_id — group messages disabled');
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn(`[feishu/wsClient] fetchBotOpenId failed (group messages disabled): ${msg}`);
+  }
+}
+
+/** 测试注入口 — 生产代码不要调用。 */
+export function setBotOpenIdForTest(openId: string | null): void {
+  botOpenId = openId;
+}
+
 const FEISHU_CONFLICT_ERROR = '该 App 已被另一台设备占用 (exceed_conn_limit)';
 
 function isConflictSignal(message: string): boolean {
@@ -106,21 +159,11 @@ function isConflictSignal(message: string): boolean {
 }
 
 function isActiveConnection(generation: number, appId: string): boolean {
-  return (
-    acceptingInbound &&
-    lifecycleGeneration === generation &&
-    currentBotAppId === appId
-  );
+  return acceptingInbound && lifecycleGeneration === generation && currentBotAppId === appId;
 }
 
-async function transitionToConflict(
-  generation: number,
-  appId: string,
-): Promise<void> {
-  if (
-    conflictTransitionGeneration === generation ||
-    !isActiveConnection(generation, appId)
-  ) {
+async function transitionToConflict(generation: number, appId: string): Promise<void> {
+  if (conflictTransitionGeneration === generation || !isActiveConnection(generation, appId)) {
     return;
   }
 
@@ -141,10 +184,7 @@ function handleReadySignal(
 ): void {
   if (!isActiveConnection(generation, appId)) return;
   activeDetector.markReady();
-  if (
-    activeDetector.getVerdict()?.kind === 'connected' &&
-    currentStatus !== 'connected'
-  ) {
+  if (activeDetector.getVerdict()?.kind === 'connected' && currentStatus !== 'connected') {
     setStatus('connected');
   }
 }
@@ -156,10 +196,7 @@ function handleReconnectingSignal(
 ): void {
   if (!isActiveConnection(generation, appId)) return;
   activeDetector.markReconnecting();
-  if (
-    activeDetector.getVerdict()?.kind !== 'conflict' &&
-    currentStatus === 'connected'
-  ) {
+  if (activeDetector.getVerdict()?.kind !== 'conflict' && currentStatus === 'connected') {
     setStatus('reconnecting');
   }
 }
@@ -171,10 +208,7 @@ function handleReconnectedSignal(
 ): void {
   if (!isActiveConnection(generation, appId)) return;
   activeDetector.markReconnected();
-  if (
-    activeDetector.getVerdict()?.kind === 'connected' &&
-    currentStatus !== 'connected'
-  ) {
+  if (activeDetector.getVerdict()?.kind === 'connected' && currentStatus !== 'connected') {
     setStatus('connected');
   }
 }
@@ -187,10 +221,7 @@ function handleErrorSignal(
 ): void {
   if (!isActiveConnection(generation, appId)) return;
   if (isConflictSignal(error.message)) {
-    if (
-      !activeDetector.markConflict() &&
-      activeDetector.getVerdict()?.kind !== 'conflict'
-    ) {
+    if (!activeDetector.markConflict() && activeDetector.getVerdict()?.kind !== 'conflict') {
       void transitionToConflict(generation, appId);
     }
     return;
@@ -218,9 +249,7 @@ function makeCapturingLogger(
     trace: () => {},
     debug: () => {},
     info: (...args: unknown[]) => {
-      const msg = args
-        .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
-        .join(' ');
+      const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
       log.debug('[feishu/sdk-info]', msg);
       if (!isActiveConnection(generation, appId)) return;
       if (msg.includes('ws client ready')) {
@@ -231,28 +260,19 @@ function makeCapturingLogger(
         handleReconnectingSignal(activeDetector, generation, appId);
       } else if (msg.includes('unable to connect to the server')) {
         activeDetector.markError(new Error('unable to connect after retries'));
-        setStatus('error', '连接失败：飞书服务无法访问，请检查网络');
+        setStatus('error', '连接失败：IM 服务无法访问，请检查网络');
       }
     },
     warn: (...args: unknown[]) => {
-      const msg = args
-        .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
-        .join(' ');
+      const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
       log.warn('[feishu/sdk-warn]', msg);
     },
     error: (...args: unknown[]) => {
-      const msg = args
-        .map((a) => (typeof a === 'string' ? a : JSON.stringify(a)))
-        .join(' ');
+      const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
       log.error('[feishu/sdk-error]', msg);
       if (!isActiveConnection(generation, appId)) return;
       if (isConflictSignal(msg)) {
-        handleErrorSignal(
-          new Error(FEISHU_CONFLICT_ERROR),
-          activeDetector,
-          generation,
-          appId,
-        );
+        handleErrorSignal(new Error(FEISHU_CONFLICT_ERROR), activeDetector, generation, appId);
         return;
       }
       if (msg.includes('code: 514')) {
@@ -285,14 +305,21 @@ export async function start(
   currentBotAppId = creds.appId;
   setStatus('testing');
 
-  const startDetector = new ConflictDetector({ readyTimeoutMs: 8000, reconnectThreshold: 2 });
+  const startDetector = new ConflictDetector({
+    readyTimeoutMs: 8000,
+    reconnectThreshold: 2,
+  });
   detector = startDetector;
 
   client = new Lark.WSClient({
     appId: creds.appId,
     appSecret: creds.appSecret,
+    domain: creds.service === 'lark' ? Lark.Domain.Lark : Lark.Domain.Feishu,
     loggerLevel: Lark.LoggerLevel.info,
     autoReconnect: true,
+    wsConfig: {
+      pingTimeout: FEISHU_WS_PING_TIMEOUT_SECONDS,
+    },
     logger: makeCapturingLogger(startDetector, startedGeneration, creds.appId),
     onReady: () => {
       handleReadySignal(startDetector, startedGeneration, creds.appId);
@@ -346,6 +373,7 @@ export async function start(
   switch (verdict.kind) {
     case 'connected':
       if (currentStatus !== 'connected') setStatus('connected');
+      void fetchBotOpenId();
       if (opts.announceLifecycle !== false) {
         void announceLifecycle('online');
       } else {
@@ -433,6 +461,8 @@ export async function stop(opts: StopOptions = {}): Promise<void> {
     detector.abandon();
     detector = null;
   }
+  botOpenId = null;
+  strangerNoticeAt.clear();
   outbound.unbindClient();
   if (opts.clearOwnerBeforeIdle) {
     pendingOfflineNotice = false;
@@ -463,9 +493,7 @@ async function announceLifecycle(phase: 'online' | 'offline'): Promise<void> {
   }
 
   const text =
-    phase === 'online'
-      ? transportMessages.lifecycle.online
-      : transportMessages.lifecycle.offline;
+    phase === 'online' ? transportMessages.lifecycle.online : transportMessages.lifecycle.offline;
   try {
     log.info(`[feishu/wsClient] announceLifecycle ${phase}: sending to ...${owner.slice(-8)}`);
     const res = await outbound.sendText(owner, text);
@@ -490,16 +518,57 @@ interface RawMessageEvent {
   message?: {
     message_id?: string;
     chat_id?: string;
+    thread_id?: string;
     chat_type?: string;
     message_type?: string;
     content?: string;
+    mentions?: Array<{
+      key: string;
+      id?: { open_id?: string };
+      name?: string;
+    }>;
   };
 }
 
-async function handleIncomingMessage(
-  botAppId: string,
-  data: RawMessageEvent,
-): Promise<void> {
+/** 平台显示名消毒: 控制字符/格式字符(含零宽)剥除 + 截断(不可信输入)。 */
+function sanitizeMentionName(value: string): string {
+  return value
+    .replace(/[\p{Cc}\p{Cf}]/gu, ' ')
+    .trim()
+    .slice(0, 64);
+}
+
+/**
+ * 群消息文本清洗: 剥掉 @bot 的占位符(`@_user_1` 形态, key 来自 mentions),
+ * 其他人的占位符替换为 `@名字`(名字是平台可改字段 — 不可信输入, 控制字符
+ * 剥除 + 截断后使用)。text/post 抽出的正文里的占位符同一口径处理。
+ */
+function resolveMentionPlaceholders(
+  text: string,
+  mentions: NonNullable<NonNullable<RawMessageEvent['message']>['mentions']>,
+  selfOpenId: string,
+): string {
+  let out = text;
+  for (const mention of mentions) {
+    if (!mention.key) continue;
+    const isSelf = mention.id?.open_id === selfOpenId;
+    const safeName = sanitizeMentionName(mention.name ?? "");
+    const replacement = isSelf ? '' : `@${safeName || 'user'}`;
+    out = out.split(mention.key).join(replacement);
+  }
+  return out.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+/** 群消息是否 @ 到本 bot。botOpenId 未知恒 false(群功能惰性失效)。 */
+function mentionsSelf(
+  mentions: NonNullable<RawMessageEvent['message']>['mentions'],
+  selfOpenId: string | null,
+): boolean {
+  if (!selfOpenId || !mentions) return false;
+  return mentions.some((m) => m.id?.open_id === selfOpenId);
+}
+
+async function handleIncomingMessage(botAppId: string, data: RawMessageEvent): Promise<void> {
   const log = getLog();
   if (!acceptingInbound) {
     log.info('[feishu/wsClient] drop inbound message while connection is stopping');
@@ -512,13 +581,12 @@ async function handleIncomingMessage(
     return;
   }
 
-  // p2p only
-  if (data.message.chat_type !== 'p2p') {
-    log.info(
-      `[feishu/wsClient] drop non-p2p chat_type=${data.message.chat_type}`,
-    );
+  const chatType = data.message.chat_type;
+  if (chatType !== 'p2p' && chatType !== 'group') {
+    log.info(`[feishu/wsClient] drop unsupported chat_type=${chatType}`);
     return;
   }
+  const isGroup = chatType === 'group';
 
   const senderOpenId = data.sender.sender_id?.open_id;
   const messageId = data.message.message_id;
@@ -527,32 +595,56 @@ async function handleIncomingMessage(
   const rawContent = data.message.content ?? '';
   if (!senderOpenId || !messageId || !chatId) return;
 
-  // TOFU: first p2p sender becomes owner. Send welcome and continue
-  // processing this very message (so the user's first ask isn't lost).
-  if (ownerGuard.tryClaimOwner(senderOpenId)) {
-    log.info(`[feishu/wsClient] TOFU: claimed owner ...${senderOpenId.slice(-8)}`);
-    emitRendererStatus();
-    try {
-      await outbound.sendText(senderOpenId, transportMessages.ownerBinding.welcome);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`[feishu/wsClient] TOFU welcome send failed (non-fatal): ${msg}`);
+  if (isGroup) {
+    // 没 @ 到本 bot 的群消息一律丢(bot open_id 未知时也丢 — 惰性失效)。
+    if (!mentionsSelf(data.message.mentions, botOpenId)) return;
+    // 群里绝不 TOFU 认主(钉钉同款): 没有 owner 时群消息全丢。
+    if (!ownerGuard.firstAllowed()) {
+      log.info('[feishu/wsClient] drop group mention: no owner bound yet');
+      return;
     }
-  }
+    // 非 owner @bot → 礼貌回应(per-user 冷却), 不起 turn。
+    if (!ownerGuard.check(senderOpenId)) {
+      const last = strangerNoticeAt.get(senderOpenId) ?? 0;
+      if (Date.now() - last >= STRANGER_NOTICE_COOLDOWN_MS) {
+        strangerNoticeAt.set(senderOpenId, Date.now());
+        try {
+          await outbound.replyText(messageId, transportMessages.group.strangerNotice);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log.warn(`[feishu/wsClient] stranger notice failed (non-fatal): ${msg}`);
+        }
+      }
+      return;
+    }
+  } else {
+    // TOFU: first p2p sender becomes owner. Send welcome and continue
+    // processing this very message (so the user's first ask isn't lost).
+    if (ownerGuard.tryClaimOwner(senderOpenId)) {
+      log.info(`[feishu/wsClient] TOFU: claimed owner ...${senderOpenId.slice(-8)}`);
+      emitRendererStatus();
+      try {
+        await outbound.sendText(senderOpenId, transportMessages.ownerBinding.welcome);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[feishu/wsClient] TOFU welcome send failed (non-fatal): ${msg}`);
+      }
+    }
 
-  // whitelist gate
-  if (!ownerGuard.check(senderOpenId)) {
-    log.warn(`[feishu/wsClient] drop non-whitelisted sender ...${senderOpenId.slice(-8)}`);
-    return;
-  }
+    // whitelist gate
+    if (!ownerGuard.check(senderOpenId)) {
+      log.warn(`[feishu/wsClient] drop non-whitelisted sender ...${senderOpenId.slice(-8)}`);
+      return;
+    }
 
-  if (pendingOfflineNotice) {
-    pendingOfflineNotice = false;
-    try {
-      await outbound.sendText(senderOpenId, transportMessages.lifecycle.offlineNotice);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`[feishu/wsClient] offlineNotice send failed (non-fatal): ${msg}`);
+    if (pendingOfflineNotice) {
+      pendingOfflineNotice = false;
+      try {
+        await outbound.sendText(senderOpenId, transportMessages.lifecycle.offlineNotice);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`[feishu/wsClient] offlineNotice send failed (non-fatal): ${msg}`);
+      }
     }
   }
 
@@ -576,20 +668,42 @@ async function handleIncomingMessage(
     }
   }
 
+  // 群消息: 剥 @bot 占位符、其他 @ 转显示名。
+  const text =
+    isGroup && data.message.mentions && botOpenId
+      ? resolveMentionPlaceholders(parsed.text, data.message.mentions, botOpenId)
+      : parsed.text;
+
   // Drop entirely only when there's literally nothing to relay.
-  if (!parsed.text && attachments.length === 0 && unsupported.length === 0) {
+  if (!text && attachments.length === 0 && unsupported.length === 0) {
     return;
+  }
+
+  // 群 lane: senderId = g/{chatId}[/{threadId}], 出站按 lane 解码回群;
+  // 记录回挂锚点让本轮回复(引用式)挂回触发消息(话题内回复顺带落回话题)。
+  const laneUserId = isGroup
+    ? encodeLaneUserId(chatId, data.message.thread_id)
+    : null;
+  if (laneUserId) {
+    outbound.pushReplyAnchor(laneUserId, messageId);
   }
 
   // Emit raw fields — orchestrator decides how to render unsupported (it owns
   // the user-facing wording and the "skip agent for pure-unsupported" rule).
   feishuEvents.emit('message', {
     channelName: 'feishu',
-    senderId: senderOpenId,
+    senderId: laneUserId ?? senderOpenId,
     chatId,
     contextId: botAppId,
     messageId,
-    text: parsed.text,
+    text,
+    ...(laneUserId
+      ? {
+          // 群轮次必带 speaker — 共享层以它识别群轮(强确认策略/命令主人门)。
+          // 触发人恒为 owner(上面的门已保证), name 留空(飞书事件不带显示名)。
+          speaker: { id: senderOpenId, name: '', isOwner: true },
+        }
+      : {}),
     attachments,
     unsupported,
     raw: data,
@@ -635,7 +749,5 @@ async function handleCardAction(data: unknown): Promise<unknown> {
   // gives the user instant "click registered" feedback even before the
   // orchestrator finishes patching the card. Generic wording — orchestrator's
   // updateInteractiveCard authoritatively replaces the card body.
-  return parsedOk
-    ? { toast: { type: 'success', content: '已收到您的选择' } }
-    : {};
+  return parsedOk ? { toast: { type: 'success', content: '已收到您的选择' } } : {};
 }

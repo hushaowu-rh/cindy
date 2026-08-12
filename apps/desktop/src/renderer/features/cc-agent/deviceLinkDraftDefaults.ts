@@ -21,6 +21,8 @@ import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 /** 被控端当前草稿的原始值(maker:get-new-maker-defaults 隧道返回;字段全可选)。 */
 export interface RemoteDraftDefaults {
   model?: string;
+  /** false = 被控端明确未在 New Maker picker 选过模型；undefined = 旧端未知。 */
+  modelChosenByUser?: boolean;
   effort?: string;
   fastMode?: boolean;
   permissionMode?: string;
@@ -40,6 +42,12 @@ export interface RemoteDraftDefaults {
     string,
     { effortByModel: Record<string, string>; fastByModel: Record<string, boolean> }
   >;
+  /**
+   * 被控端「新建会话默认启用 worktree」勾选记忆(vendor 无关根字段)。控制端远程草稿
+   * 据此播种 worktree chip 初始态;旧版被控端不回 → undefined → 按未勾选兜底。
+   * 不参与 resolveDeviceLinkDraftDefaults 的 per-vendor 解析(消费方直接读)。
+   */
+  worktreeEnabled?: boolean;
 }
 
 /** 校准后可直接 seed 控制端草稿 holder 的一组值。 */
@@ -51,6 +59,24 @@ export interface DeviceLinkDraftSelection {
   permissionMode?: PermissionMode;
   /** 来源透传,合法性交 ChatInput 校准;null = 跟随被控端默认路由。 */
   providerId: string | null;
+}
+
+/**
+ * 判断同一远程草稿是否应在 capabilities 刷新后重新校准。
+ * 新设备或 Agent 始终需要 seed；同一目标只有在被控端明确从未选过模型、且控制端也尚未
+ * 编辑运行配置时才允许重校准。旧端的未知状态与任一侧的显式选择都必须保守保留。
+ */
+export function shouldReseedDeviceLinkDraftDefaults(input: {
+  currentSeedKey: string | null;
+  nextSeedKey: string;
+  capabilitiesChanged: boolean;
+  controllerTouched: boolean;
+  remoteModelChosenByUser: boolean | undefined;
+}): boolean {
+  if (input.currentSeedKey !== input.nextSeedKey) return true;
+  return (
+    input.capabilitiesChanged && !input.controllerTouched && input.remoteModelChosenByUser === false
+  );
 }
 
 /**
@@ -76,8 +102,28 @@ export function resolveDeviceLinkDraftDefaults(
   const providerId = remoteDraft?.providerId ?? null;
   const permissionMode = pickPermissionMode(capabilities, remoteDraft?.permissionMode);
 
-  // 要解析哪个模型:显式 targetModel(切模型)优先;否则被控端当前选中模型(初始 seed)。
-  const wantedModelId = targetModel ?? remoteDraft?.model;
+  // 要解析哪个模型:控制端本次显式 targetModel(切模型)永远优先。初始 seed 只有在**新端明确
+  // 回传未选过模型**时才采用区域目录默认；旧端缺字段时保守保留 remoteDraft.model，避免
+  // 把无法识别的历史显式选择覆盖掉。每个 Agent 只接受自己的 v3 默认标记。
+  const markedDefault = agentKind
+    ? models
+        .map((model, index) => ({ model, index }))
+        .filter(
+          ({ model }) =>
+            model.defaultEnabled !== false &&
+            (model.newSessionDefault?.includes(agentKind) ?? false),
+        )
+        .sort(
+          (a, b) =>
+            (a.model.sortOrder ?? Number.MAX_SAFE_INTEGER) -
+              (b.model.sortOrder ?? Number.MAX_SAFE_INTEGER) || a.index - b.index,
+        )[0]?.model.id
+    : undefined;
+  const wantedModelId =
+    targetModel ??
+    (remoteDraft?.modelChosenByUser === false && providerId === null
+      ? (markedDefault ?? remoteDraft.model)
+      : remoteDraft?.model);
 
   if (models.length === 0) {
     return {

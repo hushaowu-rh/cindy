@@ -27,6 +27,7 @@ import {
   type QuerySetPermissionModeParams,
   type QueryStartParams,
   type QueryStartResult,
+  type QueryToolGuard,
   type SessionAttachParams,
   type SessionAttachResult,
   type SessionClosedNotification,
@@ -39,6 +40,7 @@ import {
   type AttachedNotify,
 } from './session-registry.js';
 import { encodeMessage } from './codec.js';
+import { prepareRemoteClaudeEnv } from './remote-claude-env.js';
 
 
 /**
@@ -125,12 +127,13 @@ export function wireSdkHandlers(server: ManagerServer, registry: SessionRegistry
         }
       }
     }
+    const toolGuards = validateToolGuards(p.toolGuards);
     try {
       const session = registry.create({
         sessionId: p.sessionId!,
         cwd: p.cwd!,
         model: p.model!,
-        env: p.env as Record<string, string>,
+        env: prepareRemoteClaudeEnv(p.env as Record<string, string>),
         ...(p.mcpServers ? { mcpServers: p.mcpServers } : {}),
         ...(p.permissionMode ? { permissionMode: p.permissionMode } : {}),
         ...(p.systemPrompt !== undefined ? { systemPrompt: p.systemPrompt } : {}),
@@ -138,6 +141,7 @@ export function wireSdkHandlers(server: ManagerServer, registry: SessionRegistry
         ...(p.allowedTools ? { allowedTools: p.allowedTools } : {}),
         ...(p.disallowedTools ? { disallowedTools: p.disallowedTools } : {}),
         ...(p.tools !== undefined ? { tools: p.tools } : {}),
+        ...(toolGuards ? { toolGuards } : {}),
         ...(p.resumeSdkSessionId ? { resumeSdkSessionId: p.resumeSdkSessionId } : {}),
         ...(p.extraOptions ? { extraOptions: p.extraOptions } : {}),
       });
@@ -346,6 +350,75 @@ function requireString(v: unknown, field: string): asserts v is string {
   if (typeof v !== 'string' || v.length === 0) {
     throwInvalid(`${field} must be a non-empty string`);
   }
+}
+
+function validateToolGuards(value: unknown): QueryToolGuard[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throwInvalid('toolGuards must be an array');
+  return value.map((raw, index) => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throwInvalid(`toolGuards[${index}] must be an object`);
+    }
+    const guard = raw as Record<string, unknown>;
+    requireString(guard.toolNamePrefix, `toolGuards[${index}].toolNamePrefix`);
+    if (guard.toolNamePrefix.trim().length === 0) {
+      throwInvalid(`toolGuards[${index}].toolNamePrefix must not be whitespace-only`);
+    }
+    if (guard.sourceServerId !== undefined) {
+      requireString(guard.sourceServerId, `toolGuards[${index}].sourceServerId`);
+      if (guard.sourceServerId.trim().length === 0) {
+        throwInvalid(`toolGuards[${index}].sourceServerId must not be whitespace-only`);
+      }
+    }
+    if (
+      guard.invocation !== 'auto' &&
+      guard.invocation !== 'explicit-only' &&
+      guard.invocation !== 'disabled' &&
+      guard.invocation !== 'root-only'
+    ) {
+      throwInvalid(
+        `toolGuards[${index}].invocation must be auto, explicit-only, disabled, or root-only`,
+      );
+    }
+    if (
+      guard.explicitSelectors !== undefined &&
+      (!Array.isArray(guard.explicitSelectors) ||
+        guard.explicitSelectors.some(
+          (selector) =>
+            typeof selector !== 'string' ||
+            (!selector.trim().startsWith('$') && !selector.trim().startsWith('/')),
+        ))
+    ) {
+      throwInvalid(
+        `toolGuards[${index}].explicitSelectors must contain only $ or / command tokens`,
+      );
+    }
+    if (
+      guard.denialMessage !== undefined &&
+      typeof guard.denialMessage !== 'string'
+    ) {
+      throwInvalid(`toolGuards[${index}].denialMessage must be a string`);
+    }
+    const toolNamePrefix = guard.toolNamePrefix.trim();
+    const sourceServerId = guard.sourceServerId?.trim();
+    const validToolName = guard.invocation === 'root-only'
+      ? /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(toolNamePrefix)
+      : /^mcp__[A-Za-z0-9_-]+__$/.test(toolNamePrefix);
+    if (!validToolName) {
+      throwInvalid(
+        `toolGuards[${index}].toolNamePrefix must be a normalized Claude MCP tool ${guard.invocation === 'root-only' ? 'name' : 'prefix'}`,
+      );
+    }
+    return {
+      toolNamePrefix,
+      ...(sourceServerId ? { sourceServerId } : {}),
+      invocation: guard.invocation,
+      ...(guard.explicitSelectors
+        ? { explicitSelectors: [...guard.explicitSelectors] as string[] }
+        : {}),
+      ...(guard.denialMessage ? { denialMessage: guard.denialMessage } : {}),
+    };
+  });
 }
 
 interface ThrowableInvalid extends Error {

@@ -84,6 +84,103 @@ export function shouldUnpinOnUpIntent({ scrollHeight, clientHeight }: UpIntentUn
   return scrollHeight - clientHeight > UNPIN_MIN_SCROLLABLE_PX;
 }
 
+export interface SelectTailUserMessageArgs<T extends { type: string }> {
+  /** 当前有界窗口是否覆盖完整 render-item 尾部。 */
+  windowCoversEnd: boolean;
+  /** 当前 DOM 窗口最后一个 render item。 */
+  visibleLastItem: T | undefined;
+  /** 内存中完整 render-item 序列最后一个 item。 */
+  realLastItem: T | undefined;
+  /** 从 render item 提取 user message id；非 user item 返回 null。 */
+  userMessageId: (item: T | undefined) => string | null;
+}
+
+/**
+ * 选择供「新用户发送」检测的尾消息。
+ *
+ * bounded window 未覆盖会话末尾时，visible 尾只代表历史切片边界，可能刚好是
+ * 一条旧 user message；拿它建基线会误判跳回底部或遮蔽真正的新发送。因此该态
+ * 必须无条件读取内存全量的真实尾部。窗口覆盖末尾时 visible 尾与真实尾同义，
+ * 保留 visible 路径避免纯扩窗造成额外观察变化。
+ */
+export function selectTailUserMessageId<T extends { type: string }>({
+  windowCoversEnd,
+  visibleLastItem,
+  realLastItem,
+  userMessageId,
+}: SelectTailUserMessageArgs<T>): string | null {
+  return userMessageId(windowCoversEnd ? visibleLastItem : realLastItem);
+}
+
+export interface ResolveRenderPinArgs {
+  /** A saved non-bottom viewport is currently being restored. */
+  restoring: boolean;
+  /** The current render introduced a new user message at the tail. */
+  newUserSend: boolean;
+  /** Auto-follow was active before this render. */
+  nearBottom: boolean;
+}
+
+export interface ResolveRenderPinDecision {
+  /** Explicit sends hand ownership back to the latest-message anchor. */
+  clearRestoring: boolean;
+  /** Pin the scroll container to its content end in this layout pass. */
+  pinToBottom: boolean;
+}
+
+export interface ResolveLastUserMessageObservationArgs {
+  /** A saved non-bottom viewport is currently being restored. */
+  restoring: boolean;
+  /** The current render's tail user message, if any. */
+  tailUserMessageId: string | null;
+  /** The last tail user message already observed by the mounted stream. */
+  previousTailUserMessageId: string | null;
+}
+
+export interface ResolveLastUserMessageObservation {
+  /** Baseline to store after observing the current render. */
+  baselineUserMessageId: string | null;
+  /** Whether the current tail user message is a newly sent message. */
+  isNewUserSend: boolean;
+}
+
+/**
+ * Distinguish restored history hydration from a user send at the tail.
+ *
+ * A restored stream can mount before its first history batch arrives. If that
+ * batch ends in a user message, it must establish the baseline rather than
+ * taking ownership from the restored viewport as a new send.
+ */
+export function resolveLastUserMessageObservation({
+  restoring,
+  tailUserMessageId,
+  previousTailUserMessageId,
+}: ResolveLastUserMessageObservationArgs): ResolveLastUserMessageObservation {
+  const baselineUserMessageId =
+    restoring && previousTailUserMessageId === null && tailUserMessageId !== null
+      ? tailUserMessageId
+      : previousTailUserMessageId;
+  return {
+    baselineUserMessageId,
+    isNewUserSend: tailUserMessageId !== null && tailUserMessageId !== baselineUserMessageId,
+  };
+}
+
+/**
+ * Resolve the render-time priority between a saved history anchor and auto-follow.
+ * Reopening a session must preserve a real reading position, but a user message
+ * sent during that mounted session is an explicit request to resume at the tail.
+ */
+export function resolveRenderPinDecision({
+  restoring,
+  newUserSend,
+  nearBottom,
+}: ResolveRenderPinArgs): ResolveRenderPinDecision {
+  if (newUserSend) return { clearRestoring: restoring, pinToBottom: true };
+  if (restoring) return { clearRestoring: false, pinToBottom: false };
+  return { clearRestoring: false, pinToBottom: nearBottom };
+}
+
 export interface ResolveNearBottomArgs {
   /** scroll 事件前的跟随态(isNearBottomRef) */
   wasNearBottom: boolean;

@@ -46,11 +46,18 @@ export const EMPTY_INPUT_PROJECTION: InputProjection = Object.freeze({
   recovery: null,
   errorRetryText: null,
   credentialSwitchWait: null,
+  continuationTurnClientId: null,
+  continuationInFlightProjectionCapability: 'unknown',
 });
 
 export function normalizeInputProjection(value: unknown, fallbackSessionId = ''): InputProjection {
   const record = readRecord(value);
   const pendingQueue = readQueuedMessages(record?.pendingQueue);
+  const continuationInFlightProjectionCapability = record === null
+    ? 'unknown'
+    : Object.prototype.hasOwnProperty.call(record, 'continuationTurnClientId')
+      ? 'supported'
+      : 'legacy';
   return {
     sessionId: readString(record?.sessionId) ?? fallbackSessionId,
     pendingQueue,
@@ -63,6 +70,9 @@ export function normalizeInputProjection(value: unknown, fallbackSessionId = '')
     error: readString(record?.error),
     recovery: record?.recovery,
     errorRetryText: readString(record?.errorRetryText),
+    autoResumePending: readRecord(record?.autoResumePending),
+    continuationTurnClientId: readString(record?.continuationTurnClientId),
+    continuationInFlightProjectionCapability,
     credentialSwitchWait: readCredentialSwitchWait(record?.credentialSwitchWait),
   };
 }
@@ -101,7 +111,9 @@ export function buildQueuedTextMessage(
   const workingDir = session.workingDir || '';
   const effort = session.effort || '';
   const permissionMode = permissionModeOrAsk(session.permissionMode);
-  const agentKind = session.agentKind === 'codex' ? 'codex' : 'claude-code';
+  const agentKind = session.agentKind === 'codex' || session.agentKind === 'pi'
+    ? session.agentKind
+    : 'claude-code';
   const persistedContent = stringifyUserContent(
     trimmed,
     persistedImageRefs,

@@ -9,6 +9,7 @@ describe('buildSessionNotifyPayload', () => {
     title: '修复登录问题',
     kind: 'done' as const,
     selfDeviceId: 'desktop-abcd',
+    fallbackBody: '已完成 ✓',
   };
 
   it('kind 映射 category,deepLink 为 scheme 无关的应用内路径', () => {
@@ -17,7 +18,10 @@ describe('buildSessionNotifyPayload', () => {
       title: '修复登录问题',
       body: '已完成 ✓',
       deepLink: '/sessions/session-1234?deviceId=desktop-abcd',
-      collapseId: createHash('sha256').update('desktop-abcd:session-1234').digest('hex').slice(0, 32),
+      collapseId: createHash('sha256')
+        .update('desktop-abcd:session-1234')
+        .digest('hex')
+        .slice(0, 32),
     });
     expect(buildSessionNotifyPayload({ ...base, kind: 'error' }).category).toBe('session-error');
     expect(buildSessionNotifyPayload({ ...base, kind: 'needs-reply' }).category).toBe(
@@ -33,7 +37,9 @@ describe('buildSessionNotifyPayload', () => {
     expect(withDetail.body).toBe('修好了, 共改了 3 个文件。');
     const long = buildSessionNotifyPayload({ ...base, detail: 'x'.repeat(500) });
     expect(long.body).toHaveLength(240);
-    expect(buildSessionNotifyPayload({ ...base, detail: '   ' }).body).toBe('已完成 ✓');
+    expect(
+      buildSessionNotifyPayload({ ...base, fallbackBody: '需要你回覆', detail: '   ' }).body,
+    ).toBe('需要你回覆');
   });
 
   it('collapseId 哈希压缩:长 deviceId 也稳定在 32 hex(APNs 64B 上限内),不同会话不同键', () => {

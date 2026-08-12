@@ -18,7 +18,7 @@ const log = createLogger('maker-ipc:authHandlers');
 export type MakerIpcBroadcast = (channel: string, payload: unknown) => void;
 
 /** IPC 允许的 agent 种类；运行时枚举校验不能靠 TypeScript 强转替代。 */
-const AGENT_KINDS = ['claude-code', 'codex'] as const satisfies readonly AgentKind[];
+const AGENT_KINDS = ['claude-code', 'codex', 'pi'] as const satisfies readonly AgentKind[];
 const AGENT_LOGIN_MODES = ['browser', 'device-code'] as const satisfies readonly AgentLoginMode[];
 const MAX_LOGIN_PROGRESS_CHARS = 16_384;
 const LOGIN_OWNER_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -306,7 +306,9 @@ export function registerMakerAuthHandlers(
     if (kind === 'codex' && result.authenticated && result.authSource === 'oauth') {
       let liveModelsApplied = false;
       try {
-        liveModelsApplied = await maker.refreshAgentLocalModels('codex');
+        liveModelsApplied = await maker.refreshAgentLocalModels('codex', {
+          credentialMode: 'oauth-bearer',
+        });
       } catch (e) {
         // 登录本身已成功；实时模型发现失败时由 host 回退磁盘快照，不能把登录判失败。
         // 但记异常原因(原先静默吞掉,首登无模型时无从诊断是 app-server 起不来还是

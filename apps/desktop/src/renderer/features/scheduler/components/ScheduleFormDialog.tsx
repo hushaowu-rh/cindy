@@ -11,10 +11,13 @@ import { extractIpcError } from '@/utils/ipcError';
 import { Tip } from '@/components/ui/tooltip';
 import { useAgentCapabilities } from '@/hooks/useAgentCapabilities';
 import { useProviders } from '@/hooks/useProviders';
-import { sessionModelSupportsFastMode } from '@cindy/model-providers';
+import {
+  sessionModelSupportsFastMode,
+} from '@cindy/model-providers';
 import type { UtilityTextAttemptReason, UtilityTextFailure } from '../../../../shared/utilityTextResult';
 import { useFeishuBot } from '@/hooks/useFeishuBot';
 import { useProjectPickerOptions } from '@/hooks/useProjectPickerOptions';
+import { useWecomGroupNotificationSettings } from '@/hooks/useWecomGroupNotificationSettings';
 import type { Schedule, CreateScheduleInput, ScheduleTemplate, UpdateScheduleInput } from '@cindy/maker-scheduler';
 import { applyTemplateParams } from '@cindy/maker-scheduler/template-engine';
 import { ScriptCapabilityMultiSelect } from './ScriptCapabilityMultiSelect';
@@ -32,11 +35,13 @@ import {
   buildHookCommandForScriptFile,
   canSubmitSessionBinding,
   isExplicitScheduleModelUnavailable,
+  needsBoundSessionGenerationRouteResolution,
   parsePreRunHookTimeoutMs,
   resolveScheduleGenerationProviderId,
-  shouldFollowBoundSessionGenerationRoute,
+  resolveScheduleModelEfforts,
+  usesBoundSessionGenerationModel,
 } from '../lib/scheduleFormLogic';
-import type { RunMode } from '../hooks/useScheduleForm';
+import type { RunMode, ScheduleFormState } from '../hooks/useScheduleForm';
 import { BoundSessionCard } from './BoundSessionCard';
 import { TemplateGallery } from './TemplateGallery';
 import { TemplateParamForm } from './TemplateParamForm';
@@ -97,12 +102,20 @@ interface Props {
   initial: Schedule | null;
   /** 从外部推荐卡片进入新建弹窗时，直接把对应模板应用到表单。 */
   initialTemplate?: ScheduleTemplate | null;
+  /** 外部快捷入口的新建表单覆写；只负责预填，仍须用户主动提交。 */
+  initialValues?: Partial<ScheduleFormState> | null;
   onSubmit: (input: CreateScheduleInput | UpdateScheduleInput, isEdit: boolean) => Promise<void>;
   /** 项目分组里"+"按钮的便捷入口：仅预填 workingDir，等同于普通新建（用户级 schedule，
    *  不写 schedules.json，可继续选模板、改项目）。 */
   initialWorkingDir?: string | null;
   /** 编辑 project schedule 时为 true，保存走 schedules.json upsert。 */
   editProjectSchedule?: boolean;
+  /**
+   * 本次新建面板是由哪个插件请求打开的（agent 槽 schedule 加档）。非空时在标题下
+   * 显示来源标注，让用户看清是谁请求建这条任务 —— 预填内容来自插件，用户必须知道
+   * 自己在替谁保存。仅展示，不影响提交内容。
+   */
+  requestedByGhostName?: string | null;
 }
 
 export function ScheduleFormDialog({
@@ -110,9 +123,11 @@ export function ScheduleFormDialog({
   onOpenChange,
   initial,
   initialTemplate = null,
+  initialValues = null,
   onSubmit,
   initialWorkingDir = null,
   editProjectSchedule = false,
+  requestedByGhostName = null,
 }: Props) {
   const { t } = useTranslation();
   const formApi = useScheduleForm(initial);
@@ -197,7 +212,7 @@ export function ScheduleFormDialog({
   const initialId = initial?.id;
   useEffect(() => {
     if (!open) return;
-    reset(initial);
+    reset(initial, initialValues ?? undefined);
     setMode('form');
     setSelectedTemplate(null);
     setParamValues({});
@@ -215,23 +230,34 @@ export function ScheduleFormDialog({
       setField('workspaceKind', 'project');
       setField('workingDir', prefill);
     }
-  }, [open, initialId, reset, initial, isProjectAutomationMode, projectWorkingDir, initialWorkingDir, setField]);
+  }, [
+    open,
+    initialId,
+    reset,
+    initial,
+    initialValues,
+    isProjectAutomationMode,
+    projectWorkingDir,
+    initialWorkingDir,
+    setField,
+  ]);
 
   /** 前置检查「AI 生成」:描述 → utility model 生成脚本落盘 → 命令回填输入框。 */
   const runHookGenerate = useCallback(async () => {
     const description = hookGenDesc.trim();
     if (!description || hookGenerating) return;
     const hasSessionTarget = hasRealBinding(form);
-    const followsSessionRoute = shouldFollowBoundSessionGenerationRoute(form);
-    const providerId = followsSessionRoute
-      ? undefined
+    const resolveBoundSessionRoute = needsBoundSessionGenerationRouteResolution(form);
+    const inheritsBoundSessionModel = usesBoundSessionGenerationModel(form);
+    const providerId = resolveBoundSessionRoute
+      ? form.providerId.trim() || undefined
       : resolveScheduleGenerationProviderId({
         providers,
         providerId: form.providerId,
         model: form.model,
         agentKind: form.agentKind,
       });
-    if (!followsSessionRoute && !providerId) {
+    if (!resolveBoundSessionRoute && !providerId) {
       toast.warning(t('scheduler.editor.validation.modelUnavailable', { model: form.model }));
       return;
     }
@@ -243,15 +269,16 @@ export function ScheduleFormDialog({
         description,
         scheduleName: form.name.trim() || undefined,
         providerId: providerId ?? undefined,
-        // 只有 bound + 空 model/provider 才跟随 session 路由。persistent 任务即使
-        // 已回写 targetSessionId，仍按任务级选择生成，与下次 fire 的覆盖语义一致。
-        agentKind: followsSessionRoute ? undefined : form.agentKind,
-        model: followsSessionRoute ? undefined : form.model.trim() || undefined,
+        // bound 任务的缺省模型/来源维度由 main 按绑定会话补齐；provider/model 的显式
+        // 覆盖仍原样透传。persistent 任务即使已回写 targetSessionId，也按任务级选择生成。
+        agentKind: resolveBoundSessionRoute ? undefined : form.agentKind,
+        model: inheritsBoundSessionModel ? undefined : form.model.trim() || undefined,
         // 绑定会话任务:workingDir 不发(表单残留值可能是改绑前的过期项目目录,
         // 显式值会压过会话解析),真实 cwd 由 main 按会话 meta.workDir 解析 ——
         // 落盘目录/自测环境与生产运行一致
         workingDir: hasSessionTarget ? undefined : form.workingDir.trim() || undefined,
         targetSessionId: hasSessionTarget ? form.targetSessionId.trim() : undefined,
+        resolveBoundSessionRoute: resolveBoundSessionRoute ? true : undefined,
         currentCommand: form.preRunHookCommand.trim() || undefined,
       });
       if (!result.ok) {
@@ -275,13 +302,14 @@ export function ScheduleFormDialog({
     providers,
     form.name,
     form.providerId,
+    form.effort,
     form.agentKind,
     form.model,
     form.workingDir,
     form.targetSessionId,
+    form.persistentSession,
     form.preRunHookCommand,
     form.executionMode,
-    form.persistentSession,
     setField,
     t,
   ]);
@@ -337,6 +365,7 @@ export function ScheduleFormDialog({
     if (template.notify) {
       setField('notifyDesktop', template.notify.desktop);
       setField('notifyFeishu', template.notify.feishu);
+      setField('notifyWecomGroup', template.notify.wecomGroup === true);
     }
     const initParams: Record<string, string> = {};
     for (const parameter of template.parameters ?? []) {
@@ -366,6 +395,8 @@ export function ScheduleFormDialog({
   }, [selectedTemplate, paramValues, promptDirty, setField]);
 
   const feishuBotReady = useFeishuBot().status === 'connected';
+  const wecomGroupSettings = useWecomGroupNotificationSettings();
+  const wecomGroupReady = wecomGroupSettings.configured && wecomGroupSettings.enabled;
   const navigate = useNavigate();
   const openReferencedSession = useCallback(
     async (sessionId: string) => {
@@ -388,14 +419,27 @@ export function ScheduleFormDialog({
     // 飞书机器人在「IM 机器人」页的「个人」分栏,缺省 imGroup 会落到默认的 Cindy 栏
     navigate('/settings?tab=im-bot&imGroup=personal');
   };
+  const goConfigWecomGroup = () => {
+    onOpenChange(false);
+    navigate('/settings?tab=im-bot&imGroup=personal');
+  };
 
   const projectOptions = useProjectPickerOptions();
 
   const currentModel = useMemo(() => {
     const list = caps.capabilities?.availableModels ?? [];
-    if (form.model) return list.find((m) => m.id === form.model);
-    return list[0];
+    return form.model ? list.find((m) => m.id === form.model) : undefined;
   }, [caps.capabilities, form.model]);
+
+  const currentModelEfforts = useMemo(() => {
+    return resolveScheduleModelEfforts({
+      providers,
+      providerId: form.providerId,
+      model: form.model,
+      agentKind: form.agentKind,
+      fallbackEfforts: currentModel?.efforts,
+    });
+  }, [currentModel, form.agentKind, form.model, form.providerId, providers]);
 
   // form.model 为空时回填默认模型（三级回退,所见即所存）。
   // 覆盖历史遗留的空 model 任务（编辑打开时回填）；若不回填,提交后落库是
@@ -410,10 +454,10 @@ export function ScheduleFormDialog({
   }, [form.model, form.agentKind, form.targetSessionId, setField]);
 
   useEffect(() => {
-    if (!currentModel || !form.effort) return;
-    const allowed = currentModel.efforts as readonly string[];
+    if (!currentModelEfforts || !form.effort) return;
+    const allowed = currentModelEfforts as readonly string[];
     if (!allowed.includes(form.effort)) setField('effort', '');
-  }, [currentModel, form.effort, setField]);
+  }, [currentModelEfforts, form.effort, setField]);
 
   // Fast 模式门控：agent 级 hasFastMode × 该 (生效来源, 模型) 的 supportsFastMode（per-provider，
   // 唯一真相）。生效来源按 form.providerId 解析（空则该模型的默认来源）。Claude 当前 hasFastMode
@@ -535,7 +579,11 @@ export function ScheduleFormDialog({
                     : t('scheduler.editor.promptDialog.titleCreate')}
               </Dialog.Title>
               <p className="text-sm leading-[1.43] text-[var(--cmd-palette-item-meta)]">
-                {t('scheduler.editor.promptDialog.subtitle')}
+                {requestedByGhostName
+                  ? t('scheduler.editor.promptDialog.subtitleFromGhost', {
+                      name: requestedByGhostName,
+                    })
+                  : t('scheduler.editor.promptDialog.subtitle')}
               </p>
             </div>
             {!isEdit && !isProjectAutomationMode && (
@@ -667,7 +715,7 @@ export function ScheduleFormDialog({
                       <summary className="w-fit cursor-pointer select-none text-[var(--settings-btn-secondary-text)] hover:text-[var(--msg-assistant-text)]">
                         {t('scheduler.editor.script.protocolExample')}
                       </summary>
-                      <pre className="mt-2 overflow-x-auto rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] p-3 font-mono text-[11px] leading-[1.5] text-[var(--settings-input-text)]">
+                      <pre className="mt-2 overflow-x-auto rounded-xl border border-[var(--settings-input-border)] bg-[var(--settings-input-bg)] p-3 font-mono text-11 leading-[1.5] text-[var(--settings-input-text)]">
                         <code>{SCRIPT_PROTOCOL_PYTHON_EXAMPLE}</code>
                       </pre>
                     </details>
@@ -923,6 +971,45 @@ export function ScheduleFormDialog({
                   )}
                 >
                   {t('scheduler.editor.fields.configFeishu')}
+                </button>
+              )}
+              {wecomGroupReady ? (
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={form.notifyWecomGroup === true}
+                  onClick={() => setField('notifyWecomGroup', form.notifyWecomGroup !== true)}
+                  className={cn(
+                    'inline-flex h-[34px] items-center gap-2 rounded-md px-1.5',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)] focus:outline-none',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[3px] border-[1.5px] transition-colors',
+                      form.notifyWecomGroup
+                        ? 'border-[var(--lightbox-cta-bg)] bg-[var(--lightbox-cta-bg)] text-[var(--lightbox-cta-fg)]'
+                        : 'border-[var(--cmd-palette-item-meta)] bg-transparent dark:border-[var(--settings-section-desc)]',
+                    )}
+                    aria-hidden
+                  >
+                    {form.notifyWecomGroup && <Check size={10} strokeWidth={3} aria-hidden />}
+                  </span>
+                  {t('scheduler.editor.fields.finishSendToWecomGroup')}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={goConfigWecomGroup}
+                  className={cn(
+                    'inline-flex h-[34px] items-center rounded-md px-2',
+                    'text-13 leading-none text-[var(--settings-btn-secondary-text)]',
+                    'transition-colors hover:bg-[var(--surface-hover)]',
+                    'focus:outline-none underline-offset-2 hover:underline',
+                  )}
+                >
+                  {t('scheduler.editor.fields.configWecomGroup')}
                 </button>
               )}
             </div>
@@ -1207,7 +1294,7 @@ export function ScheduleFormDialog({
                     </div>
                   )}
                   {hookGenPath && (
-                    <span className="truncate font-mono text-[11px] text-[var(--cmd-palette-item-meta)]">
+                    <span className="truncate font-mono text-11 text-[var(--cmd-palette-item-meta)]">
                       {t('scheduler.editor.preRunHook.aiDone', { path: hookGenPath })}
                     </span>
                   )}
@@ -1232,7 +1319,7 @@ export function ScheduleFormDialog({
                                 })}
                       </span>
                       {(hookTestResult.stdout.trim() || hookTestResult.stderr.trim()) && (
-                        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--cmd-palette-item-meta)]">
+                        <span className="min-w-0 flex-1 truncate font-mono text-11 text-[var(--cmd-palette-item-meta)]">
                           {(hookTestResult.stdout.trim() || hookTestResult.stderr.trim()).split('\n')[0]}
                         </span>
                       )}

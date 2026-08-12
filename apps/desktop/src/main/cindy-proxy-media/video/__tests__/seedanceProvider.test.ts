@@ -32,8 +32,35 @@ describe('seedance provider · capabilities', () => {
       true,
     );
   });
-  it('declares maxImages=2 for first+last frame transition', () => {
-    expect(p.capabilities.maxImages).toBe(2);
+  /**
+   * 反向不变量:2.0 provider **不得**承载 2.5 的 alias。
+   *
+   * capabilities 是 per-provider 而非 per-alias(run.ts 与 cindy-brain 的
+   * getGhostVideoCapabilities 取的都是 `provider.capabilities`),所以把 2.5 挂成
+   * 这里的第三个 alias 会让它整份继承下面这些 2.0 的值域 —— 时长被卡在
+   * 4/6/8/10(2.5 的 4–30 长片一律明拒)、1080p 被放行(2.5 只到 720p)、
+   * 画幅没有 adaptive、后缀串还照 2.0 写 `--fps`。反向同样成立:2.5 的宽值域
+   * 挤进来就替 2.0 放宽了。2.5 归 createSeedance25Provider,见
+   * seedance25Provider.test.ts。
+   */
+  it('不承载 2.5:2.0 的 capabilities 里只有 2.0 的档位', () => {
+    expect(p.capabilities.modelAliases.map((a) => a.alias)).toEqual([
+      'seedance-fast',
+      'seedance-pro',
+    ]);
+    expect(p.capabilities.expectedSecondsByAlias['bytedance/seedance-2.5']).toBeUndefined();
+  });
+  it('首尾帧模式上限 2 张,参考图模式 9 张(同一个 2.0 模型的两种 role)', () => {
+    expect(p.capabilities.maxImagesByRefMode).toEqual({
+      first_and_last_frame: 2,
+      reference_image: 9,
+    });
+  });
+  it('有音频开关,且登记的上游默认是"出声"(Seedance 2.0 原生音画同生)', () => {
+    // audioDefault 改成 false 或删掉,都会让不传音频的单子回执失真 ——
+    // 这个型号不传就是有声的,回执必须如实这么报。
+    expect(p.capabilities.supportsAudio).toBe(true);
+    expect(p.capabilities.audioDefault).toBe(true);
   });
 });
 
@@ -78,6 +105,25 @@ describe('seedance provider · submit body shape', () => {
         text: '一只小猫在草地上跳 --duration 6 --resolution 1080p --ratio 9:16 --fps 24',
       },
     ]);
+    // 没表态就不写这个键:上游按自己的默认(有声)出片,与接入音频开关之前
+    // 的请求体逐字节同形。
+    expect('generate_audio' in body).toBe(false);
+  });
+
+  it('音频开关走请求体顶层 generate_audio,不是 content 里的 --flag 后缀', async () => {
+    for (const audio of [true, false]) {
+      const fetchMock = vi.fn(async () =>
+        new Response(JSON.stringify({ id: 'cgt-FAKE-A' }), { status: 200 }),
+      ) as unknown as typeof fetch;
+      const p = makeProvider(fetchMock);
+      await p.submit({ prompt: '雪地脚步声', duration: 6, audio }, 'seedance-fast');
+      const init = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as RequestInit;
+      const body = JSON.parse(init.body as string);
+      expect(body.generate_audio, `audio=${audio}`).toBe(audio);
+      // 别顺手把它也拼进提示词:方舟没有对应的 flag 写法,拼进去就是脏提示词。
+      expect(body.content[0].text).not.toContain('audio');
+    }
   });
 
   it('image-to-video: appends image_url with role:first_frame', async () => {
@@ -121,6 +167,64 @@ describe('seedance provider · submit body shape', () => {
     const body = JSON.parse(init.body as string);
     expect(body.model).toBe('doubao-seedance-2-0-260128');
     expect(body.content).toHaveLength(3);
+    expect(body.content[1].role).toBe('first_frame');
+    expect(body.content[2].role).toBe('last_frame');
+  });
+
+  it('2.5 的 alias 在 2.0 provider 上提交前就被拒,一个请求都不发', async () => {
+    // 走错 provider 时必须早拒。放行的话 2.5 的单子就会带着 2.0 的值域上路
+    // (--fps、无 adaptive、时长卡 4/6/8/10),错误要到上游才暴露。
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ id: 'cgt-FAKE-25' }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const p = makeProvider(fetchMock);
+    await expect(
+      p.submit({ prompt: '一只猫在雨里奔跑' }, 'bytedance/seedance-2.5'),
+    ).rejects.toThrow(/unknown alias/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refMode:reference_image → 每张图都是 role:reference_image,顺序原样保留', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ id: 'cgt-FAKE-4' }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const p = makeProvider(fetchMock);
+    await p.submit(
+      {
+        prompt: '[图片1] 的女孩戴着 [图片2] 的耳环',
+        refMode: 'reference_image',
+        images: [
+          'data:image/png;base64,ONE',
+          'data:image/png;base64,TWO',
+          'data:image/png;base64,THREE',
+        ],
+      },
+      'seedance-fast',
+    );
+    const init = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string);
+    expect(body.content).toHaveLength(4);
+    // 顺序 = 提示词里的「图片1/2/3」序号,不能重排
+    expect(body.content.slice(1)).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,ONE' }, role: 'reference_image' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,TWO' }, role: 'reference_image' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,THREE' }, role: 'reference_image' },
+    ]);
+    // 参考图模式下不混发首尾帧 role
+    expect(body.content.some((c: { role?: string }) => c.role === 'first_frame')).toBe(false);
+  });
+
+  it('不传 refMode 时仍是首尾帧(老调用方逐字节同形)', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ id: 'cgt-FAKE-5' }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    const p = makeProvider(fetchMock);
+    await p.submit(
+      { prompt: '动起来', images: ['data:image/png;base64,A', 'data:image/png;base64,B'] },
+      'seedance-fast',
+    );
+    const init = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string);
     expect(body.content[1].role).toBe('first_frame');
     expect(body.content[2].role).toBe('last_frame');
   });

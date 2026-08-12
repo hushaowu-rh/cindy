@@ -18,11 +18,21 @@ import {
   getSessionDeviceId,
   remoteProjectsStore,
 } from '@/features/device-link/remoteProjectsStore';
+import { isDataOwnerPushCurrent } from '@/contexts/dataOwnerGeneration';
+import { isDeviceLinkRemotePushCurrent } from '@/lib/remoteDataOwnerPushFence';
+import {
+  accountCounterAtRequestStart,
+  invalidationAtRequestStart,
+  ownerTokenAtRequestStart,
+  persistCachedMessages,
+  sessionCacheInvalidationToken,
+} from '@/features/device-link/mirrorCacheClient';
 import { getStickySessionDeviceId } from '@/features/device-link/stickySessionOrigin';
 import type { Message, Session } from '@/lib/ccAgent.types';
 import * as messageService from '@/lib/messageService';
 import * as sessionService from '@/lib/sessionService';
 import { extractIpcError } from '@/utils/ipcError';
+import type { TurnChangeSetUpdatedPayload } from '../../shared/turnChangeSet';
 
 type FullMaker = typeof window.electronAPI.maker;
 
@@ -34,10 +44,17 @@ type FullMaker = typeof window.electronAPI.maker;
 export interface RoutableMaker {
   send: FullMaker['send'];
   setModel: FullMaker['setModel'];
+  // session-agent-switch:跨引擎切换是**会话级**操作,数据真相(pending 意图注册表 +
+  // 引擎交接)都在会话所在端。远程会话必须隧道到被控端,否则打到控制端本机 maker 上
+  // 会因本机无此 session 直接失败。只读入口供重连 / 重开视图后恢复 main 权威意图。
+  switchSessionAgent: FullMaker['switchSessionAgent'];
+  getSessionAgentSwitchIntent: FullMaker['getSessionAgentSwitchIntent'];
   setEffort: FullMaker['setEffort'];
   setPermissionMode: FullMaker['setPermissionMode'];
   setFastMode: FullMaker['setFastMode'];
   setPlanMode: FullMaker['setPlanMode'];
+  getSessionTree: FullMaker['getSessionTree'];
+  navigateSessionTree: FullMaker['navigateSessionTree'];
   resolveInteraction: FullMaker['resolveInteraction'];
   getPendingInteractions: FullMaker['getPendingInteractions'];
   deleteMessage: FullMaker['deleteMessage'];
@@ -50,6 +67,10 @@ export interface RoutableMaker {
   getContextUsage: FullMaker['getContextUsage'];
   setExtraDirs: FullMaker['setExtraDirs'];
   closeSession: FullMaker['closeSession'];
+  // 手动压缩(pi 原生 compact,capability-aware 的 maker:compact-session):
+  // 上下文环 / 会话菜单对 device-link 远程 pi 会话也要隧道到被控端执行
+  // (压缩的是被控端的会话上下文,控制端本机无该 live 会话,固定调本机必 null 静默失败)。
+  compactSession: FullMaker['compactSession'];
   enableOrca: FullMaker['enableOrca'];
   disableOrca: FullMaker['disableOrca'];
   input: Pick<
@@ -77,20 +98,63 @@ function invokeRemote(deviceId: string, channel: string, args: unknown[]): Promi
   return window.electronAPI.deviceLink.invoke(deviceId, channel, args);
 }
 
-/** 远程被控设备的 maker 操作适配器:每个方法把入参原样隧道到对应 channel。 */
+type SetModelArgs = Parameters<FullMaker['setModel']>;
+
+/**
+ * maker:set-model 的 wire 参数不能直接原样转发：Device Link 通过 JSON 传数组，
+ * undefined 会变成 null。保留中间参数的 null 占位，但裁掉尾部多余的 undefined，
+ * 使被控端能区分 providerId / revision / selection 的位置而不收到假的尾参。
+ */
+function buildRemoteSetModelArgs(args: SetModelArgs): unknown[] {
+  const [sessionId, model, providerId, expectedAgentSwitchRevision, selection] = args;
+  if (
+    providerId === undefined &&
+    (expectedAgentSwitchRevision !== undefined || selection !== undefined)
+  ) {
+    throw new Error(
+      '[INVALID_PARAMS] providerId is required when expectedAgentSwitchRevision or selection is provided',
+    );
+  }
+  const wireArgs: unknown[] = [sessionId, model];
+  if (
+    providerId !== undefined ||
+    expectedAgentSwitchRevision !== undefined ||
+    selection !== undefined
+  ) {
+    wireArgs.push(providerId === undefined ? null : providerId);
+  }
+  if (expectedAgentSwitchRevision !== undefined || selection !== undefined) {
+    wireArgs.push(expectedAgentSwitchRevision === undefined ? null : expectedAgentSwitchRevision);
+  }
+  if (selection !== undefined) wireArgs.push(selection);
+  return wireArgs;
+}
+
+/** 远程被控设备的 maker 操作适配器:每个方法把入参隧道到对应 channel。 */
 function remoteMakerApi(deviceId: string): RoutableMaker {
-  // 入参顺序与 window.electronAPI.maker.* / maker:* handler 完全一致,原样转发即可。
+  // 除 setModel 外，入参顺序与 window.electronAPI.maker.* / maker:* handler 完全一致。
   const t =
     (channel: string) =>
     (...args: unknown[]): Promise<unknown> =>
       invokeRemote(deviceId, channel, args);
   return {
     send: t('maker:send') as FullMaker['send'],
-    setModel: t('maker:set-model') as FullMaker['setModel'],
+    setModel: (async (...args: SetModelArgs) =>
+      invokeRemote(
+        deviceId,
+        'maker:set-model',
+        buildRemoteSetModelArgs(args),
+      )) as FullMaker['setModel'],
+    switchSessionAgent: t('maker:switch-session-agent') as FullMaker['switchSessionAgent'],
+    getSessionAgentSwitchIntent: t(
+      'maker:get-session-agent-switch-intent',
+    ) as FullMaker['getSessionAgentSwitchIntent'],
     setEffort: t('maker:set-effort') as FullMaker['setEffort'],
     setPermissionMode: t('maker:set-permission-mode') as FullMaker['setPermissionMode'],
     setFastMode: t('maker:set-fast-mode') as FullMaker['setFastMode'],
     setPlanMode: t('maker:set-plan-mode') as FullMaker['setPlanMode'],
+    getSessionTree: t('maker:get-session-tree') as FullMaker['getSessionTree'],
+    navigateSessionTree: t('maker:navigate-session-tree') as FullMaker['navigateSessionTree'],
     resolveInteraction: t('maker:resolve-interaction') as FullMaker['resolveInteraction'],
     getPendingInteractions: t(
       'maker:get-pending-interactions',
@@ -103,6 +167,12 @@ function remoteMakerApi(deviceId: string): RoutableMaker {
     getContextUsage: t('maker:get-context-usage') as FullMaker['getContextUsage'],
     setExtraDirs: t('maker:set-extra-dirs') as FullMaker['setExtraDirs'],
     closeSession: t('maker:close-session') as FullMaker['closeSession'],
+    compactSession: ((sessionId, instructions) =>
+      invokeRemote(
+        deviceId,
+        'maker:compact-session',
+        instructions === undefined ? [sessionId] : [sessionId, instructions],
+      )) as FullMaker['compactSession'],
     enableOrca: t('maker:session:enable-orca') as FullMaker['enableOrca'],
     disableOrca: t('maker:session:disable-orca') as FullMaker['disableOrca'],
     input: {
@@ -136,6 +206,16 @@ export function makerApiForDevice(deviceId: string): RoutableMaker {
   return remoteMakerApi(deviceId);
 }
 
+/** Mutation 前按明确 deviceId 重新读取被控端能力，避免复用可能过期的 renderer cache。 */
+export function agentCapabilitiesForDevice(
+  deviceId: string,
+  agentKind: 'claude-code' | 'codex' | 'pi',
+): Promise<{ supportsOrcaWorkerPermissionMode?: boolean }> {
+  return invokeRemote(deviceId, 'maker:get-capabilities', [agentKind]) as Promise<{
+    supportsOrcaWorkerPermissionMode?: boolean;
+  }>;
+}
+
 /**
  * 按 sessionId 来源返回 maker 操作入口:
  *   - 本地 → 真 window.electronAPI.maker(零开销,行为不变)
@@ -144,6 +224,57 @@ export function makerApiForDevice(deviceId: string): RoutableMaker {
 export function makerApiFor(sessionId: string): RoutableMaker {
   const deviceId = getSessionDeviceId(sessionId);
   return deviceId ? makerApiForDevice(deviceId) : window.electronAPI.maker;
+}
+
+/**
+ * 粘滞归属版 maker 入口:曾解析到 deviceId 的会话,在 relay 瞬时重连清空注册表的窗口内
+ * 仍走隧道,不会退回本机。
+ *
+ * 用于「误判本机会产生副作用」的 **mutation**(与 isRemoteSessionSticky 同一判据,只是那条
+ * 服务于 gating、这条服务于调用)。协同开关就是典型:enableOrca / disableOrca 在瞬断窗口内
+ * 被误判成本机,会在**控制端本机**建出或销毁一个 team —— 本机恰好存在同 id 会话时还会操作
+ * 错对象,而用户看到的入口(按粘滞 remoteDeviceId 渲染)分明指向被控端(issue #1170 codex P2)。
+ *
+ * 普通高频操作(send / setModel / …)仍用 makerApiFor:它们本就跟随会话来源的实时判定,
+ * 且误判的代价是一次失败重试,不是在错误的机器上留下持久状态。
+ */
+export function makerApiForSticky(sessionId: string): RoutableMaker {
+  const deviceId = getStickySessionDeviceId(sessionId);
+  return deviceId ? makerApiForDevice(deviceId) : window.electronAPI.maker;
+}
+
+/** Subscribe to local exact-turn updates; remote sessions deliberately fail closed in this phase. */
+export function subscribeTurnChangeSetUpdated(
+  sessionId: string,
+  cb: (payload: TurnChangeSetUpdatedPayload) => void,
+): () => void {
+  const bind = (deviceId: string | undefined): (() => void) => {
+    if (!deviceId) {
+      return window.electronAPI.maker.onTurnChangeSetUpdated((raw, ownerStamp) => {
+        if (!isDataOwnerPushCurrent(ownerStamp)) return;
+        const payload = raw as Partial<TurnChangeSetUpdatedPayload> | null;
+        if (payload?.sessionId !== sessionId || !payload.summary) return;
+        cb(payload as TurnChangeSetUpdatedPayload);
+      });
+    }
+    // Exact patches can exceed the 2 MiB device-link frame. This phase fails closed for
+    // controlled sessions instead of truncating a patch and presenting it as exact.
+    return () => {};
+  };
+
+  let currentDeviceId = getStickySessionDeviceId(sessionId);
+  let offInner = bind(currentDeviceId);
+  const offStore = remoteProjectsStore.subscribe(() => {
+    const nextDeviceId = getStickySessionDeviceId(sessionId);
+    if (nextDeviceId === currentDeviceId) return;
+    currentDeviceId = nextDeviceId;
+    offInner();
+    offInner = bind(nextDeviceId);
+  });
+  return () => {
+    offStore();
+    offInner();
+  };
 }
 
 /** 是否远程(device-link)会话。 */
@@ -166,7 +297,7 @@ export function isRemoteSessionSticky(sessionId: string): boolean {
  * 老被控端无此 channel 时 invoke 以 CHANNEL_NOT_ALLOWED 拒绝,调用方按生成失败提示。
  */
 export function regenerateSessionTitleFor(sessionId: string): Promise<{ title: string | null }> {
-  const deviceId = getSessionDeviceId(sessionId);
+  const deviceId = getStickySessionDeviceId(sessionId);
   if (!deviceId) return window.electronAPI.maker.regenerateSessionTitle(sessionId);
   return invokeRemote(deviceId, 'maker:regenerate-title', [{ sessionId }]) as Promise<{
     title: string | null;
@@ -175,7 +306,12 @@ export function regenerateSessionTitleFor(sessionId: string): Promise<{ title: s
 
 /** 读会话元数据:远程走隧道 local-db:sessions:get(本地 DB 没有该 row,直接调会 404)。 */
 export function getSessionFor(sessionId: string): Promise<Session> {
-  const deviceId = getSessionDeviceId(sessionId);
+  // Session metadata is part of the same remote send attempt as the later
+  // enqueue. Keep using the last known device while the mirror is being
+  // rebuilt; reading the controller's local DB in that window returns either
+  // an unrelated row or a misleading 404 and can make a UI trigger fall back
+  // to the wrong maker instance.
+  const deviceId = getStickySessionDeviceId(sessionId);
   if (!deviceId) return sessionService.get(sessionId);
   return invokeRemote(deviceId, 'local-db:sessions:get', [sessionId]) as Promise<Session>;
 }
@@ -192,14 +328,67 @@ export function isSessionTurnRunningFor(sessionId: string): Promise<boolean> {
   return invokeRemote(deviceId, 'maker:session-in-turn', [sessionId]) as Promise<boolean>;
 }
 
-/** 读历史消息:远程走隧道 local-db:messages:list,返回形状与本地一致(camelCase Message[])。 */
+/**
+ * 读历史消息:远程走隧道 local-db:messages:list,返回形状与本地一致(camelCase Message[])。
+ *
+ * 远程会话取回**最新一页**(没有 before / beforeTs 游标)时顺手写进冷缓存
+ * (`mirrorCacheClient`),供下次冷启动 / 被控端离线时乐观渲染。这是缓存的**唯一写点**:
+ * 首拉、reconcileRemoteMessages、reconnect 重拉、turn 结束对账都经过这里,所以缓存
+ * 自然跟着最近一次对账保持新鲜。翻页(before/beforeTs)与本机会话都不写 ——
+ * 老窗口不是"最近一页",写进去会让下次冷开 hydrate 出一段历史中间的孤岛。
+ */
 export function listMessagesFor(
   sessionId: string,
   opts?: { limit?: number; before?: string; beforeTs?: number },
 ): Promise<Message[]> {
   const deviceId = getSessionDeviceId(sessionId);
   if (!deviceId) return messageService.list(sessionId, opts);
-  return invokeRemote(deviceId, 'local-db:messages:list', [sessionId, opts]) as Promise<Message[]>;
+  const promise = invokeRemote(deviceId, 'local-db:messages:list', [sessionId, opts]) as Promise<
+    Message[]
+  >;
+  if (!opts?.before && opts?.beforeTs == null) {
+    // 发起时的作废令牌:/clear、rewind、删消息都会自增它(见 clearCachedMessages)。
+    const invalidationAtStart = sessionCacheInvalidationToken(sessionId);
+    // 同时记下 main 侧的会话级作废计数(跨窗口 / 跨进程可见);落盘时交给 main 比对。
+    // 还没有已知值时**在这里**(与远端请求同时)补读一次 —— main 拒绝没带令牌的非空写入,
+    // 而补读若拖到落盘前做,拿到的是清理之后的值,屏障就失效了(见 invalidationAtRequestStart)。
+    const mainInvalidationAtStart = invalidationAtRequestStart(deviceId, sessionId);
+    // opaque owner token 只信任受保护读(readCachedMessages,经 main 原子复核)带回的值:有已知值同步
+    // 返回;有在途受保护读则等它完成(账号切换后首次打开会话时 hydrate 读在并行);都没有才
+    // undefined → 由 store fail-closed 丢弃。绝不单独 getMessages 补读,避免补读 IPC 在账号
+    // 切换后才被 main 处理、把新账号 token 当成本次请求的 owner 锚点(review: codex P1 + Greptile)。
+    const ownerTokenAtStart = ownerTokenAtRequestStart(sessionId);
+    // 账号代际计数同源:同一账号登出再登录时 token 不变,靠它区分登出前后的内容。
+    const accountCounterAtStart = accountCounterAtRequestStart(sessionId);
+    void promise
+      .then((rows) => {
+        if (!Array.isArray(rows)) return;
+        // 请求在途期间权威侧作废过这个会话的历史 → 手里这批是作废前的行,丢弃这次写,
+        // 否则它会排在那次空写之后落地,把已被清掉的正文重新写回盘上(review: pr-code-review)。
+        if (sessionCacheInvalidationToken(sessionId) !== invalidationAtStart) return;
+        // 请求在途期间这台设备可能已被撤销 / 关闭被控 / 本机停用控制,那条路径已经
+        // clearCachedDevice 清过盘了。迟到的响应若照写,会用清理**之后**的 main 代际
+        // 把被撤销对端的明文重新落盘,main 侧的作废闸挡不住它(review: codex P1)。
+        // 落盘前重核归属:mapping 已经不在(或已换设备)就直接丢弃这次写入。
+        if (getSessionDeviceId(sessionId) !== deviceId) return;
+        // 把"我取到内容时 main 侧的会话级作废计数"一起交上去:main 会再比对一次,于是
+        // **另一个窗口 / 另一个进程**的作废也能挡住这次写(renderer 令牌只在本进程内可见)。
+        // opaque owner token 同理:它是「这份内容在哪个账号名下取的」的身份标记,账号切换后 main 靠
+        // 它丢弃上一个账号的在途响应(review: #1783)。accountCounter 再补「同账号登出再登录」。
+        // 两者取不到时(补读在途 / 失败)传 undefined,由 main 侧 fail-closed 判断。
+        persistCachedMessages(
+          deviceId,
+          sessionId,
+          rows,
+          mainInvalidationAtStart,
+          ownerTokenAtStart,
+          accountCounterAtStart,
+        );
+      })
+      // 拉取失败由调用方处理;这里只是不写缓存(旧缓存保留,离线时正好还能用)。
+      .catch(() => undefined);
+  }
+  return promise;
 }
 
 // 已确认不支持 maker:get-workflow-progress 的被控设备(收到过 CHANNEL_NOT_ALLOWED):
@@ -282,6 +471,38 @@ export function estimatedSessionValueFor(sessionId: string): Promise<{
   ]) as ReturnType<typeof estimatedSessionValueFor>;
 }
 
+/**
+ * 插件启停状态(只读):**按目标设备**读项目级 / 用户级 collab 等开关。
+ *
+ * device-link 会话与草稿的 workingDir 是**被控端**机器上的路径,拿它在控制端本机查
+ * `.cindy/plugins.json` 读到的是控制端自己的用户级开关 —— 与被控端 main 的权威授权
+ * (assertCollabProjectEnabled)可能相反,于是入口看得见却开不起来(issue #1170)。
+ * 所以这里按 deviceId 分流:本机 → 真 IPC;远程 → 隧道到被控端读它自己的真相。
+ *
+ * 路径归一化由调用方在控制端完成:normalizeWorkingDirForProjectSettings 是纯路径形态
+ * 推导(不依赖 process.platform / 本机 userData),跨 macOS ↔ Windows 控制同样成立。
+ *
+ * 老被控端未收录该 channel 时隧道回 DEVICE_LINK_CHANNEL_NOT_ALLOWED,调用方据此
+ * fail-closed 置灰入口并说明「设备版本过旧」,不会放行到 enableOrca 才撞错。
+ */
+export function pluginEnableStateFor(
+  deviceId: string | null | undefined,
+  pluginId: string,
+  workingDir?: string,
+  workspaceKind?: string | null,
+): ReturnType<typeof window.electronAPI.maker.plugins.getState> {
+  if (!deviceId) {
+    return workspaceKind === undefined
+      ? window.electronAPI.maker.plugins.getState(pluginId, workingDir)
+      : window.electronAPI.maker.plugins.getState(pluginId, workingDir, workspaceKind);
+  }
+  const args =
+    workspaceKind === undefined ? [pluginId, workingDir] : [pluginId, workingDir, workspaceKind];
+  return invokeRemote(deviceId, 'maker:plugins:get-state', args) as ReturnType<
+    typeof window.electronAPI.maker.plugins.getState
+  >;
+}
+
 /** 会话内搜索跳转定位:远程走隧道 local-db:messages:around(否则查控制端空库,跳转必失败)。 */
 export function aroundMessagesFor(
   sessionId: string,
@@ -324,11 +545,10 @@ export function deleteMessageFor(
 ): Promise<MessageDeletionResult> {
   const deviceId = getSessionDeviceId(sessionId);
   if (!deviceId) return window.electronAPI.maker.deleteMessage(sessionId, clientId);
-  return invokeRemote(
-    deviceId,
-    'maker:message:delete',
-    [sessionId, clientId],
-  ) as Promise<MessageDeletionResult>;
+  return invokeRemote(deviceId, 'maker:message:delete', [
+    sessionId,
+    clientId,
+  ]) as Promise<MessageDeletionResult>;
 }
 
 /** interrupted-turn-resume:中断提示「忽略」的显式确认(写一次 last_turn_ended_at),
@@ -350,6 +570,24 @@ export function aroundMessagesByClientIdFor(
 ): Promise<Message[]> {
   const deviceId = getSessionDeviceId(sessionId);
   if (!deviceId) return messageService.aroundClientId(sessionId, clientId, opts);
+  return invokeRemote(deviceId, 'local-db:messages:around-client-id', [
+    sessionId,
+    clientId,
+    opts,
+  ]) as Promise<Message[]>;
+}
+
+/**
+ * 已知稳定 deviceId 时直接查询 clientId 锚点。远程乐观发送用它核实一个
+ * ACK 丢失的 steer 是否已经落库；这里不能重新读取易失的 session origin，
+ * 否则恰好在重连清镜像的窗口会误查控制端本机 DB。
+ */
+export function aroundMessagesByClientIdForDevice(
+  deviceId: string,
+  sessionId: string,
+  clientId: string,
+  opts?: { radius?: number },
+): Promise<Message[]> {
   return invokeRemote(deviceId, 'local-db:messages:around-client-id', [
     sessionId,
     clientId,
@@ -427,8 +665,9 @@ export function subscribeGoalStatusChanged(
       });
     }
     return (
-      window.electronAPI.deviceLink?.onRemotePush?.((push) => {
+      window.electronAPI.deviceLink?.onRemotePush?.((push, localOwnerStamp) => {
         if (push.deviceId !== deviceId || push.channel !== 'maker:goal:status-changed') return;
+        if (!isDeviceLinkRemotePushCurrent(push, localOwnerStamp)) return;
         const payload = push.payload as { sessionId?: string; goal?: GoalStatusPayload | null };
         if (payload?.sessionId !== sessionId) return;
         cb(payload as { sessionId: string; goal: GoalStatusPayload | null });
@@ -535,6 +774,15 @@ export function orcaWorkflowsFor(contextSessionId: string): RoutableOrcaWorkflow
 }
 
 /**
+ * 已知稳定 deviceId 时直接返回远程 orca 适配器,不重新读取易失的 session origin
+ * (与 makerApiForDevice 同款)。用于「调用方手里已经握着权威 deviceId」的场景 ——
+ * 例如刚在该被控端建出会话、要回查它的权威团队终态。
+ */
+export function orcaWorkflowsForDevice(deviceId: string): RoutableOrcaWorkflows {
+  return remoteOrcaWorkflows(deviceId);
+}
+
+/**
  * 订阅某 lead 的 orca worker 变更并在变更时回调:
  *   - 本机 lead → 本机 `onOrcaWorkerChanged` IPC(按 leadSessionId 过滤)。
  *   - 远程 lead → device-link 远程推送(被控端 `maker:orca:worker-changed` 经隧道转发;
@@ -542,7 +790,9 @@ export function orcaWorkflowsFor(contextSessionId: string): RoutableOrcaWorkflow
  * 返回 unsubscribe。
  */
 export function subscribeOrcaWorkerChanged(leadSessionId: string, cb: () => void): () => void {
-  const deviceId = getSessionDeviceId(leadSessionId);
+  // 订阅与 Orca 投影查询一样使用粘滞归属。relay 瞬时重连会清空
+  // remoteProjectsStore；此时不能把仍属于被控端的 Lead 改订到控制端本机事件源。
+  const deviceId = getStickySessionDeviceId(leadSessionId);
   if (!deviceId) {
     return (
       window.electronAPI.localDb.orcaWorkflows.onOrcaWorkerChanged?.((payload: unknown) => {
@@ -551,11 +801,13 @@ export function subscribeOrcaWorkerChanged(leadSessionId: string, cb: () => void
     );
   }
   return (
-    window.electronAPI.deviceLink?.onRemotePush?.((push) => {
+    window.electronAPI.deviceLink?.onRemotePush?.((push, localOwnerStamp) => {
       if (
+        push.deviceId === deviceId &&
         push.channel === 'maker:orca:worker-changed' &&
         (push.payload as { leadSessionId?: string })?.leadSessionId === leadSessionId
       ) {
+        if (!isDeviceLinkRemotePushCurrent(push, localOwnerStamp)) return;
         cb();
       }
     }) ?? (() => {})

@@ -45,6 +45,10 @@ describe('mobile maker transport', () => {
       'maker:set-extra-dirs',
       'maker:set-session-model-pref',
       'maker:apply-new-maker-draft-pref',
+      'maker:get-new-maker-defaults',
+      'maker:apply-new-maker-worktree-pref',
+      'maker:get-new-maker-worktree-branch-pref',
+      'maker:apply-new-maker-worktree-branch-pref',
       'maker:usage:model-pricing',
       'maker:usage:codex-rate-limits',
       'maker:usage:codex-rate-limit-reset',
@@ -66,6 +70,8 @@ describe('mobile maker transport', () => {
       'maker:goal:resume',
       'maker:goal:update',
       'maker:fork',
+      'maker:get-session-tree',
+      'maker:navigate-session-tree',
       'maker:rewind:preview',
       'maker:rewind:commit',
       'maker:message:delete',
@@ -90,6 +96,7 @@ describe('mobile maker transport', () => {
       'maker:input:get-projection',
       'maker:input:enqueue',
       'maker:input:compact',
+      'maker:compact-session',
       'maker:input:steer',
       'maker:input:stop',
       'maker:input:resume',
@@ -106,6 +113,11 @@ describe('mobile maker transport', () => {
       'fs:list-dir',
       'fs:stat-path',
       'fs:mkdir-p',
+      'worktree:detect-cwd',
+      'worktree:list-branches',
+      'worktree:suggest-name',
+      'worktree:create',
+      'worktree:discard-precreated',
       'text-file:read-preview',
       'file-browser:remote-op',
     ]);
@@ -284,6 +296,9 @@ describe('mobile maker transport', () => {
     await maker.getVoiceDictionary();
     await maker.input.stop('s1', { pauseQueue: true });
     await maker.input.compact('s1');
+    await maker.compactSession('s1');
+    await maker.compactSession('s1', '');
+    await maker.compactSession('s1', 'focus on API design');
     await maker.input.retryLastError('s1');
     await maker.input.clearError('s1');
     await maker.input.updateText('s1', 'queued-1', 'updated');
@@ -326,6 +341,9 @@ describe('mobile maker transport', () => {
       ['device-link:voice:dictionary:get', []],
       ['maker:input:stop', ['s1', { pauseQueue: true }]],
       ['maker:input:compact', ['s1']],
+      ['maker:compact-session', ['s1']],
+      ['maker:compact-session', ['s1', '']],
+      ['maker:compact-session', ['s1', 'focus on API design']],
       ['maker:input:retry-last-error', ['s1']],
       ['maker:input:clear-error', ['s1']],
       ['maker:input:update-text', ['s1', 'queued-1', 'updated']],
@@ -346,16 +364,81 @@ describe('mobile maker transport', () => {
     ]);
   });
 
-  it('routes fork, rewind and delete actions through maker namespace', async () => {
+  it('routes worktree probes and new-maker worktree defaults with device-link argument shapes', async () => {
+    const { calls, maker } = harness();
+
+    await maker.getNewMakerDefaults('claude-code');
+    await maker.applyNewMakerWorktreePref(true);
+    await maker.getNewMakerWorktreeBranchPref('/repo');
+    await maker.applyNewMakerWorktreeBranchPref('/repo', 'feature/mobile-sync');
+    await maker.worktree.detectCwd('/repo/app');
+    await maker.worktree.listBranches('/repo');
+    await maker.worktree.suggestName('/repo');
+    await maker.worktree.create({
+      sessionId: 'preset-session-1',
+      baseRepo: '/repo',
+      name: 'auto-abc123',
+      sourceBranch: 'main',
+      recoveryKey: 'recovery-key-1234567890',
+    });
+    await maker.worktree.discardPrecreated({
+      sessionId: 'preset-session-1',
+      path: '/repo/.cindy-worktrees/auto-abc123',
+    });
+    await maker.worktree.discardPrecreated({
+      sessionId: 'preset-session-2',
+      recoveryKey: 'recovery-key-0987654321',
+    });
+
+    expect(calls.map((call) => [call.channel, call.args])).toEqual([
+      ['maker:get-new-maker-defaults', ['claude-code']],
+      ['maker:apply-new-maker-worktree-pref', [{ worktreeEnabled: true }]],
+      ['maker:get-new-maker-worktree-branch-pref', [{ baseRepo: '/repo' }]],
+      ['maker:apply-new-maker-worktree-branch-pref', [{
+        baseRepo: '/repo',
+        sourceBranch: 'feature/mobile-sync',
+      }]],
+      ['worktree:detect-cwd', [{ cwd: '/repo/app' }]],
+      ['worktree:list-branches', [{ baseRepo: '/repo' }]],
+      ['worktree:suggest-name', [{ baseRepo: '/repo' }]],
+      ['worktree:create', [{
+        sessionId: 'preset-session-1',
+        baseRepo: '/repo',
+        name: 'auto-abc123',
+        sourceBranch: 'main',
+        recoveryKey: 'recovery-key-1234567890',
+      }]],
+      ['worktree:discard-precreated', [{
+        sessionId: 'preset-session-1',
+        path: '/repo/.cindy-worktrees/auto-abc123',
+      }]],
+      ['worktree:discard-precreated', [{
+        sessionId: 'preset-session-2',
+        recoveryKey: 'recovery-key-0987654321',
+      }]],
+    ]);
+  });
+
+  it('routes fork, native tree, rewind and delete actions through maker namespace', async () => {
     const { calls, maker } = harness();
 
     await maker.fork('s1', 'm2');
+    await maker.getSessionTree('s1');
+    await maker.navigateSessionTree('s1', 'entry-2', {
+      summarize: true,
+      customInstructions: 'Keep the decision context',
+    });
     await maker.rewindPreview('s1', 'm2');
     await maker.rewindCommit('s1', 'm2');
     await maker.deleteMessage('s1', 'm2');
 
     expect(calls.map((call) => [call.channel, call.args])).toEqual([
       ['maker:fork', ['s1', 'm2']],
+      ['maker:get-session-tree', ['s1']],
+      ['maker:navigate-session-tree', ['s1', 'entry-2', {
+        summarize: true,
+        customInstructions: 'Keep the decision context',
+      }]],
       ['maker:rewind:preview', ['s1', 'm2']],
       ['maker:rewind:commit', ['s1', 'm2']],
       ['maker:message:delete', ['s1', 'm2']],

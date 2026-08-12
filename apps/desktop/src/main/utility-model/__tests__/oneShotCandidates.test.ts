@@ -51,9 +51,14 @@ vi.mock('../../secrets/providerSecretStore.js', () => ({
   readCustomProviderKey: vi.fn(),
 }));
 
-vi.mock('undici', () => ({
-  fetch: vi.fn(),
+vi.mock('../../maker-host/outbound-proxy-resolver.js', () => ({
+  resolveDesktopOutboundProxy: vi.fn(async () => null),
 }));
+
+vi.mock('undici', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, fetch: vi.fn() };
+});
 
 // SUT 链(maker-host/runtime-configs → effectiveXdGatewayBaseUrl)运行期读
 // model-access 下发的 endpoint;mock 成 fixture 值。
@@ -75,7 +80,7 @@ import { readModelDisableOverrides } from '../../maker-host/model-disable-store.
 import { isProviderRouteMutationInProgress } from '../../maker-host/provider-route.js';
 import { readCustomProviderKey } from '../../secrets/providerSecretStore.js';
 import { getUtilityModelChainProfiles } from '../UtilityModelSelection.js';
-import { getUtilityTextCandidates, requestUtilityText } from '../oneShotCandidates.js';
+import { getUtilityTextCandidates, requestUtilityText, toAnthropicApiModelId } from '../oneShotCandidates.js';
 
 const getProfiles = vi.mocked(getUtilityModelChainProfiles);
 const readKey = vi.mocked(readClaudeApiKey);
@@ -160,7 +165,10 @@ describe('utility one-shot candidates', () => {
       json: async () => ({ choices: [{ message: { content: 'lite text' } }] }),
     } as never);
 
-    const result = await requestUtilityText(maker, 'hello', { maxTokens: 10 });
+    const result = await requestUtilityText(maker, 'hello', {
+      maxTokens: 10,
+      reasoningEffort: 'low',
+    });
 
     expect(result).toMatchObject({
       ok: true,
@@ -168,6 +176,120 @@ describe('utility one-shot candidates', () => {
       providerId: 'litellm-gpt-5.4-mini',
       model: 'gpt-5.4-mini',
       transport: 'litellm-chat-completions',
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      max_tokens: 10,
+      reasoning_effort: 'low',
+    });
+  });
+
+  it('chat-completions 的 content 为 parts 数组时拼接文本段(思考模型形态)', async () => {
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: [{ type: 'text', text: '答' }, { type: 'text', text: '案' }] } }],
+      }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', { maxTokens: 10 });
+    expect(result).toMatchObject({ ok: true, text: '答案' });
+  });
+
+  it('parts 数组只拼正文段:reasoning/thinking 等带 text 的非正文段跳过,字符串元素直取', async () => {
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: [
+                { type: 'reasoning', text: '内部推理不给出' },
+                { type: 'text', text: '答' },
+                '字',
+                { text: '案' },
+                { type: 'tool_result', text: '工具输出不给出' },
+              ],
+            },
+          },
+        ],
+      }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', { maxTokens: 10 });
+    expect(result).toMatchObject({ ok: true, text: '答字案' });
+  });
+
+  it('parts 数组只有思考段(无正文)→ 如实 empty_response,不拿思维链冒充答案', async () => {
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: [{ type: 'reasoning', text: '在想…' }] }, finish_reason: 'length' }],
+      }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', { maxTokens: 10 });
+    expect(result).toMatchObject({ ok: false, reason: 'empty_response' });
+  });
+
+  it('思考烧光预算只留下 reasoning_content(content 空)→ 如实 empty_response,不拿思维链冒充答案', async () => {
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: '', reasoning_content: '在想…' }, finish_reason: 'length' }],
+      }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', { maxTokens: 10 });
+    expect(result).toMatchObject({ ok: false, reason: 'empty_response' });
+  });
+
+  it('pinnedProfileId 钉住某一档时只用它,绕开默认链', async () => {
+    // 默认链(mock)是 codex-mini + litellm-mini;钉 deepseek 应当完全绕开它们,
+    // 只解析出 deepseek 这一个候选(取自真实档位表,不受链 mock 影响)。
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'pinned text' } }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', {
+      maxTokens: 10,
+      pinnedProfileId: 'litellm-deepseek-v4-flash',
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      text: 'pinned text',
+      providerId: 'litellm-deepseek-v4-flash',
+      model: 'deepseek/deepseek-v4-flash',
+    });
+    // 钉住后链上的 mini 一次都不该被下单
+    expect(JSON.parse(String(vi.mocked(fetchMock).mock.calls[0]?.[1]?.body))).toMatchObject({
+      model: 'deepseek/deepseek-v4-flash',
+    });
+  });
+
+  it('不认的 pinnedProfileId 忽略,回落默认链', async () => {
+    readKey.mockReturnValue('proxy-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: 'chain text' } }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', {
+      maxTokens: 10,
+      pinnedProfileId: 'no-such-profile',
+    });
+
+    // 回落到链上第一个可用候选(codex 无凭证被跳过 → litellm-mini)
+    expect(result).toMatchObject({
+      ok: true,
+      providerId: 'litellm-gpt-5.4-mini',
+      model: 'gpt-5.4-mini',
     });
   });
 
@@ -357,6 +479,7 @@ describe('utility one-shot candidates', () => {
       providerId: 'chat-only',
       agentKind: 'codex',
       model: 'chat-model',
+      reasoningEffort: 'low',
     });
 
     expect(result).toMatchObject({
@@ -370,9 +493,91 @@ describe('utility one-shot candidates', () => {
     );
     expect(JSON.parse(String(vi.mocked(fetchMock).mock.calls[0]?.[1]?.body))).toMatchObject({
       model: 'chat-model',
+      reasoning_effort: 'low',
       messages: [{ role: 'user', content: 'generate' }],
     });
   });
+
+  it.each([
+    {
+      wireProtocol: 'openai-chat' as const,
+      endpoint: 'https://custom.example/v1/chat/completions',
+      reasoningField: 'reasoning_effort',
+      maxTokensField: 'max_tokens',
+      successBody: JSON.stringify({ choices: [{ message: { content: 'chat result' } }] }),
+    },
+    {
+      wireProtocol: 'openai-responses' as const,
+      endpoint: 'https://custom.example/v1/responses',
+      reasoningField: 'reasoning',
+      maxTokensField: 'max_output_tokens',
+      successBody: 'data: {"type":"response.output_text.delta","delta":"response result"}\ndata: [DONE]\n',
+    },
+  ])(
+    'retries a custom $wireProtocol route with a minimal body after an invalid-parameter response',
+    async ({ wireProtocol, endpoint, reasoningField, maxTokensField, successBody }) => {
+      activeCatalog.mockReturnValue({
+        providers: [{
+          id: 'custom-reasoning-unknown',
+          name: 'Custom Reasoning Unknown',
+          source: 'user',
+          agents: ['codex'],
+          auth: { method: 'apiKey' },
+          routing: {
+            codex: {
+              upstream: 'https://custom.example/v1',
+              wireProtocol,
+              authStrategy: 'api-key-header',
+            },
+          },
+          models: {
+            codex: [{ id: 'custom-model', name: 'Custom Model', contextWindow: 100_000 }],
+          },
+        }],
+      } as never);
+      readCustomKey.mockReturnValue('custom-secret');
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 400,
+          body: { cancel: vi.fn(async () => undefined) },
+        } as never)
+        .mockResolvedValueOnce({
+          ok: true,
+          text: async () => successBody,
+        } as never);
+
+      const result = await requestUtilityText(makerMock(false), 'generate', {
+        providerId: 'custom-reasoning-unknown',
+        agentKind: 'codex',
+        model: 'custom-model',
+        maxTokens: 384,
+        reasoningEffort: 'low',
+      });
+
+      expect(result).toMatchObject({ ok: true, providerId: 'custom-reasoning-unknown' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenNthCalledWith(1, endpoint, expect.anything());
+      expect(fetchMock).toHaveBeenNthCalledWith(2, endpoint, expect.anything());
+      const firstBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+      const retryBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+      expect(firstBody).toHaveProperty(reasoningField);
+      expect(firstBody).toHaveProperty(maxTokensField, 384);
+      expect(retryBody).not.toHaveProperty(reasoningField);
+      expect(retryBody).not.toHaveProperty(maxTokensField);
+      if (wireProtocol === 'openai-responses') {
+        expect(retryBody).toEqual({
+          model: 'custom-model',
+          input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'generate' }] }],
+        });
+      } else {
+        expect(retryBody).toEqual({
+          model: 'custom-model',
+          messages: [{ role: 'user', content: 'generate' }],
+        });
+      }
+    },
+  );
 
   it('uses an explicitly configured custom-provider request path', async () => {
     activeCatalog.mockReturnValue({
@@ -763,6 +968,171 @@ describe('utility one-shot candidates', () => {
     expect(init.headers['anthropic-version']).toBeUndefined();
   });
 
+  it('clamps the requested maxTokens to the catalog model maxOutput (Codex 2026-08-06)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'xd',
+        name: 'XD',
+        source: 'builtin',
+        agents: ['codex', 'claude-code'],
+        auth: { method: 'api-key' },
+        routing: {
+          codex: { upstream: 'https://xd.example/v1', authStrategy: 'api-key-header' },
+        },
+        models: { codex: [{ id: 'claude-opus-4-5', name: 'Opus', contextWindow: 100_000, maxOutput: 64_000 }] },
+      }],
+    } as never);
+    readKey.mockReturnValue('xd-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({ choices: [{ message: { content: 'ok' } }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', {
+      providerId: 'xd',
+      agentKind: 'codex',
+      model: 'claude-opus-4-5',
+      maxTokens: 81_920,
+    });
+
+    expect(result).toMatchObject({ ok: true, text: 'ok' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.max_tokens).toBe(64_000);
+  });
+
+  it('缺省不传 maxTokens 时,Anthropic wire 用模型目录 maxOutput 兜底(协议必填,非宿主上限)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'builtin',
+        agents: ['claude-code'],
+        auth: { method: 'oauth' },
+        routing: {
+          'claude-code': { upstream: 'https://anthropic.example/api/v1', authStrategy: 'oauth-passthrough' },
+        },
+        models: {
+          'claude-code': [{ id: 'claude-opus-4-5', name: 'Opus', contextWindow: 200_000, maxOutput: 64_000 }],
+        },
+      }],
+    } as never);
+    readClaudeOAuth.mockResolvedValue({ accessToken: 'anthropic-token' });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({ content: [{ type: 'text', text: 'script' }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', {
+      providerId: 'anthropic',
+      agentKind: 'claude-code',
+      model: 'claude-opus-4-5',
+    });
+
+    expect(result).toMatchObject({ ok: true, providerId: 'anthropic' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.max_tokens).toBe(64_000);
+  });
+
+  it('内置 Anthropic 直连:1M 目录模型的 body.model 用裸目录 id,不带 SDK 专用 [1m] 后缀(#2429)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'builtin',
+        agents: ['claude-code'],
+        auth: { method: 'oauth' },
+        routing: {
+          'claude-code': { upstream: 'https://anthropic.example/api/v1', authStrategy: 'oauth-passthrough' },
+        },
+        models: {
+          'claude-code': [{ id: 'claude-fable-5', name: 'Fable', contextWindow: 1_000_000, maxOutput: 64_000 }],
+        },
+      }],
+    } as never);
+    readClaudeOAuth.mockResolvedValue({ accessToken: 'anthropic-token' });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({ content: [{ type: 'text', text: 'verdict' }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'review this', {
+      providerId: 'anthropic',
+      agentKind: 'claude-code',
+      model: 'claude-fable-5',
+    });
+
+    expect(result).toMatchObject({ ok: true, providerId: 'anthropic' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.model).toBe('claude-fable-5');
+  });
+
+  it('toAnthropicApiModelId:剥掉尾部 [1m],其余 id 原样返回(防御显示 id 泄入)', () => {
+    expect(toAnthropicApiModelId('claude-opus-5[1m]')).toBe('claude-opus-5');
+    expect(toAnthropicApiModelId('claude-fable-5')).toBe('claude-fable-5');
+    expect(toAnthropicApiModelId('claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5-20251001');
+  });
+
+  it('内置 Anthropic 直连:非 1M 模型的 body.model 保持目录 id 不变(不回归)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'anthropic',
+        name: 'Anthropic',
+        source: 'builtin',
+        agents: ['claude-code'],
+        auth: { method: 'oauth' },
+        routing: {
+          'claude-code': { upstream: 'https://anthropic.example/api/v1', authStrategy: 'oauth-passthrough' },
+        },
+        models: {
+          'claude-code': [{ id: 'claude-haiku-4-5-20251001', name: 'Haiku', contextWindow: 200_000, maxOutput: 64_000 }],
+        },
+      }],
+    } as never);
+    readClaudeOAuth.mockResolvedValue({ accessToken: 'anthropic-token' });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({ content: [{ type: 'text', text: 'verdict' }] }),
+    } as never);
+
+    await requestUtilityText(makerMock(false), 'review this', {
+      providerId: 'anthropic',
+      agentKind: 'claude-code',
+      model: 'claude-haiku-4-5-20251001',
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body.model).toBe('claude-haiku-4-5-20251001');
+  });
+
+  it('缺省不传 maxTokens 时,xd wire 不发送输出上限(模型自然输出)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'xd',
+        name: 'XD',
+        source: 'builtin',
+        agents: ['codex'],
+        auth: { method: 'api-key' },
+        routing: { codex: { upstream: 'https://xd.example/v1', authStrategy: 'api-key-header' } },
+        models: { codex: [{ id: 'claude-sonnet-4-6', name: 'Sonnet', contextWindow: 100_000, maxOutput: 64_000 }] },
+      }],
+    } as never);
+    readKey.mockReturnValue('xd-key');
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      text: async () => JSON.stringify({ choices: [{ message: { content: 'ok' } }] }),
+    } as never);
+
+    const result = await requestUtilityText(makerMock(false), 'hello', {
+      providerId: 'xd',
+      agentKind: 'codex',
+      model: 'claude-sonnet-4-6',
+    });
+
+    expect(result).toMatchObject({ ok: true, text: 'ok' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body).not.toHaveProperty('max_tokens');
+  });
+
   it('routes a descriptor-backed no-auth builtin through the generic utility transport', async () => {
     activeCatalog.mockReturnValue({
       providers: [{
@@ -806,6 +1176,32 @@ describe('utility one-shot candidates', () => {
       expect.anything(),
     );
     expect(readCustomKey).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicit builtin provider whose routing is disabled (Codex 2026-08-06)', async () => {
+    activeCatalog.mockReturnValue({
+      providers: [{
+        id: 'xd',
+        name: 'XD',
+        source: 'builtin',
+        agents: ['codex', 'claude-code'],
+        auth: { method: 'api-key' },
+        routing: {
+          codex: { upstream: 'https://xd.example/v1', authStrategy: 'api-key-header', disabled: true },
+        },
+        models: { codex: [{ id: 'gpt-5.5', name: 'GPT 5.5', contextWindow: 100_000 }] },
+      }],
+    } as never);
+    readKey.mockReturnValue('xd-key');
+
+    const result = await requestUtilityText(makerMock(false), 'generate', {
+      providerId: 'xd',
+      agentKind: 'codex',
+      model: 'gpt-5.5',
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'no_candidate' });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('can infer a unique custom provider when an older caller omits providerId', async () => {
@@ -1074,12 +1470,16 @@ describe('utility one-shot candidates', () => {
       providerId: 'xd',
       agentKind: 'claude-code',
       model: 'gpt-5.5',
+      reasoningEffort: 'low',
     });
 
     expect(result).toMatchObject({ ok: true, providerId: 'xd', model: 'gpt-5.5' });
     expect(getProfiles).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledWith('https://gateway.test.invalid/v1/chat/completions', expect.anything());
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ model: 'gpt-5.5' });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      model: 'gpt-5.5',
+      reasoning_effort: 'low',
+    });
   });
 
   it('uses Anthropic OAuth and the selected Anthropic routing for an explicit builtin provider', async () => {
@@ -1114,7 +1514,9 @@ describe('utility one-shot candidates', () => {
     expect(fetchMock).toHaveBeenCalledWith('https://anthropic.example/api/v1/messages', expect.anything());
     const init = fetchMock.mock.calls[0]?.[1] as { headers: Record<string, string>; body: string };
     expect(init.headers.Authorization).toBe('Bearer anthropic-token');
-    expect(JSON.parse(init.body).model).toBe('claude-sonnet-4-6[1m]');
+    // [1m] 是 Claude Code SDK 的 beta 通道后缀,直连 /v1/messages 会 404(#2429):
+    // 直连请求体必须用目录裸 id。
+    expect(JSON.parse(init.body).model).toBe('claude-sonnet-4-6');
   });
 
   it('uses OpenAI Codex OAuth and strips the bridge model prefix on the selected route', async () => {
@@ -1139,12 +1541,20 @@ describe('utility one-shot candidates', () => {
       providerId: 'openai',
       agentKind: 'codex',
       model: 'chatgpt/gpt-5.5',
+      maxTokens: 384,
+      reasoningEffort: 'low',
     });
 
     expect(result).toMatchObject({ ok: true, providerId: 'openai', model: 'chatgpt/gpt-5.5' });
     expect(readCodexCreds).toHaveBeenCalledOnce();
     expect(fetchMock).toHaveBeenCalledWith('https://chatgpt.example/api/v1/responses', expect.anything());
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ model: 'gpt-5.5' });
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      model: 'gpt-5.5',
+      reasoning: { effort: 'low' },
+    });
+    // ChatGPT Codex returns HTTP 400 for this public Responses API field.
+    expect(body).not.toHaveProperty('max_output_tokens');
   });
 
   it('uses xAI OAuth and the selected xAI Responses route', async () => {
@@ -1169,10 +1579,47 @@ describe('utility one-shot candidates', () => {
       providerId: 'xai',
       agentKind: 'codex',
       model: 'xai/grok-4.3',
+      reasoningEffort: 'low',
     });
 
     expect(result).toMatchObject({ ok: true, providerId: 'xai', model: 'xai/grok-4.3' });
     expect(fetchMock).toHaveBeenCalledWith('https://xai.example/v1/responses', expect.anything());
-    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ model: 'grok-4.3' });
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      model: 'grok-4.3',
+      reasoning: { effort: 'low' },
+    });
   });
+
+  it.each(['xai/grok-code-fast', 'xai/grok-build-preview'])(
+    'omits reasoning for xAI model %s that rejects the field',
+    async (model) => {
+      activeCatalog.mockReturnValue({
+        providers: [{
+          id: 'xai',
+          name: 'xAI',
+          source: 'builtin',
+          agents: ['codex'],
+          auth: { method: 'oauth' },
+          routing: { codex: { upstream: 'https://xai.example/v1', authStrategy: 'provider-oauth-header' } },
+          models: { codex: [{ id: model, name: 'Grok Code', contextWindow: 256_000 }] },
+        }],
+      } as never);
+      readGrokToken.mockResolvedValue('xai-token');
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        text: async () => 'data: {"type":"response.output_text.delta","delta":"script"}\ndata: [DONE]\n',
+      } as never);
+
+      const result = await requestUtilityText(makerMock(false), 'generate', {
+        providerId: 'xai',
+        agentKind: 'codex',
+        model,
+        reasoningEffort: 'low',
+      });
+
+      expect(result).toMatchObject({ ok: true, providerId: 'xai', model });
+      const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+      expect(body).not.toHaveProperty('reasoning');
+    },
+  );
 });

@@ -13,7 +13,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { RpcClient, RpcClientError } from '../src/client.js';
 import { ManagerServer } from '../src/server.js';
-import { SessionRegistry, type SdkQueryFactory, type SdkQueryLike } from '../src/session-registry.js';
+import {
+  SessionRegistry,
+  type SdkQueryFactory,
+  type SdkQueryFactoryOptions,
+  type SdkQueryLike,
+} from '../src/session-registry.js';
 import { wireSdkHandlers } from '../src/sdk-handlers.js';
 import { NOTIFICATIONS } from '../src/protocol.js';
 
@@ -26,6 +31,7 @@ interface Ctx {
 }
 
 let ctx: Ctx | null = null;
+let latestFactoryOptions: SdkQueryFactoryOptions | null = null;
 
 function makeIpcPath(): string {
   const uniq = `cc-mgr-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -37,6 +43,7 @@ function makeIpcPath(): string {
 
 function buildFakeFactory(): SdkQueryFactory {
   return (opts): SdkQueryLike => {
+    latestFactoryOptions = opts;
     async function* gen(): AsyncGenerator<unknown> {
       yield {
         type: 'system',
@@ -44,6 +51,10 @@ function buildFakeFactory(): SdkQueryFactory {
         session_id: 'fake-sdk-uuid',
         cwd: opts.cwd,
         model: opts.model,
+        mcp_servers: Object.keys(opts.mcpServers ?? {}).map((name) => ({
+          name,
+          status: 'connected',
+        })),
       };
       for await (const userMsg of opts.inputStream) {
         yield {
@@ -60,6 +71,13 @@ function buildFakeFactory(): SdkQueryFactory {
       async setModel() {},
       async setPermissionMode() {},
       async applyFlagSettings() {},
+      async mcpServerStatus() {
+        return Object.keys(opts.mcpServers ?? {}).map((name) => ({
+          name,
+          status: 'connected',
+          scope: 'local',
+        }));
+      },
       async stopTask() {},
       async getContextUsage() {
         return {
@@ -82,6 +100,7 @@ function buildFakeFactory(): SdkQueryFactory {
 }
 
 beforeEach(async () => {
+  latestFactoryOptions = null;
   const socketPath = makeIpcPath();
   const registry = new SessionRegistry({ sdkQueryFactory: buildFakeFactory(), bufferCapacity: 2 });
   const server = new ManagerServer({
@@ -133,6 +152,23 @@ async function waitFor(
 }
 
 describe('sdk-handlers end-to-end', () => {
+  it('rewrites controller-local Claude config paths at the remote RPC boundary', async () => {
+    await ctx!.client.request('query/start', {
+      sessionId: 'remote-env',
+      cwd: '/Users/david/repo',
+      model: 'm',
+      env: {
+        ANTHROPIC_API_KEY: 'sk-gw',
+        CLAUDE_CONFIG_DIR: 'C:\\Users\\Admin\\AppData\\Roaming\\Cindy-dev2\\claude-home',
+      },
+    });
+
+    expect(latestFactoryOptions?.env).toEqual({
+      ANTHROPIC_API_KEY: 'sk-gw',
+      CLAUDE_CONFIG_DIR: expect.stringMatching(/\/.xdt-server\/v1\/claude-home$/),
+    });
+  });
+
   it('query/start returns sessionId + emits init notification', async () => {
     const result = await ctx!.client.request<{ sessionId: string }>('query/start', {
       sessionId: 'sess-1',
@@ -300,6 +336,95 @@ describe('sdk-handlers end-to-end', () => {
       expect(err).toBeInstanceOf(RpcClientError);
       expect((err as RpcClientError).rpcError.code).toBe('INVALID_PARAMS');
     }
+  });
+
+  it('query/start rejects routing guards with ambiguous plain-text selectors', async () => {
+    try {
+      await ctx!.client.request('query/start', {
+        sessionId: 's1',
+        cwd: '/a',
+        model: 'm',
+        env: {},
+        toolGuards: [
+          {
+            toolNamePrefix: 'mcp__plugin_guard__',
+            invocation: 'explicit-only',
+            explicitSelectors: ['Feishu Delegate'],
+          },
+        ],
+      });
+      throw new Error('expected rejection');
+    } catch (err) {
+      expect(err).toBeInstanceOf(RpcClientError);
+      expect((err as RpcClientError).rpcError.code).toBe('INVALID_PARAMS');
+    }
+  });
+
+  it('query/start rejects invalid routing guard prefixes', async () => {
+    for (const [index, toolNamePrefix] of ['   ', 'not-an-mcp-prefix'].entries()) {
+      try {
+        await ctx!.client.request('query/start', {
+          sessionId: `s-invalid-prefix-${index}`,
+          cwd: '/a',
+          model: 'm',
+          env: {},
+          toolGuards: [
+            {
+              toolNamePrefix,
+              invocation: 'disabled',
+            },
+          ],
+        });
+        throw new Error('expected rejection');
+      } catch (err) {
+        expect(err).toBeInstanceOf(RpcClientError);
+        expect((err as RpcClientError).rpcError.code).toBe('INVALID_PARAMS');
+      }
+    }
+  });
+
+  it('query/start normalizes routing guard identities before matching', async () => {
+    await ctx!.client.request('query/start', {
+      sessionId: 's1',
+      cwd: '/a',
+      model: 'm',
+      env: {},
+      toolGuards: [
+        {
+          toolNamePrefix: '  mcp__plugin_guard__  ',
+          sourceServerId: '  plugin:guard  ',
+          invocation: 'explicit-only',
+        },
+      ],
+    });
+    await waitFor(() => ctx!.notifications.length >= 1);
+
+    const preToolUse = latestFactoryOptions?.hooks?.PreToolUse?.[0]?.hooks[0];
+    expect(preToolUse).toBeDefined();
+    await expect(
+      preToolUse!({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'mcp__plugin_guard__call',
+      }),
+    ).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+  });
+
+  it('query/start accepts an exact root-only Orca tool guard', async () => {
+    await ctx!.client.request('query/start', {
+      sessionId: 's-root-only',
+      cwd: '/a',
+      model: 'm',
+      env: {},
+      toolGuards: [{
+        toolNamePrefix: 'mcp__orca_worker_bridge__send_to_lead',
+        sourceServerId: 'orca_worker_bridge',
+        invocation: 'root-only',
+      }],
+    });
+    await waitFor(() => ctx!.notifications.length >= 1);
+    expect(latestFactoryOptions?.hooks?.PreToolUse?.[0]?.hooks[0]).toBeDefined();
   });
 
   it('query/close ends consume loop → session.alive=false + closed notification', async () => {

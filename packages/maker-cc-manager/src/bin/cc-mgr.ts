@@ -20,6 +20,7 @@ import path from 'node:path';
 import { ManagerServer } from '../server.js';
 import { SessionRegistry, type SdkQueryFactoryOptions, type SdkQueryLike } from '../session-registry.js';
 import { wireSdkHandlers } from '../sdk-handlers.js';
+import { ensureRemoteClaudeConfigDir } from '../remote-claude-env.js';
 import { CC_MGR_BUNDLE_VERSION, PROTOCOL_VERSION, SERVER_METHODS, type ApprovalRequestParams, type ApprovalRequestResult, type OAuthRefreshParams, type OAuthRefreshResult } from '../protocol.js';
 
 const MANAGER_VERSION = CC_MGR_BUNDLE_VERSION;
@@ -294,6 +295,10 @@ async function runDaemon(socketPath: string): Promise<void> {
   if (stripped.length > 0) {
     console.error('[cc-mgr] stripped sensitive env keys at boot:', stripped.join(', '));
   }
+  // Keep all Cindy-managed Claude state outside the user's repository and
+  // outside the host's global ~/.claude directory. query/start independently
+  // overwrites the per-session env with the same daemon-owned path.
+  process.env.CLAUDE_CONFIG_DIR = ensureRemoteClaudeConfigDir();
 
   // Lazy import the SDK so --version doesn't pay the SDK load cost.
   const sdkModule = await import('@anthropic-ai/claude-agent-sdk');
@@ -304,7 +309,7 @@ async function runDaemon(socketPath: string): Promise<void> {
   //  inside the cindy-slack ghost's slack_call_tool.)
 
   const sdkQueryFactory = (opts: SdkQueryFactoryOptions): SdkQueryLike => {
-    const { inputStream, cwd, model, env, mcpServers, permissionMode, systemPrompt, additionalDirectories, allowedTools, disallowedTools, tools, resume, extraOptions, canUseTool, getOAuthToken } = opts;
+    const { inputStream, cwd, model, env, mcpServers, permissionMode, systemPrompt, additionalDirectories, allowedTools, disallowedTools, tools, resume, extraOptions, hooks, canUseTool, getOAuthToken } = opts;
     // SDK's `query` accepts `prompt: string | AsyncIterable<SDKUserMessage>`.
     // We pass our inputQueue (push-based AsyncIterable) so the SDK consumes
     // user messages on demand. SDK's options.* fields are typed strictly —
@@ -329,6 +334,9 @@ async function runDaemon(socketPath: string): Promise<void> {
         // control 分支)—— 与 desktop 本地分支同一注入方式,经 spread 绕过类型检查。
         ...(getOAuthToken ? { getOAuthToken: getOAuthToken as any } : {}),
         ...(extraOptions ?? {}),
+        // Daemon-owned hooks must win over JSON extraOptions. They enforce
+        // host routing before Claude's permission mode and setting rules.
+        ...(hooks ? { hooks: hooks as any } : {}),
       } as any,
     });
     /* eslint-enable @typescript-eslint/no-explicit-any */

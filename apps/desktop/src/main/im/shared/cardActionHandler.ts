@@ -18,14 +18,12 @@ import fs from 'node:fs';
 
 import type { ChannelIM, IMCardActionEvent } from '@cindy/im';
 import {
-  createSessionPermissionUpdate,
   hasSessionPermissionUpdates,
   type AgentKind,
   type Effort,
   type InteractionDecision,
   type PermissionMode,
 } from '@cindy/maker-core';
-import { requiresFullAccessConfirmation } from '@cindy/maker-shared/permission-mode';
 
 import { createLogger } from '../../logger';
 import { getMaker } from '../../maker-host';
@@ -74,7 +72,18 @@ import {
   updateModelEffort,
   updatePermissionMode,
 } from './sessionRepo';
+import { changeSessionPermissionMode } from './permissionModeControl';
 import type { ImCardBuilders } from './cardBuilders';
+import {
+  buildAskAnswerDecision,
+  buildPermissionAllowAlwaysDecision,
+  buildPermissionAllowOnceDecision,
+  buildPermissionDenyDecision,
+  buildPlanApproveDecision,
+  buildPlanDenyDecision,
+  PERMISSION_USER_DENIED_REASON,
+  PLAN_USER_REJECTED_REASON,
+} from './interactionCardModel';
 import type { ImTurnRunner } from './turnRunner';
 import type { ImChannelAdapter } from './types';
 
@@ -395,24 +404,17 @@ export function createCardActionHandler(
 
     // Validate against the bound agent's actual capabilities — single source of
     // truth is the agent module (e.g. claude-code/index.ts CLAUDE_PERMISSION_MODES).
-    const supportedIds = getMaker()
-      .getCapabilities(agentKind)
-      .permissionModes.map((m) => m.id);
-    if (!sessionId || !supportedIds.includes(mode)) {
-      log.warn(`permmode:pick missing/invalid sessionId=${sessionId} mode=${mode} — ignoring`);
-      return;
-    }
+    const result = await changeSessionPermissionMode({
+      sessionId,
+      mode,
+      modes: getMaker().getCapabilities(agentKind).permissionModes,
+      confirmedFullAccess: event.buttonId === 'permmode:confirm-full-access',
+      readPreviousMode: () => readPermissionMode(sessionId),
+      getLiveSession: () => turnRunner.getMakerSessionById(sessionId),
+      persist: (nextMode) => updatePermissionMode(sessionId, nextMode),
+    });
 
-    const previousMode = await readPermissionMode(sessionId);
-    if (!previousMode) {
-      log.warn(`permmode:pick session not found sessionId=${sessionId} — ignoring`);
-      return;
-    }
-
-    if (
-      event.buttonId === 'permmode:pick'
-      && requiresFullAccessConfirmation(previousMode, mode)
-    ) {
+    if (result.kind === 'confirmation-required') {
       try {
         await im.updateInteractiveCard(event.messageId, {
           title: ui.cards.permissionMode.fullAccessConfirmTitle,
@@ -439,28 +441,17 @@ export function createCardActionHandler(
       return;
     }
 
-    const live = turnRunner.getMakerSessionById(sessionId);
-    let runtimeChanged = false;
-    try {
-      if (live) {
-        await live.setPermissionMode(mode);
-        runtimeChanged = true;
-      }
-      await updatePermissionMode(sessionId, mode);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.error(`permmode:pick update failed: ${msg}`);
-      if (runtimeChanged && live) {
-        try {
-          await live.setPermissionMode(previousMode);
-        } catch (rollbackErr) {
-          log.warn(`permmode:pick runtime rollback failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`);
-        }
-      }
+    if (result.kind === 'invalid') {
+      log.warn(`permmode:pick invalid sessionId=${sessionId} mode=${mode}: ${result.reason}`);
+      return;
+    }
+
+    if (result.kind === 'failed') {
+      log.error(`permmode:pick update failed: ${result.reason}`);
       try {
         await im.updateInteractiveCard(
           event.messageId,
-          cards.buildResolvedCard(ui.cards.permissionMode.failed(msg)),
+          cards.buildResolvedCard(ui.cards.permissionMode.failed(result.reason)),
         );
       } catch {
         /* non-fatal: update failure is already logged */
@@ -468,7 +459,7 @@ export function createCardActionHandler(
       return;
     }
 
-    if (!live) {
+    if (!result.live) {
       log.info(`permmode:pick: no live session for ${sessionId.slice(-8)} — DB updated only`);
     }
     try {
@@ -1222,7 +1213,7 @@ export function createCardActionHandler(
     const requestId = String(p.requestId ?? '');
     switch (event.buttonId) {
       case 'permission:allow:once':
-        return { kind: 'permission', behavior: 'allow' };
+        return buildPermissionAllowOnceDecision();
       case 'permission:allow:always': {
         // "Allow always for this session": ask the SDK to add a session-scoped
         // allow rule for the same toolName so subsequent calls of the same tool
@@ -1233,26 +1224,16 @@ export function createCardActionHandler(
         if (!toolName) {
           // No toolName recoverable — degrade to plain allow (one-shot). User
           // sees the same outcome as "allow once" for this single call.
-          return { kind: 'permission', behavior: 'allow' };
+          return buildPermissionAllowOnceDecision();
         }
-        return {
-          kind: 'permission',
-          behavior: 'allow',
-          permissionUpdates: [
-            createSessionPermissionUpdate({
-              type: 'addRules',
-              rules: [{ toolName }],
-              behavior: 'allow',
-            }),
-          ],
-        };
+        return buildPermissionAllowAlwaysDecision(toolName);
       }
       case 'permission:deny':
-        return { kind: 'permission', behavior: 'deny', reason: 'user_denied' };
+        return buildPermissionDenyDecision(PERMISSION_USER_DENIED_REASON);
       case 'plan:approve':
-        return { kind: 'plan_review', behavior: 'allow' };
+        return buildPlanApproveDecision();
       case 'plan:reject':
-        return { kind: 'plan_review', behavior: 'deny', reason: 'user_rejected', dismissed: true };
+        return buildPlanDenyDecision(PLAN_USER_REJECTED_REASON);
       case 'ask:pick':
       case 'ask:noop': {
         // answers 的 key 必须是 question.question 全文 — SDK 用全文匹配
@@ -1262,7 +1243,7 @@ export function createCardActionHandler(
         // 历史 payload, 新卡片(cardBuilders.ts)总是带 questionText。
         const qKey = String(p.questionText ?? p.questionHeader ?? 'q');
         const label = String(p.optionLabel ?? '');
-        return { kind: 'ask_user_question', answers: { [qKey]: label } };
+        return buildAskAnswerDecision(qKey, label);
       }
       default:
         return null;
@@ -1387,6 +1368,9 @@ export function createCardActionHandler(
 
           const resolved = resolvePending(requestId, decision);
           if (!resolved) {
+            // 卡片正文**不动**: 交互被作废时 turnRunner 已经把它收口了(dropInteractionCard),
+            // 而这里拿不到的另一半原因是"刚刚已经成功处理过" —— 那种情况改写成过期态
+            // 等于把一次已经生效的授权报成失效。渠道侧的气泡提示已足够告知这次点击无效。
             log.warn(
               `no pending interaction for requestId=...${requestId.slice(-8)} (already resolved? user double-tapped?)`,
             );

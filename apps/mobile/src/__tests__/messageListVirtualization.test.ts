@@ -49,4 +49,28 @@ describe('mobile message list container', () => {
     expect(focusEffectSource).toContain('userScrollForOlderRef.current = true');
     expect(focusEffectSource).toContain('lastAutoLoadEarlierKeyRef.current = null');
   });
+
+  it('protects follow state while imperative scroll and verifies the cold-open anchor', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
+    expect(source).toContain('programmaticScrollInFlight: programmaticScrollInFlightRef.current');
+    expect(source).toContain('evaluateMobileAnchorVerify({');
+    expect(source).toContain('initialAnchorVerifyFrameRef');
+    expect(source).toContain('scrollToEndProgrammatically(false)');
+  });
+
+  it('measures every mounted shareable message, including expanded group children', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/session/MessageRenderer.tsx'), 'utf8');
+    const readerStart = source.indexOf('const readActuallyVisibleShareableMessageIds');
+    const readerEnd = source.indexOf('useEffect(() => {', readerStart);
+    const readerSource = source.slice(readerStart, readerEnd);
+
+    expect(source).toContain('shareableMessageViewsRef = useRef(new Map<string, View>())');
+    expect(source).toContain('onShareableMessageViewChange?: (clientId: string, view: View | null) => void');
+    expect(source).toContain('ref={shareableMessage ? handleShareableMessageViewChange : undefined}');
+    expect(readerSource).toContain('shareableMessageViewsRef.current.entries()');
+    expect(readerSource).not.toContain("token.item.type !== 'message'");
+    expect(source).toContain(
+      'itemVisiblePercentThreshold: MESSAGE_LIST_VISIBLE_PERCENT_THRESHOLD',
+    );
+  });
 });

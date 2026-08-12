@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePosixShell } from '../lib/posix-shell.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
@@ -54,8 +55,71 @@ function resolveRef(repoSlug, ref) {
     stdio: ['ignore', 'pipe', 'inherit'],
   }).trim();
 }
+/** Whether the `tar` on PATH is GNU tar (msys/GNU accept `--wildcards`;
+ * bsdtar/libarchive — the Windows/macOS system default — rejects it). */
+let gnuTarChecked = false;
+let gnuTar = false;
+function isGnuTar() {
+  if (!gnuTarChecked) {
+    gnuTarChecked = true;
+    try {
+      // Probe tar in the SAME environment that will execute it: on win32 the
+      // Node process PATH may resolve `tar` to System32\bsdtar while the Git
+      // sh resolves GNU tar — probing through the resolved sh keeps
+      // detection and execution consistent (Greptile P1 + codex-connector
+      // P1, round 4).
+      const sh = resolvePosixShell('sh');
+      if (!sh) throw new Error('no sh resolved');
+      gnuTar = /GNU tar/i.test(
+        execFileSync(sh, ['-c', 'tar --version'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }),
+      );
+    } catch {
+      gnuTar = false;
+    }
+  }
+  return gnuTar;
+}
 function shHide(cmd) {
-  execFileSync('sh', ['-c', cmd], { stdio: ['ignore', 'ignore', 'inherit'] });
+  // Windows (msys) compatibility ONLY. On win32, msys GNU tar treats `C:\`
+  // drive letters as remote hosts and does not glob by default, so quoted
+  // Windows paths are converted to /c/... and tar gets --wildcards. On POSIX
+  // (incl. macOS BSD/libarchive tar) the command runs UNCHANGED — no
+  // GNU-only flags are injected, so other platforms keep upstream behavior.
+  // Locate a real sh up front: on win32 the PATH may only contain Git\cmd
+  // (without Git\bin), so a bare `sh` would ENOENT — the repo resolver finds
+  // the Git-bundled sh.exe in standard install locations (codex-connector
+  // P1, round 3). Non-win32 callers keep using their normal PATH ('sh').
+  const sh = resolvePosixShell('sh');
+  if (!sh) {
+    throw new Error(
+      'sync: could not locate a usable sh (Git for Windows not detected). ' +
+        'Install Git for Windows and retry.',
+    );
+  }
+  if (process.platform !== 'win32') {
+    execFileSync(sh, ['-c', cmd], { stdio: ['ignore', 'ignore', 'inherit'] });
+    return;
+  }
+  // Inject --wildcards ONLY when the resolved tar is actually GNU tar: on
+  // win32 the PATH may resolve to the system bsdtar, which treats unsupported
+  // options as fatal errors (Greptile P1 round 1). bsdtar matches extraction
+  // paths as shell-style patterns natively, so no flag is needed there.
+  const wildcards = isGnuTar() ? ' --wildcards' : '';
+  const toMsys = (p) =>
+    p
+      // Collapse JSON-escaped double backslashes FIRST: converting each `\\`
+      // separately would emit doubled separators like /c//Users//foo
+      // (Copilot P1, round 2).
+      .replace(/\\\\/g, '\\')
+      .replace(/^([A-Za-z]):[\\/]/, (_, d) => `/${d.toLowerCase()}/`)
+      .replace(/\\/g, '/');
+  const posix = cmd
+    .replace(/"((?:[A-Za-z]:)?[^"]*)"/g, (m, p) => JSON.stringify(toMsys(p)))
+    .replace(/(^|\s)tar(\s)/g, `$1tar${wildcards}$2`);
+  execFileSync(sh, ['-c', posix], { stdio: ['ignore', 'ignore', 'inherit'] });
 }
 
 /**
@@ -126,7 +190,9 @@ function computeLeafClosure(repoTmp) {
     }
   }
   for (const s of SEEDS) walk(path.join(repoTmp, s));
-  return [...visited].map((f) => path.relative(repoTmp, f)).sort();
+  // Normalize separators: on win32 path.relative emits '\', and the 'src/'
+  // prefix filter below is POSIX-separator based.
+  return [...visited].map((f) => path.relative(repoTmp, f).split(path.sep).join('/')).sort();
 }
 
 /** Rewrite all bare/aliased imports for a generated file at `genRelFromGenRoot`. */
@@ -183,6 +249,84 @@ function header(srcLabel) {
  */
 const LOCAL_PATCHES = {
   'extension/src/browser/config.ts': [
+    {
+      desc: 'preserve narrow fake-IP SSRF allowances from the host config without enabling general private-network access',
+      find: `function resolveBrowserSsrFPolicy(cfg: BrowserConfig | undefined): SsrFPolicy | undefined {
+  const rawPolicy = cfg?.ssrfPolicy as BrowserSsrFPolicyCompat | undefined;
+  const allowPrivateNetwork = rawPolicy?.allowPrivateNetwork;
+  const dangerouslyAllowPrivateNetwork = rawPolicy?.dangerouslyAllowPrivateNetwork;
+  const allowedHostnames = normalizeStringList(rawPolicy?.allowedHostnames);
+  const hostnameAllowlist = normalizeStringList(rawPolicy?.hostnameAllowlist);
+  const hasExplicitPrivateSetting =
+    allowPrivateNetwork !== undefined || dangerouslyAllowPrivateNetwork !== undefined;
+  const resolvedAllowPrivateNetwork =
+    dangerouslyAllowPrivateNetwork === true || allowPrivateNetwork === true;
+
+  if (
+    !resolvedAllowPrivateNetwork &&
+    !hasExplicitPrivateSetting &&
+    !allowedHostnames &&
+    !hostnameAllowlist
+  ) {
+    // Keep the default policy object present so CDP guards still enforce
+    // fail-closed private-network checks on unconfigured installs.
+    return {};
+  }
+
+  return {
+    ...(resolvedAllowPrivateNetwork ||
+    dangerouslyAllowPrivateNetwork === false ||
+    allowPrivateNetwork === false
+      ? { dangerouslyAllowPrivateNetwork: resolvedAllowPrivateNetwork }
+      : {}),
+    ...(allowedHostnames ? { allowedHostnames } : {}),
+    ...(hostnameAllowlist ? { hostnameAllowlist } : {}),
+  };
+}`,
+      replace: `function resolveBrowserSsrFPolicy(cfg: BrowserConfig | undefined): SsrFPolicy | undefined {
+  const rawPolicy = cfg?.ssrfPolicy as BrowserSsrFPolicyCompat | undefined;
+  const allowPrivateNetwork = rawPolicy?.allowPrivateNetwork;
+  const dangerouslyAllowPrivateNetwork = rawPolicy?.dangerouslyAllowPrivateNetwork;
+  // LOCAL PATCH (Cindy, via sync.mjs): upstream's config resolver currently
+  // drops the narrow fake-IP allowances even though the SSRF layer supports
+  // them. Preserve explicit booleans so hosts can allow only proxy fake-IP
+  // ranges without disabling protection for metadata, link-local, or RFC1918.
+  const allowRfc2544BenchmarkRange = rawPolicy?.allowRfc2544BenchmarkRange;
+  const allowIpv6UniqueLocalRange = rawPolicy?.allowIpv6UniqueLocalRange;
+  const allowedHostnames = normalizeStringList(rawPolicy?.allowedHostnames);
+  const hostnameAllowlist = normalizeStringList(rawPolicy?.hostnameAllowlist);
+  const hasExplicitPrivateSetting =
+    allowPrivateNetwork !== undefined || dangerouslyAllowPrivateNetwork !== undefined;
+  const hasExplicitFakeIpSetting =
+    allowRfc2544BenchmarkRange !== undefined || allowIpv6UniqueLocalRange !== undefined;
+  const resolvedAllowPrivateNetwork =
+    dangerouslyAllowPrivateNetwork === true || allowPrivateNetwork === true;
+
+  if (
+    !resolvedAllowPrivateNetwork &&
+    !hasExplicitPrivateSetting &&
+    !hasExplicitFakeIpSetting &&
+    !allowedHostnames &&
+    !hostnameAllowlist
+  ) {
+    // Keep the default policy object present so CDP guards still enforce
+    // fail-closed private-network checks on unconfigured installs.
+    return {};
+  }
+
+  return {
+    ...(resolvedAllowPrivateNetwork ||
+    dangerouslyAllowPrivateNetwork === false ||
+    allowPrivateNetwork === false
+      ? { dangerouslyAllowPrivateNetwork: resolvedAllowPrivateNetwork }
+      : {}),
+    ...(allowRfc2544BenchmarkRange !== undefined ? { allowRfc2544BenchmarkRange } : {}),
+    ...(allowIpv6UniqueLocalRange !== undefined ? { allowIpv6UniqueLocalRange } : {}),
+    ...(allowedHostnames ? { allowedHostnames } : {}),
+    ...(hostnameAllowlist ? { hostnameAllowlist } : {}),
+  };
+}`,
+    },
     {
       desc: 'skip upstream auto-injected "openclaw"/"user" profiles when the host provides its own (avoids CDP port 18800 collision with the managed profile + never drives the user\'s Chrome)',
       find:
@@ -241,6 +385,10 @@ function applyLocalPatches(relDest, raw) {
 }
 
 function writeGen(relDest, raw, srcLabel, hashes, appliedPatches) {
+  // Normalize to POSIX separators: LOCAL_PATCHES keys and the lock's patch
+  // records use '/', but path.join on win32 emits '\' — without this the
+  // patches silently never match on Windows.
+  relDest = relDest.replace(/\\/g, '/');
   const { patched, applied } = applyLocalPatches(relDest, raw);
   if (appliedPatches) appliedPatches.push(...applied);
   const dest = path.join(genRoot, relDest);

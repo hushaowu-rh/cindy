@@ -9,7 +9,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  resolveLastUserMessageObservation,
   resolveNearBottomOnScroll,
+  resolveRenderPinDecision,
+  selectTailUserMessageId,
   shouldUnpinOnUpIntent,
   shouldUnpinOnWheel,
   UNPIN_MIN_SCROLLABLE_PX,
@@ -163,5 +166,103 @@ describe('resolveNearBottomOnScroll', () => {
         scrollDelta: 400,
       }),
     ).toBe(true);
+  });
+});
+
+describe('resolveRenderPinDecision', () => {
+  it('explicit tail send takes ownership from a restored history anchor', () => {
+    expect(resolveRenderPinDecision({
+      restoring: true,
+      newUserSend: true,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: true, pinToBottom: true });
+  });
+
+  it('restored history remains anchored until an explicit user send', () => {
+    expect(resolveRenderPinDecision({
+      restoring: true,
+      newUserSend: false,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: false, pinToBottom: false });
+  });
+
+  it('keeps ordinary near-bottom auto-follow behavior', () => {
+    expect(resolveRenderPinDecision({
+      restoring: false,
+      newUserSend: false,
+      nearBottom: true,
+    })).toEqual({ clearRestoring: false, pinToBottom: true });
+    expect(resolveRenderPinDecision({
+      restoring: false,
+      newUserSend: false,
+      nearBottom: false,
+    })).toEqual({ clearRestoring: false, pinToBottom: false });
+  });
+});
+
+describe('selectTailUserMessageId', () => {
+  type Item = { type: 'message'; id: string; role: 'user' | 'assistant' };
+  const userMessageId = (item: Item | undefined) =>
+    item?.role === 'user' ? item.id : null;
+
+  it('uses the real tail when a bounded window does not cover the end', () => {
+    expect(
+      selectTailUserMessageId({
+        windowCoversEnd: false,
+        visibleLastItem: { type: 'message', id: 'old-user', role: 'user' },
+        realLastItem: { type: 'message', id: 'new-user', role: 'user' },
+        userMessageId,
+      }),
+    ).toBe('new-user');
+  });
+
+  it('ignores an older visible-tail user when the real tail is assistant', () => {
+    expect(
+      selectTailUserMessageId({
+        windowCoversEnd: false,
+        visibleLastItem: { type: 'message', id: 'old-user', role: 'user' },
+        realLastItem: { type: 'message', id: 'assistant-tail', role: 'assistant' },
+        userMessageId,
+      }),
+    ).toBeNull();
+  });
+
+  it('uses the visible tail when the window covers the end', () => {
+    expect(
+      selectTailUserMessageId({
+        windowCoversEnd: true,
+        visibleLastItem: { type: 'message', id: 'visible-user', role: 'user' },
+        realLastItem: { type: 'message', id: 'visible-user', role: 'user' },
+        userMessageId,
+      }),
+    ).toBe('visible-user');
+  });
+});
+
+describe('resolveLastUserMessageObservation', () => {
+  it('seeds a restored user tail hydrated after mount without treating it as a send', () => {
+    expect(
+      resolveLastUserMessageObservation({
+        restoring: true,
+        tailUserMessageId: 'historical-user',
+        previousTailUserMessageId: null,
+      }),
+    ).toEqual({
+      baselineUserMessageId: 'historical-user',
+      isNewUserSend: false,
+    });
+  });
+
+  it('still detects a later user send after the restored baseline', () => {
+    expect(
+      resolveLastUserMessageObservation({
+        restoring: true,
+        tailUserMessageId: 'new-user',
+        previousTailUserMessageId: 'historical-user',
+      }),
+    ).toEqual({
+      baselineUserMessageId: 'historical-user',
+      isNewUserSend: true,
+    });
   });
 });

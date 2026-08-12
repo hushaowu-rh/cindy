@@ -352,6 +352,7 @@ describe('inputProjection', () => {
       queueAbortPending: true,
       error: 'failed',
       errorRetryText: 'retry',
+      autoResumePending: { error: 'socket hang up', attempt: 2, maxAttempts: 5, sessionTotal: 3 },
     });
 
     expect(projection).toMatchObject({
@@ -365,6 +366,32 @@ describe('inputProjection', () => {
       queueAbortPending: true,
       error: 'failed',
       errorRetryText: 'retry',
+      autoResumePending: { error: 'socket hang up', attempt: 2, maxAttempts: 5, sessionTotal: 3 },
+    });
+  });
+
+  it('distinguishes supported, legacy, and not-yet-received continuation ownership', () => {
+    expect(normalizeInputProjection(undefined)).toMatchObject({
+      continuationTurnClientId: null,
+      continuationInFlightProjectionCapability: 'unknown',
+    });
+    expect(normalizeInputProjection({ sessionId: 'legacy' })).toMatchObject({
+      continuationTurnClientId: null,
+      continuationInFlightProjectionCapability: 'legacy',
+    });
+    expect(normalizeInputProjection({
+      sessionId: 'supported-null',
+      continuationTurnClientId: null,
+    })).toMatchObject({
+      continuationTurnClientId: null,
+      continuationInFlightProjectionCapability: 'supported',
+    });
+    expect(normalizeInputProjection({
+      sessionId: 'supported-owner',
+      continuationTurnClientId: 'resume-1',
+    })).toMatchObject({
+      continuationTurnClientId: 'resume-1',
+      continuationInFlightProjectionCapability: 'supported',
     });
   });
 

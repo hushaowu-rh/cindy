@@ -3,16 +3,155 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildModelsSyncRequest,
   ensureCredentialsReadyForModelsRefresh,
+  parseModelsSyncPayload,
   withModelsSyncOverallDeadline,
   waitForModelsSyncRefresh,
   XD_MODELS_SYNC_TIMEOUT_MS,
   type ModelsSyncFlightSnapshot,
 } from '../modelsSyncRefresh.js';
 
+describe('parseModelsSyncPayload', () => {
+  const baseModel = {
+    id: 'deepseek/deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro',
+    contextWindow: 128_000,
+    currency: 'CNY' as const,
+    agents: ['claude-code', 'codex'] as const,
+    mode: 'chat',
+    icon: 'deepseek',
+    modalities: { input: ['text'], output: ['text'] },
+  };
+
+  it('does not downgrade a v3 sync request to a v1 response', () => {
+    expect(parseModelsSyncPayload({ schemaVersion: 1, models: [baseModel] })).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it('does not downgrade a v3 sync request to a v2 response', () => {
+    const model = {
+      ...baseModel,
+      newSessionDefault: ['claude-code', 'codex'] as const,
+    };
+    expect(parseModelsSyncPayload({ schemaVersion: 2, models: [model] })).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it('rejects a legacy v2 model even when its optional fields remain parseable', () => {
+    const { currency: _currency, ...modelWithoutCurrency } = baseModel;
+
+    expect(
+      parseModelsSyncPayload({ schemaVersion: 2, models: [modelWithoutCurrency] }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it('rejects all v2 shapes rather than re-enabling legacy model fallbacks', () => {
+    const { agents: _agents, ...modelWithoutAgents } = baseModel;
+    const legacyModel = { ...modelWithoutAgents, defaultEffort: null } as const;
+    const modelWithOverride = {
+      ...baseModel,
+      defaultEffort: null,
+      perAgent: { codex: { defaultEffort: null } },
+    } as const;
+
+    expect(parseModelsSyncPayload({ schemaVersion: 2, models: [legacyModel] })).toMatchObject({
+      ok: false,
+    });
+    expect(parseModelsSyncPayload({ schemaVersion: 2, models: [modelWithOverride] })).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it.each([
+    {
+      label: 'unknown schema version',
+      payload: { schemaVersion: 4, models: [baseModel] },
+      errorPath: 'response.schemaVersion',
+    },
+    {
+      label: 'v2-only field in v1',
+      payload: {
+        schemaVersion: 1,
+        models: [{ ...baseModel, newSessionDefault: ['claude-code'] }],
+      },
+      errorPath: 'response.models[0].newSessionDefault',
+    },
+    {
+      label: 'unknown v2 entry field',
+      payload: {
+        schemaVersion: 2,
+        models: [{ ...baseModel, family: 'deepseek' }],
+      },
+      errorPath: 'response.models[0].family',
+    },
+    {
+      label: 'default marker outside live agents',
+      payload: {
+        schemaVersion: 2,
+        models: [{ ...baseModel, agents: ['claude-code'], newSessionDefault: ['codex'] }],
+      },
+      errorPath: 'response.models[0].newSessionDefault',
+    },
+  ])(
+    'rejects $label so the caller keeps its last-known-good snapshot',
+    ({ payload, errorPath }) => {
+      const parsed = parseModelsSyncPayload(payload);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) throw new Error('unreachable');
+      expect(parsed.error).toContain(errorPath);
+    },
+  );
+
+  it('leaves the caller-owned last-known-good snapshot untouched on rejection', () => {
+    const lastKnownGood = [{ id: 'last-known-model' }];
+    const parsed = parseModelsSyncPayload({ schemaVersion: 99, models: [] });
+    const effectiveModels = parsed.ok ? parsed.models : lastKnownGood;
+
+    expect(effectiveModels).toBe(lastKnownGood);
+    expect(lastKnownGood).toEqual([{ id: 'last-known-model' }]);
+  });
+
+  it('reads v3 Pi routing and filters future agent kinds without rejecting the catalog', () => {
+    const payload = {
+      schemaVersion: 3,
+      models: [
+        {
+          ...baseModel,
+          agents: ['claude-code', 'codex', 'pi', 'future-agent'],
+          newSessionDefault: ['pi', 'future-agent'],
+          perAgent: {
+            'claude-code': { wireProtocol: 'anthropic-messages' },
+            codex: { wireProtocol: 'openai-responses' },
+            pi: { wireProtocol: 'openai-responses' },
+            'future-agent': { arbitrary: true },
+          },
+        },
+      ],
+    };
+
+    expect(parseModelsSyncPayload(payload)).toEqual({
+      ok: true,
+      models: [
+        {
+          ...baseModel,
+          agents: ['claude-code', 'codex', 'pi'],
+          newSessionDefault: ['pi'],
+          perAgent: {
+            'claude-code': { wireProtocol: 'anthropic-messages' },
+            codex: { wireProtocol: 'openai-responses' },
+            pi: { wireProtocol: 'openai-responses' },
+          },
+        },
+      ],
+    });
+  });
+});
+
 describe('waitForModelsSyncRefresh', () => {
   it('gives the shared XD model-list request a finite deadline', () => {
     expect(buildModelsSyncRequest('https://model-access.example.com')).toEqual({
-      path: '/api/model-access/models',
+      path: '/api/model-access/models?schemaVersion=3',
       options: {
         baseUrl: 'https://model-access.example.com',
         timeoutMs: 20_000,
@@ -30,9 +169,7 @@ describe('waitForModelsSyncRefresh', () => {
     if (typeof request.options.baseUrl !== 'function') {
       throw new Error('expected a live endpoint resolver');
     }
-    expect(request.options.baseUrl()).toBe(
-      'https://model-access.global.example.com',
-    );
+    expect(request.options.baseUrl()).toBe('https://model-access.global.example.com');
   });
 
   it('bounds the complete fetch lifecycle without cancelling the underlying auth refresh', async () => {
@@ -134,7 +271,9 @@ describe('waitForModelsSyncRefresh', () => {
 
   it('stops instead of following a new account when auth changes in flight', async () => {
     let resolveFlight!: () => void;
-    const flight = new Promise<void>((resolve) => { resolveFlight = resolve; });
+    const flight = new Promise<void>((resolve) => {
+      resolveFlight = resolve;
+    });
     let generation = 7;
     const outcome = waitForModelsSyncRefresh({
       expectedGeneration: 7,

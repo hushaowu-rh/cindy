@@ -25,6 +25,7 @@ import * as path from 'node:path';
 import matter from 'gray-matter';
 
 import {
+  CURATED_MEMORY_TYPES,
   DEFAULT_MEMORY_CONFIG,
   isMemoryType,
   MemoryError,
@@ -93,11 +94,43 @@ export function memoryScopeDirName(scopeKey: string): string {
   return `ssh-${sanitizeWorkdir(hostSegment).slice(0, 24)}-${digest}`;
 }
 
-/** filename = `<type>_<slug>.md` */
+/** filename = `<type>_<slug>.md`; slug 误带 `<type>_` 前缀会被拒绝 (见 validateNoTypePrefix) */
 export function buildFilename(type: MemoryType, slug: string): string {
+  validateNoTypePrefix(type, slug);
   return `${type}_${slug}${SHARD_EXT}`;
 }
 
+/**
+ * 拒绝 slug 上误带的 `<type>_` 前缀 — memory_write 的调用方 (LLM) 常把 type
+ * 写进 name, 造成 `feedback_feedback_foo.md` 双前缀分片 (#1652 附带 bug, #205 审计亦命中)。
+ * **只报错不剥离**: 剥离会让存量双前缀分片在 update/append/consolidate 时定位错位 —
+ * parseFilename 把 `feedback_feedback_foo.md` 的 slug 解析为 `feedback_foo`, 剥离后
+ * 定位到 `feedback_foo.md`, 造成 not-found 或静默修改错误分片。报错让调用方传纯 slug,
+ * 存量双前缀分片由一次性改名/去重迁移清理 (另行处理)。
+ */
+function validateNoTypePrefix(type: MemoryType, slug: string): void {
+  if (slug === type) {
+    throw new MemoryError(
+      'invalid-slug',
+      `slug 不能等于 type 名 "${type}", 请传纯 slug (如 "${type}-brief")`,
+    );
+  }
+  if (slug.startsWith(`${type}_`)) {
+    throw new MemoryError(
+      'invalid-slug',
+      `slug "${slug}" 已带 type 前缀 "${type}_", 请传纯 slug (如 "${stripAllTypePrefixes(type, slug) || type + '-brief'}")`,
+    );
+  }
+}
+
+/** 剥掉 slug 上所有重复的 `<type>_` 前缀 — 错误信息示例必须本身可通过校验 */
+function stripAllTypePrefixes(type: MemoryType, slug: string): string {
+  let out = slug;
+  while (out.startsWith(`${type}_`)) {
+    out = out.slice(type.length + 1);
+  }
+  return out;
+}
 /** 解析 filename 反推 type + slug, 不匹配返 null */
 export function parseFilename(filename: string): { type: MemoryType; slug: string } | null {
   if (!filename.endsWith(SHARD_EXT)) return null;
@@ -321,8 +354,11 @@ export class MemoryStorage {
     if (records.length === 0) {
       lines.push('_(empty — no memories saved yet for this workdir)_', '');
     } else {
-      // 固定顺序 user → feedback → project → reference
-      for (const type of ['user', 'feedback', 'project', 'reference'] as MemoryType[]) {
+      // 固定顺序 user → feedback → project → reference。**只列 curated 类型** ——
+      // `digest`(系统内部,如 pi 压缩摘要)故意排除:进 FTS 可 memory_search,但不进
+      // MEMORY.md、不进 system prompt(见 types.ts MEMORY_TYPES 注释)。新增 curated
+      // 类型时改 CURATED_MEMORY_TYPES;不要把 digest 加进来。
+      for (const type of CURATED_MEMORY_TYPES) {
         const items = grouped.get(type);
         if (!items || items.length === 0) continue;
         lines.push(`## ${type}`);

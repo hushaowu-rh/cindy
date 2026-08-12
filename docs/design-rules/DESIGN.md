@@ -73,11 +73,12 @@ Small interactive chips (button backgrounds, tag pills, avatar fills, selected-n
 The grayscale rule is near-absolute. The following are the **only** sanctioned non-gray colors in the system — each tightly scoped to a specific surface. New semantic colors must not be introduced without being recorded here first.
 
 - **Focus Blue** (`#417CDD` at 50%; tokens `--focus-ring` / `--focus-ring-soft`): the keyboard-accessibility focus ring, finalized 2026-07-17 (replaces Tailwind's default `#3b82f6`). Never visible in normal interaction flow.
-- **Thinking / Warning Orange** (`#EA6B17`, finalized 2026-07-17, replaces the frozen `#FF6600`): the shared warning-accent family, identical in both modes. Sanctioned consumers only — the ChatView Running Status Bar (sparkles icon + status text, e.g. `Spelunking...`, no background fill), running-state breathing icons in the sidebar, the collaboration toggle ON state, the plan-approve icon, the Full Access permission highlight, the settings integration warning, and the workflow agent status strip's running cells (8×8px filled squares in the background-tasks panel detail and the workflow chat card, registered 2026-07-28 — running-state semantics, same family as the sidebar breathing icons; the done/failed/queued cells stay on their own semantic tokens: `--card-status-done` / `--error-fg` / `--surface-chip`) (see the §10 exemption table and §15 for the full token list: `--warning-accent` and its follower tokens). A consumer that introduces no new token — one that reads `--warning-accent` or an existing follower directly, like this strip — is registered by this list alone; a consumer needing a NEW token must be registered in the §10 exemption table first.
+- **Thinking / Warning Orange** (`#EA6B17`, finalized 2026-07-17, replaces the frozen `#FF6600`): the shared warning-accent family, identical in both modes. Sanctioned consumers only — the ChatView Running Status Bar (sparkles icon + status text, e.g. `Spelunking...`, no background fill), running-state breathing icons in the sidebar, the collaboration-mode menu row's ON state, the plan-approve icon, the Full Access permission highlight, the settings integration warning, and the workflow agent status strip's running cells (8×8px filled squares in the background-tasks panel detail and the workflow chat card, registered 2026-07-28 — running-state semantics, same family as the sidebar breathing icons; the done/failed/queued cells stay on their own semantic tokens: `--card-status-done` / `--error-fg` / `--surface-chip`) (see the §10 exemption table and §15 for the full token list: `--warning-accent` and its follower tokens). A consumer that introduces no new token — one that reads `--warning-accent` or an existing follower directly, like this strip — is registered by this list alone; a consumer needing a NEW token must be registered in the §10 exemption table first.
 
 > **Additional narrowly-scoped exceptions** (documented in their respective component specs, do NOT generalize as system semantic colors):
 >
 > - **Toast Info / Success / Warning / Error** — `#417CDD` / `#2AAE5B` / `#F3A115` / `#D91F37`(finalized 2026-07-17; Toast exemption lifted) — used ONLY on the 16×16 lucide icon inside Toast pill notifications. The pill body (background, text, border, close icon) remains strictly grayscale. Info blue #417CDD equals the focus-ring / Auto Approval value (originally #3B82F6, added 2026-07-14, now finalized); success/warning/error equal the global status colors (done green / status error / warning foreground).
+> - **Resource Usage Process Categories** — the Resource Usage table may color only its 14px process-type glyphs so dense rows can be scanned by category (user-requested 2026-08-06). The six category pairs are task Agent blue `#2563EB / #60A5FA`, Agent service purple `#7C3AED / #A78BFA`, main-process pink `#DB2777 / #F472B6`, renderer cyan `#0891B2 / #22D3EE`, GPU amber `#D97706 / #F59E0B`, and utility green `#059669 / #34D399` (Light / Dark). These colors encode process category, **not health or status**; row backgrounds, labels, metrics, selection and actions remain on the neutral system. Scope is strictly `resource-usage` process glyphs and must not be generalized to other tables or process UI. Tokens: `--process-agent-task-icon`, `--process-agent-service-icon`, `--process-main-icon`, `--process-renderer-icon`, `--process-gpu-icon`, `--process-utility-icon`.
 > - **ConfirmDialog Danger** — `#EF4444` used ONLY on the confirm button background in the Danger variant. The cancel button and rest of the dialog remain grayscale.
 > - **Permission Selector Mode Highlights** — selected risky permission modes may color only the option text/icon/checkmark and the collapsed trigger text/icon. The selected row background remains grayscale. Auto Approval uses `#417CDD` in both modes (finalized 2026-07-17, same value light/dark; replaces light #000050 / dark #00D9C5). Full Access uses Heart Orange `#EA6B17` in both modes (auto-follows warning-accent, finalized 2026-07-17). These hex values are the **default-theme palette only** — other themes may override `--perm-auto-selected-text` and `--perm-bypass-selected-text` with their own accent colors, provided both modes remain color-coded, distinguishable from each other, and visually distinct from neutral text. Tokens: `--perm-auto-selected-text` and `--perm-bypass-selected-text` in `apps/desktop/src/renderer/styles/globals.css`.
 > - **Diff Add Green / Diff Del Red** — GitHub-standard diff syntax colors, used on the `+` / `-` symbol glyph, the changed-line text foreground, **and the full row background** inside code-diff renderings. Applied in three places: (1) the Edit-tool DiffView card (F-MSG-6), (2) markdown ````diff` fenced code blocks in the message stream, and (3) `.diff` / `.patch` files opened in TextLightbox (the document previewer) — there hljs `.hljs-addition` / `.hljs-deletion` are forced `display: block` so the background fills to the right edge instead of stopping at the last glyph. Line-number gutter and ctx (unchanged) lines remain strictly grayscale per the layer system. **Foreground** — Add: `#22863a` Light / `#7ee787` Dark; Del: `#b31d28` Light / `#ff7b72` Dark. **Background** — Add: `#f0fff4` Light / `#033a16` Dark; Del: `#ffeef0` Light / `#67060c` Dark. Tokens: `--diff-add-fg/-bg` and `--diff-del-fg/-bg` in `apps/desktop/src/renderer/styles/globals.css`. Updated 2026-04-21: backgrounds switched from grayscale → GitHub red/green for full-row fill so additions / deletions are unambiguous at a glance.
@@ -87,6 +88,7 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 ### Gradient System
 
 - **None in the core UI.** Cindy uses no gradients; visual separation comes from flat color blocks and single-pixel borders. This is a deliberate, almost philosophical design choice. (The login canvas is also flat by ruling — see §16.5.)
+- **Session-loading wordmark sheen — narrow functional exception (Desktop approved 2026-08-10).** `BrandLoadingMark` may use one neutral `transparent → --text-primary → transparent` gradient solely as a mask-clipped highlight inside the official Light/Dark wordmark while a session's message tree is deferred. It is a loading-progress signal, not a background, separator, fill, or reusable surface treatment. It may appear only after the 200ms delayed-reveal threshold, disappears as soon as the message tree mounts, and may not leak to messages, cards, dialogs, sidebars, or static branding. Full motion and brand-surface constraints are registered in §14.4 and §15.7.
 
 ## 3. Typography Rules
 
@@ -104,26 +106,76 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 | --------------- | -------------- | -------------- | ------- | ------------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Display / Hero  | Inter          | 48px (3rem)    | 500     | 1.00 (tight) | normal                                 | Maximum impact headline                                                                                                                                                                                                                                      |
 | Section Heading | Inter          | 36px (2.25rem) | 500     | 1.11 (tight) | normal                                 | Feature section titles                                                                                                                                                                                                                                       |
-| Sub-heading     | Inter          | 30px (1.88rem) | 400–500 | 1.20 (tight) | normal                                 | Card headings, feature names                                                                                                                                                                                                                                 |
+| Sub-heading     | Inter          | 30px (1.88rem) | 400 / 500 | 1.20 (tight) | normal                                 | Card headings, feature names                                                                                                                                                                                                                                 |
 | Card Title      | Inter          | 24px (1.5rem)  | 400     | 1.33         | normal                                 | Medium emphasis headings                                                                                                                                                                                                                                     |
-| Body Large      | Inter          | 18px (1.13rem) | 400–500 | 1.56         | normal                                 | Hero descriptions, button text                                                                                                                                                                                                                               |
-| Body / Link     | Inter          | 16px (1rem)    | 400–500 | 1.50         | normal                                 | Standard body text, navigation                                                                                                                                                                                                                               |
+| Body Large      | Inter          | 18px (1.13rem) | 400 / 500 | 1.56         | normal                                 | Hero descriptions, button text                                                                                                                                                                                                                               |
+| Body / Link     | Inter          | 16px (1rem)    | 400 / 500 | 1.50         | normal                                 | Standard body text, navigation                                                                                                                                                                                                                               |
 | Caption         | Inter          | 14px (0.88rem) | 400     | 1.43         | normal                                 | Metadata, descriptions                                                                                                                                                                                                                                       |
-| Small           | Inter          | 12px (0.75rem) | 400     | 1.33         | normal                                 | Smallest sans-serif text                                                                                                                                                                                                                                     |
-| Micro Label     | Inter          | 10–13px        | 400–500 | 1.20–1.40    | optional 0.5–1px tracking on uppercase | **Auxiliary / non-reading** labels only — sidebar tree section heads (13px), tree row counts, frontmatter field names, scope chips, tag pills, status badges, breadcrumb segments. Never used for body text or anything the user reads sentence-by-sentence. |
+| Small           | Inter          | 12px (0.75rem) | 400     | 1.33         | normal                                 | Smallest reading-text size (auxiliary Micro Label may go smaller, floor 10px)                                                                                                                                                                                                                                     |
+| Micro Label     | Inter          | 10–13px        | 400 / 500 | 1.20–1.40    | optional 0.5–1px tracking on uppercase | **Auxiliary / non-reading** labels only — sidebar tree section heads (13px), tree row counts, frontmatter field names, scope chips, tag pills, status badges, breadcrumb segments. Never used for body text or anything the user reads sentence-by-sentence. |
 | Code Body       | JetBrains Mono | 16px (1rem)    | 400     | 1.50         | normal                                 | Inline code, commands                                                                                                                                                                                                                                        |
 | Code Caption    | JetBrains Mono | 14px (0.88rem) | 400     | 1.43         | normal                                 | Code snippets, secondary                                                                                                                                                                                                                                     |
-| Code Small      | JetBrains Mono | 11–12px        | 400–500 | 1.40–1.63    | normal                                 | Tags, labels, in-tree paths                                                                                                                                                                                                                                  |
+| Code Small      | JetBrains Mono | 11–12px        | 400 / 500 | 1.40–1.63    | normal                                 | Tags, labels, in-tree paths                                                                                                                                                                                                                                  |
 
 
-*Positioning note: the Display / Section Heading / Sub-heading rows are for brand-scale surfaces (login, splash, empty states); everyday app chrome lives in the Body / Caption / Small / Micro rows.*
+*Positioning note: the Display / Section Heading / Sub-heading rows are conceptual role targets for **brand canvases only** (the §16 login / splash family and its self-contained pages). Their concrete values live in canvas constants and §16 tables, not in app code. The 「排版豁免登记表」 below only registers exemption domains. Everything else — everyday chrome **and** in-app empty states — lives in the Body / Caption / Small / Micro rows, and for `apps/desktop` code the normative size set is the 「桌面 UI 字号白名单」 below: this table describes roles, the whitelist constrains values.*
 
 ### Principles
 
 - **Single sans family**: Inter carries both display headlines and body text — no typeface switching between hierarchy levels. Size and weight alone create hierarchy, keeping the typographic system maximally simple.
-- **Weight restraint**: Only two weights matter — 400 (regular) for body and 500 (medium) for headings. No bold, no light, no black weight. This extreme restraint reinforces the minimal philosophy.
+- **Weight restraint**: Everyday chrome defaults to 400 (regular) and 500 (medium); 600 is a rationed emphasis tier, and 700 lives exclusively inside registered exemption domains. No light, no black weight, no in-between values. The full ladder and its rules are in 「字重阶梯」 below (2026-08 revision, issue #1505 — this supersedes the former "400/500 only" wording).
 - **Tight display, comfortable body**: Headlines compress to 1.0 line-height, while body text relaxes to 1.43–1.56. The contrast creates clear hierarchy without needing weight contrast.
 - **Monospace for code only**: JetBrains Mono is reserved for inline code, terminal commands, and code blocks — never used for UI chrome.
+
+### 字重阶梯(2026-08 修订,issue #1505)
+
+全站字重只允许以下四档整百值,禁止一切中间值(550/650…)与 800 及以上:
+
+| 档 | 名称 | 用途 |
+| --- | --- | --- |
+| 400 | Regular | 长文阅读正文、代码 |
+| 500 | Medium | UI 默认强调、标题 —— 日常 chrome 的主力档 |
+| 600 | Semibold | 限量强调(徽标、表头、选中态等局部加重)。新增使用要能说出「为什么 500 不够」 |
+| 700 | Bold | **仅限下方豁免登记表中的域**,禁止出现在普通 UI chrome |
+
+- 与手机端 `apps/mobile/src/theme/tokens.ts` 的 `fontWeight` token(regular / medium / semibold / bold)一一对应 —— 两端一张梯子。
+- **两端 700 口径**:手机端 UI chrome 的上限仍是 600（正本为 `apps/mobile/docs/mobile-design-guide.md`,该文已同步登记本例外）。`bold` / 700 在手机端**只允许**出现在下表登记的域——原生 Markdown strong 与登录品牌画布。也就是说「四档梯子」是两端共用的**档位定义**,不等于两端 chrome 都可用 700。
+- **CJK 注记**:桌面未设 `font-synthesis: none`,中文回退字体(PingFang)公开档位到 600 —— UI 里用 700 会在中文上触发伪粗体(算法加粗、边缘发糊),且 600 与 700 在 CJK 上的渲染差异不可靠。**中文层级不得依赖 600 vs 700 区分**,强调靠字号或颜色。
+
+### 桌面 UI 字号白名单(2026-08,issue #1505)
+
+- **UI 段:{10, 11, 12, 13, 14, 15, 16}px;标题 / 内容段:{18, 20, 24, 28}px。** 下限 10px —— 9px 及以下禁止(再小就不是文字是纹理)。
+- **下限约束的是「开发者写死的档位」,不约束运行期缩放结果。** 用户可把 UI 字号设到 `appearanceSettings.uiSize` 允许的最小值 12（默认 14）,`useFontSettings` 按 `uiSize / 14` 缩放并 `Math.round`,此时 `--text-10` 与 `--text-11` 都会算成 9px（两档在该设置下失去区分）。这是用户主动选择的整体缩小,不是违反下限;守卫也只检查源码里写的档位,不检查运行期计算值。**若要保住 10px 视觉下限,应在字号设置侧（提高 `uiSize` 下限或改缩放曲线）解决,而不是往白名单里加更小的档位。**
+- **写法**:一律用 `tailwind.config.ts` 的 `text-<n>` token 类(映射 `--text-<n>` 变量;doc 紧凑模式与后续字号缩放能力都挂在这层变量上,任意值类会静默漏掉这些机制)。语义类 `text-xs / text-sm / text-base / text-lg` 只收编存量(等值 12 / 14 / 16 / 18)；源码侧禁止使用 `text-xl` 及以上语义档位（由守卫拦截），配置侧 `theme.extend.fontSize` 的 `xl..5xl` 遗留项不在本轮删除范围，避免删除后静默回退到 Tailwind 内置固定值、失去用户字号缩放；其清理另行处理。**禁止新增任意值 `text-[Npx]`(含一切小数)与白名单外档位**;需要新档先改本表与权威来源，再进组件。
+- **镜像约定（已成立，由 #1553 完成）**：四个权威来源必须同步：本表（规范正本）与以下三处代码——`apps/desktop/tailwind.config.ts` 的 `fontSize`（类名可用性与变量映射；漏掉则 `text-<n>` 类根本不存在）、`apps/desktop/src/renderer/styles/globals.css` 的静态 `--text-<n>` 默认值（漏掉则变量未定义并回退到继承值）、`apps/desktop/src/renderer/hooks/useFontSettings.ts` 的 `UI_TEXT_TOKEN_SIZES` 运行时生效值（含用户字号缩放；漏掉则该档位不随用户设置缩放，反向漏则会写出已删档位的陈旧变量）。另有一个消费端需保持一致：`apps/desktop/src/renderer/lib/utils.ts` 的 tailwind-merge `classGroups['font-size']` 负责类名去重，不产生字号值；漏登记会让 `cn()` 合并两个字号类失效，两个类会同时留在 DOM 上。该消费端单独做一致性校验，不计入四个权威来源镜像。同一 hook 的 `SCALED_TAILWIND_TOKENS` 负责语义类运行时缩放，需与 Tailwind 语义类映射保持同步，但不改变本白名单的具体档位。PR4 的守卫按四个权威来源做镜像断言，并单独校验消费端一致性。
+- 品牌画布域(登录 / Splash 家族等设计 px 坐标系表面)不映射本白名单:字面量只允许进画布常量文件(`loginDesignTokens.ts` 的地位,对齐手机端 `loginSkinLayout.ts`)**或下表登记的自包含品牌页生成器**(`oauthResultPage.ts` 整页由 main 侧生成,其内嵌 raw CSS 即该页的常量载体),组件消费端照常受守卫扫描。
+
+### 排版豁免登记表(2026-08,issue #1505)
+
+以下是**登记过的刻意分歧**,不要当 bug「修」;新增豁免必须先改本表:
+
+| 域 | 范围 | 允许 | 理由 |
+| --- | --- | --- | --- |
+| 登录 / Splash 品牌画布 | 桌面 `LoginControls.tsx`、`loginDesignTokens.ts`(Splash 借用同族面板)、`LegacyMigrationDialog.tsx`(仅字重)、`oauthResultPage.ts`(自包含品牌页生成器,raw CSS 为其常量载体)；手机 `apps/mobile/app/(auth)/login.tsx`(登录页本体)、`apps/mobile/src/components/LoginSkinControls.tsx` 与 `apps/mobile/src/auth/loginSkinLayout.ts` | 700 + 设计 px 字号 | §16 已登记 Bold,两端共用同源登录画布与 figma 坐标系；桌面守卫只扫描 `apps/desktop/src/renderer`，手机端由自身守卫体系负责，本登记不扩展 PR #1553 的扫描范围 |
+| markdown 内容 | **仅 Markdown 渲染路径**：桌面 Markdown 渲染器输出的 DOM `<strong>`（`MarkdownRenderer` 及其消费方；必须解析为绝对 700；嵌套 strong 仍封顶 700）、CodeMirror strong 语法节点（`codemirrorGithubTheme.ts` 的 `t.strong` → `fontWeight: 'bold'`）、移动端原生 Markdown strong（`apps/mobile/src/session/MessageRenderer.tsx` 的 `markdownStrong` → `fontWeight.bold`） | 700 / `bold` | 用户内容语义,非 UI chrome;编辑器内 strong 与两端渲染后的 strong 同权。当前桌面 Tailwind preflight 的相对 `bolder` 会使嵌套 strong 计算到更高档位，是已知实现缺口；规则不把该结果视为合规，待独立施工。**本行不覆盖普通 UI chrome 里直接写的 `<strong>`**（如 `MakerExperimentalView.tsx` 会话状态与事件列表）——它们同样被 preflight 的相对 `bolder` 渲染成 700,但不属豁免域,是已登记缺口,待归一为 `font-medium` / `font-semibold`。 |
+| hljs 主题移植 | `globals.css` 内 hljs 规则 | `bold` | 第三方主题移植,保真优先 |
+| 第三方查看器（用户内容） | `apps/desktop/src/renderer/vendor/drawio/viewer-static.min.js`（由 `DrawioPreview.tsx` 加载）及 `vendor/` 下其他上游产物 | 上游自带字重与字号 | 上游压缩产物,渲染的是用户绘图内容而非本产品 chrome;不改上游、不逐行归一。**守卫边界**:整个 `vendor/` 目录不纳入扫描（PR #1553 已在守卫盲区中显式登记该排除,不是未登记的漏扫）。 |
+| CodeMirror / Markdown 内容字号 | `codemirrorGithubTheme.ts` 的标题等内容层级（`2.15em` / `1.62em` 等相对值,CSS-in-JS 路径） | 相对字号（`em` 派生） | 内容标题层级必须随编辑器基础字号等比缩放,固定 token 会打断这个比例关系;相对值本身不脱离缩放链,故不要求落在 numeric 白名单。**守卫边界**:`em` / `rem` / `%` 相对值不参与 numeric 白名单判定。 |
+| 命令式第三方 API（非 DOM class 路径） | xterm 的 `ITerminalOptions.fontSize`（`features/right-sidebar/plugins/terminal/lib/xtermPool.ts`）等只接受**数值字段**、无法挂 class 的第三方配置入口；SVG 的 `fontSize="N"` 属性同理 | 数值字面量 | 这类 API 不消费 DOM class,Tailwind token 类挂不上去,只能传数字。**取值规则**:数值必须取自本白名单档位,或取自用户代码字号设置（`--app-code-font-size` / `appearanceSettings.codeSize`）解析出的运行期值 —— 不允许凭手感另取一个数。**守卫边界**:按精确签名放行（文件 + 字段 + 期望次数）,不做整文件豁免,新增此类入口须先改本表。 |
+| 用户可配置代码字号（变量路径） | `--app-code-font-size` 及其派生写法（`text-[length:var(--app-code-font-size)]`、`text-[length:calc(var(--app-code-font-size)_-_1px)]` 等,消费方含 Markdown / DiffView / ToolCallCard 等约 19 个文件） | 变量与其 `calc` 派生 | 该字号是**用户设置项**,`appearanceSettings.ts` 的 `codeSize` 允许 10–24 逐整数取值,因此运行期可落在 17 / 19 / 21 / 22 / 23 等 numeric 白名单外的值;这是刻意的可配置能力,不是漏归一。本白名单约束的是**开发者写死的档位**,不约束用户设置的运行期取值。**守卫边界**:`--app-code-font-size` 的变量与 `calc` 派生写法按精确签名登记豁免（见 PR #1553 守卫的豁免表）,不按 numeric 白名单判定。 |
+| 外部页注入 | `browserCommentPreload.ts` | 系统字体族 | 注入他人网页,不强加 Inter |
+| 手机 WebView HTML 生成器 | `selectableMarkdownHtml.ts` 等 | CSS 语法字面量 | 手机守卫已自登记盲区,值仍须守本阶梯 |
+| 紧凑模式派生值 | `globals.css` `.chat-rail-compact` 段 | calc / -1px 派生 | 机制本体 |
+
+### 排版 non-goals(2026-08 登记)
+
+以下漂移**已知且本轮明确不治理**,后人见到不要当「漏网」顺手修,治理需另立 issue:
+
+- line-height **档位统一**:桌面存在 `leading-[1.45]` / `leading-[1.55]` 等微调档与无单位 / px 混轨,本轮不收敛成统一阶梯。
+  - **但有一条例外,已在 #1553 治理完毕**:`text-<n>` 与**固定 px 行高**(`leading-[Mpx]`)并存属于**功能缺陷**,不是风格漂移 —— `text-<n>` 经 `--text-<n>` 响应「外观 → UI 字号」设置,固定 px 行框不跟随,用户放大字号时文字会裁切/重叠。原设计未考虑用户可自行调整字号,故留下这个洞。**该组合一律改为无单位比例**(比例 = 原 px ÷ 字号),渲染在默认字号下不变而放大时正确。#1553 已把当时全部 38 处清零(其中 14 处为字号归一新引入、24 处先于其存在);后续新增 `text-<n>` 时**不得再配固定 px 行高**,该约束由 `typographyDiscipline.test.ts` 的 `fixed-leading` 规则做机器门禁,**按 `className` / `cn(...)` 整块区域跨行判定**(只比对同一行会漏掉 `cn()` 分行写法,#1553 实际漏过一处)。行高被 JS 布局计算写死引用时(如按行高算 auto-grow 上限),须同时改成读计算值,否则上限不跟随缩放。
+- 语义类 `text-xs/sm/base/lg` → `text-<n>` 的机械统一:等值改写零收益,收编即可。
+- letter-spacing 与 font-family 治理。
+- 原生层排版:macOS agent-island helper 等 Swift / 原生 UI 的字号字重不在本白名单域(Web 白名单与守卫均不覆盖,治理需另立 issue)。
 
 ## 4. Component Stylings
 
@@ -201,6 +253,8 @@ Reference implementation: `apps/desktop/src/renderer/components/ui/confirm-dialo
 - **Title / description**: `--confirm-title` / `--confirm-desc`, medium weight.
 - **Buttons**: pill (9999px); primary = solid CTA (`--confirm-btn-primary-*`), secondary/cancel = outlined (`--confirm-btn-secondary-*`, transparent fill + Board border); footer `justify-end`.
 - **Focus on open**: lands on the dialog's **primary input or primary button**, never defaults to Cancel (see §14.2 + ConfirmDialog's `autoFocusConfirm` / `onOpenAutoFocus`).
+- **Closing affordance** (made explicit 2026-07-30, scope clarified 2026-07-31): **dismissible** dialogs (wizards, catalogs, forms — anything a user may abandon freely) close via the footer Cancel button, Esc, and a scrim click, and carry **no top-right × close icon** — a × coexisting with Cancel is a spec violation, not a convenience. Confirm-tier dialogs built on AlertDialog (ConfirmDialog) intentionally do **not** close on scrim click (a deliberate mis-tap guard) — that behavior stays. Known legacy debt: CustomProviderDialog still ships a top-right × predating this rule — migrate it the next time that dialog is touched; do not copy the pattern into new dialogs.
+- **Multi-step dialogs / wizards** (registered 2026-07-30, first consumer: Add-Provider wizard): the step indicator lives in the header row (round numbered chips — current step solid `--accent-cta-bg` with `--surface-on-card` text, completed steps ✓ on `--surface-chip`, upcoming outlined `--border-default`). Footer: **back navigation ("← 上一步") is a left-aligned text button** (`--text-secondary`, 13px/500) — navigation is not a commit action and must not sit inside the right-aligned pill group; commit actions (取消 / 下一步 / 完成) remain right-aligned pills per the button rule above. Catalog/list steps put the scrollable region between **two full-width 1px `--border-default` hairlines**, with permanent entries (e.g. 自定义端点) pinned below the scroll region, always visible. Width matches the custom-provider form dialog (600px, `min(600px, 100vw-32px)`) so the two provider dialogs read as one family; height is capped at `min(640px, 85vh)` — on large displays a catalog dialog must not stretch toward full-screen height (2026-07-30 ruling).
 
 ### Tabs
 
@@ -253,7 +307,7 @@ Three tiers — **these three only**:
 | Lifted (Card)      | Card fill (`#ffffff` Light / `#2c2c2a` Dark) + optional 1px Board outline | Login cards, modals, raised panels             |
 
 
-**Shadow Philosophy**: Cindy's base visual language uses **zero shadows**. This is not an oversight — it's a deliberate design decision. The flat, shadowless approach creates a paper-like experience where elements are distinguished purely by background color and single-pixel borders. Depth is communicated through **content hierarchy and typography weight**, not visual layering. (The only shadows in the system are the token-gated floating-layer exceptions registered in §10 — `--shadow-menu` / `--cmd-palette-shadow` / `--confirm-shadow`; never add ad-hoc shadows to in-page elements.)
+**Shadow Philosophy**: Cindy's base visual language uses **zero shadows**. This is not an oversight — it's a deliberate design decision. The flat, shadowless approach creates a paper-like experience where elements are distinguished purely by background color and single-pixel borders. Depth is communicated through **content hierarchy and typography weight**, not visual layering. (The only shadows in the system are the token-gated floating-layer exceptions registered in §10 — `--shadow-menu` / `--cmd-palette-shadow` / `--confirm-shadow`; never add ad-hoc shadows to in-page elements. A Switch-knob shadow was trialed and explicitly rejected — user ruling 2026-08-05: the legacy `shadow-lg` on the 16px thumb was invisible in practice, and a visible replacement read as noise; the knob is flat by decision, don't re-add it.)
 
 ## 7. Do's and Don'ts
 
@@ -264,7 +318,7 @@ Three tiers — **these three only**:
 - Use 12px radius on all non-interactive containers — code blocks, cards, panels
 - Use 8px radius only for inner controls that can't be a pill — multi-line inputs, dropdown/menu rows (see §5)
 - Keep the palette strictly grayscale — chromatic color only via the sanctioned semantic set in §2, always through tokens
-- Use Inter at weight 500 for display headings — hierarchy comes from size + weight, not typeface switching
+- Use Inter at weight 400 / 500 for display headings (per the §3 Hierarchy rows) — hierarchy comes from size + weight, not typeface switching
 - Maintain zero shadows — depth comes from borders and background shifts only
 - Keep content density low — each section should present one clear idea
 - Use monospace for terminal commands and code — it's primary content, not decoration
@@ -275,8 +329,8 @@ Three tiers — **these three only**:
 - Don't introduce any chromatic color outside the sanctioned semantic set in §2 — no brand blue, no accent green, no warm tones beyond the registered exceptions
 - Don't invent arbitrary radii — only three values exist: 8px (inner controls), 12px (containers), 9999px (pill). Nothing in between, nothing else.
 - Don't add shadows to any element — the flat aesthetic is intentional
-- Don't use font weights above 500 — no bold, no black weight
-- Don't add decorative illustrations — Cindy's working UI carries no mascots or artwork; brand imagery appears only on sanctioned brand surfaces (login, splash, new-session brand block — see §15.7 / §16)
+- Don't use font weights above 600 in UI chrome — 700 only inside the exemption domains registered in the §3 registry (that table is the single source of truth; it currently covers markdown content, hljs theme ports, login / Splash brand canvas, third-party viewers under `vendor/`, and imperative third-party APIs). Don't re-enumerate the domains here — read §3. No 800+, no in-between values, anywhere
+- Don't add decorative illustrations — Cindy's working UI carries no mascots or artwork; brand imagery appears only on the explicitly enumerated sanctioned brand surfaces in §15.7 / §16
 - Don't use gradients anywhere — flat blocks and borders only
 - Don't overcomplicate the layout — stick to the region structure in §5; no complex nested grids
 - Don't use borders heavier than 1px — containment is always the lightest possible touch
@@ -325,7 +379,7 @@ Cindy Mobile (React Native) has its own device-class rules (phone / pad portrait
 2. Keep all values grayscale — "Stone (#737373)" not "use a light color"
 3. Always specify radius from the three tiers — pill (9999px) / container (12px) / inner control (8px, only for textareas & dropdown rows). Nothing else.
 4. Shadows are always zero — never add them
-5. Weight is always 400 or 500 — never bold
+5. Weight is 400/500 for everyday chrome, 600 for rationed emphasis — 700 never appears in new UI (registered exemption domains in §3 only)
 6. If something feels too decorated, remove it — less is always more
 
 ## 10. Theme System & Token Reference
@@ -414,11 +468,13 @@ Theme switching: `useTheme.ts` provides `theme` (System / Light / Dark mode) plu
 | `--warning-bg-soft` | rgba(234,107,23,0.12) | rgba(234,107,23,0.18) | Warning alpha surface (alpha recomputed against `#EA6B17`, 2026-07-17) |
 | `--warning-fg` | `#F3A115` | `#F3A115` | Warning text/icons, including the update-restart busy-turn interruption hint |
 | `--focus-ring` / `--focus-ring-soft` | `#417CDD` / @50% | same | A11y focus ring, finalized 2026-07-17 (replaces #3b82f6), theme-invariant |
+| `--text-selection-bg` | `var(--focus-ring-soft)` | same | Selected text background; remains visible when focus moves into an embedded webview |
 | `--shadow-menu` / `--cmd-palette-shadow` / `--confirm-shadow` | rgba | rgba (deeper) | Shadows, theme-invariant |
 | `--overlay-modal` / `--overlay-lightbox` | rgba | rgba (deeper) | Modal / lightbox backdrop |
 | `--perm-auto-selected-text` | `#417CDD` | `#417CDD` | Auto Approval accent, finalized 2026-07-17 (same value both modes; replaces #000050/#00D9C5) |
 | Toast `#417CDD / #2AAE5B / #F3A115 / #D91F37` | (hardcoded in Toast.tsx, VARIANT_MAP exported) | same | Finalized 2026-07-17 (Toast exemption lifted, merged into the status-color family) |
 | `--file-badge-pdf/-doc/-sheet/-slide/-code` + `--file-badge-fg` | `#B23A26` / `#2C5CA8` / `#2E7D4F` / `#A25A12` / `#5B49A8`, fg `#FFFFFF` | same | File-type badges on the self-drawn attachment icon (2026-07-27). Bound to *what the file is*, not to the theme, so both modes share one value. Each accent is picked for ≥4.5:1 against `--file-badge-fg` (5.96 / 6.56 / 5.05 / 5.24 / 7.09) — the badge label renders at 10px (Micro Label floor, §3), so AA small-text applies. `--file-badge-fg` is a standalone white: `--accent-pure-cta-fg` flips to black in Dark and cannot be borrowed. |
+| `--process-agent-task-icon`, `--process-agent-service-icon`, `--process-main-icon`, `--process-renderer-icon`, `--process-gpu-icon`, `--process-utility-icon` | `#2563EB` / `#7C3AED` / `#DB2777` / `#0891B2` / `#D97706` / `#059669` | `#60A5FA` / `#A78BFA` / `#F472B6` / `#22D3EE` / `#F59E0B` / `#34D399` | Resource Usage 14px process-category glyphs only (2026-08-06). Category cue, not status; all surrounding UI stays neutral. Protected from automatic external-theme import so category identity does not drift. |
 
 Never freestyle these semantic colors as hardcoded hex — always go through the corresponding token.
 
@@ -470,20 +526,21 @@ This section is the authoritative token-usage text; i18n rules for UI copy live 
 
 Settings → Appearance can import a VSCode color theme (`*.json` / jsonc) or an Obsidian `theme.css` and convert it into a local theme. Implementation: `apps/desktop/src/shared/theme-import/` (pure conversion) + `apps/desktop/src/main/local-themes/importer.ts` (dialog / read / write). Rules that govern it:
 
-- **One template, taken from the hand-ported community themes.** The seven ported themes under `apps/desktop/src/renderer/themes/builtin/` (one-dark-pro, github-dark, eclipse, material-ocean-hc, monokai-pro, atom-one-light, solarized-light) share a byte-identical key set of 108 tokens derived from 13 palette roles plus the optional light-only `inputBg` role (CREATE AGENT card/input background, e.g. Solarized base2; absent ⇒ collapses to `surface`). Within the template, when a light palette supplies an `inputBg` distinct from `surface` (e.g. Solarized base2 cards), CREATE AGENT `*-hover` and the resting `quick-card-icon-bg` lift to `surface` (icon drops back to `chip` on hover); otherwise `*-hover`=`hover` and `quick-card-icon-bg` is `border` in dark / `chip` in light — keeping default/hover/icon visually distinct in every theme. `control-bg-pressed` is `chip` in dark and `hover` in light. `send-btn-bg`/`send-btn-icon` use the inverse-neutral pair (`textPrimary`/`surface`), not the accent, because the shared send tokens also render 10–12px text that must clear 4.5:1. `apps/desktop/src/shared/theme-import/palette.ts` is that derivation, code-ified; `one-dark-pro.ts`'s header comment is the source-of-truth for which VSCode key feeds which role. The template is **allow-list only** — it emits exactly those 108 base ids, plus optional Markdown tokens (`md-h1-fg`…`md-h6-fg` / `md-strong-fg`) when the source theme provides heading or bold colors.
+- **One template, taken from the hand-ported community themes.** The seven ported themes under `apps/desktop/src/renderer/themes/builtin/` (one-dark-pro, github-dark, eclipse, material-ocean-hc, monokai-pro, atom-one-light, solarized-light) share a byte-identical key set of 108 tokens derived from 13 palette roles plus the optional light-only `inputBg` role (CREATE AGENT card/input background, e.g. Solarized base2; absent ⇒ collapses to `surface`). Within the template, when a light palette supplies an `inputBg` distinct from `surface` (e.g. Solarized base2 cards), CREATE AGENT `*-hover` and the resting `quick-card-icon-bg` lift to `surface` (icon drops back to `chip` on hover); otherwise `*-hover`=`hover` and `quick-card-icon-bg` is `border` in dark / `chip` in light — keeping default/hover/icon visually distinct in every theme. `control-bg-pressed` is `chip` in dark and `hover` in light. `send-btn-bg`/`send-btn-icon` use the inverse-neutral pair (`textPrimary`/`surface`), not the accent, because the shared send tokens also render 10–12px text that must clear 4.5:1. `apps/desktop/src/shared/theme-import/palette.ts` is that derivation, code-ified; `one-dark-pro.ts`'s header comment is the source-of-truth for which VSCode key feeds which role. The template is **allow-list only** — it emits those 108 base ids plus the imported-theme-only `switch-track-off` / `switch-thumb-off` safety pair. Because external muted/comment colors are unconstrained, the track keeps the source `textSecondary` only when it clears the 3.2:1 derivation target (above the 3:1 non-text floor) against the relevant surfaces and thumb; otherwise the converter takes the smaller passing correction along the source-to-black/source-to-white paths, or rejects the palette with the dedicated contrast error rather than reporting it as an unrecognized file or internal error. Existing local snapshots created before this pair existed are backfilled with the same 3.2:1 target at renderer load time only when both tokens are absent and the complete legacy semantic palette is parseable; if no track can satisfy the target, the runtime restores the pre-upgrade `border-default` track and `surface` thumb instead of falling through to unchecked aliases. Disk JSON and explicit user overrides are never changed. Optional Markdown tokens (`md-h1-fg`…`md-h6-fg` / `md-strong-fg`) are added when the source theme provides heading or bold colors.
 - **Exemption families are never imported.** `--login-*`, brand red, `--destructive`, `--error-*`, `--warning-accent`, `--status-bar-accent`, `--focus-ring*`, `--diff-*`, shadows and overlays stay at their spec values under every imported theme (see the exemption table above and §16). `apps/desktop/src/shared/theme-import/protected-tokens.ts` enforces it as a second gate; the import report tells the user how many tokens were held back.
 - **`-hsl` tokens are computed, not copied.** Both forms of a color must denote the same color, so the converter derives every HSL triplet from its hex via `toHslTriplet()`. (Note: a few hand-written builtin themes carry approximate HSL values — `github-dark`'s `SURFACE_BG_HSL` was copied off one-dark-pro. Those are left as-is; new imports are exact.)
 - **Markdown text colors go through `--md-h1-fg`…`--md-h6-fg` / `--md-strong-fg`, and default to `inherit`.** Before these tokens existed, Markdown headings and bold text inherited their color from the container (`baseComponents` sets size/weight only). Defaulting to `var(--text-primary)` would have repainted headings inside blockquotes, tool cards and secondary-text regions, so the defaults are `inherit` — every built-in theme renders exactly as before. Imported themes fill them from Obsidian `--hN-color` / `--bold-color` or VSCode `markup.heading` / `markup.bold`. Guard: `themes/__tests__/markdownColorTokens.test.ts`.
 - **Obsidian import is a palette import, not a theme port.** Only CSS custom properties are read; selectors, layout, radii and fonts are discarded — Cindy's layout and typography stay owned by §3/§5. Values that cannot be evaluated statically (`color-mix()`, undefined `var()`) are skipped and reported rather than guessed.
+- **Checked Switch track = theme accent (ported theme files only, user ruling 2026-08-05).** The seven ported theme files each override `switch-track-on` to their own accent (solarized-light uses `GREEN_DEEP` — the official `#859900` fails the 3:1 floor). The registry default stays `hsl(var(--primary))`: Classic and imported themes keep the pre-existing neutral checked track, and CINDY carries its own frozen decision-table values (Dark keeps `#EEEEEE`; Light deliberately lightened to `#4A4D51`). Guard: `switchThemeContrast.test.ts` asserts every builtin theme's checked track ≥3:1 against the checked thumb (`background`) and all five surfaces.
 - **Local themes may declare an optional `family`.** Same-family light + dark variants merge into one switchable family (`themes/families.ts`); files without the field keep behaving exactly as before (family id = theme id). Obsidian's dual-mode CSS uses this to land as a single theme that follows Light/Dark mode.
 
 ## 11. Voice & Content(微文案规范)
 
-> **Status: draft**, introduced 2026-06 (after the Voice & Content section of Vercel Geist's `design.md`). This section governs **how interface copy is written** and pairs with `docs/dev-rules/engineering-conventions.md` §5 (the i18n system) — that side enforces "copy lands via i18n keys, aligned across 4 languages"; this side governs each string's tone and wording. It adds no UI strings, only constraints.
+> **Status: draft**, introduced 2026-06 (after the Voice & Content section of Vercel Geist's `design.md`). This section governs **how interface copy is written** and pairs with `docs/dev-rules/engineering-conventions.md` §5 (the i18n system) — that side enforces "copy lands via i18n keys, aligned across 5 languages"; this side governs each string's tone and wording. It adds no UI strings, only constraints.
 
 Cindy's product voice matches its visuals: **restrained, direct, never self-congratulatory**. Copy is part of the tool, not marketing.
 
-### 11.1 Language-Independent Principles (zh-CN / en / ja / ko alike)
+### 11.1 Language-Independent Principles (zh-CN / zh-TW / en / ja / ko alike)
 
 - **Actions = verb + object, never a bare verb.** Buttons and menu items say what is done to what: `Deploy Project` / `删除会话` / `セッションを削除`. **Forbidden**: objectless verbs like `Confirm` / `OK` / `确定` / `提交` (confirm-dialog primary buttons especially must carry the object so they read correctly out of context).
 - **Errors = what happened + what to do.** A bare "Failed / 出错了" is not acceptable — give the next step ("Connection timed out — check your network and retry"). Pairs with `docs/dev-rules/engineering-conventions.md` §2 (IPC error protocol): error codes are for code; the user-facing sentence must be human and actionable.
@@ -496,8 +553,9 @@ Cindy's product voice matches its visuals: **restrained, direct, never self-cong
 
 - **English**: labels / buttons / titles / tabs use **Title Case** (`Deploy Project`); body / help text / toasts use **sentence case**. Curly quotes and the ellipsis character `…`, never straight quotes or `...`.
 - **zh-CN**: **no Title Case concept** — no per-word capitalization, no English-style punctuation in Chinese; keep English terms as-is in mixed text (`部署 Project`). No full stop at the end of toasts / labels.
+- **zh-TW**: likewise has no Title Case; use Traditional Chinese characters and punctuation, while keeping English terms as-is in mixed text. No full stop at the end of toasts / labels.
 - **ja / ko**: likewise no Title Case; follow each language's particle / politeness conventions, and verify terminology when unsure (per `docs/dev-rules/engineering-conventions.md` §5: no improvised ja/ko).
-- **Numbers / units**: Arabic numerals + half-width in all four languages; number-to-unit spacing per language convention.
+- **Numbers / units**: Arabic numerals + half-width in all five languages; number-to-unit spacing per language convention.
 
 ### 11.3 Self-Check (when touching copy)
 
@@ -505,7 +563,7 @@ Cindy's product voice matches its visuals: **restrained, direct, never self-cong
 - [ ] Error copy says what to do next, not just that it failed
 - [ ] No "successfully / 成功" filler
 - [ ] In-progress states read "present continuous + …"
-- [ ] All 4 `common.json` files updated, each matching its language's casing/punctuation (see `docs/dev-rules/engineering-conventions.md` §5)
+- [ ] All 5 `common.json` files updated, each matching its language's casing/punctuation (see `docs/dev-rules/engineering-conventions.md` §5)
 
 ## 12. Component Spec (merged into §4)
 
@@ -526,6 +584,7 @@ Known but deliberately-deferred cleanups (e.g. hardcoded hex in `MakerExperiment
 ### 14.1 Text Selectability (user-select)
 
 - **Content is selectable**: message body text, code blocks, document previews — anything the user reads sentence-by-sentence or may want to copy. Selectable by default; leave it alone.
+- **Selections survive focus changes**: moving focus into an embedded webview (plugin panel, built-in browser, etc.) must not clear the host selection or let Chromium repaint it as an unreadable inactive color. Global and editor selections use `--text-selection-bg`, which remains visible in both Light and Dark modes.
 - **Chrome is not selectable**: buttons, menu items, labels/chips, status bars, badges, toolbars, sidebar rows — interface-skeleton text gets `select-none`. They are controls, not content; being selectable only gets in the way (typical offender: the goal-status chip label).
 - Litmus test: would the user ever think "let me copy this"? Yes → selectable; no (it's just a control) → `select-none`.
 
@@ -548,7 +607,7 @@ Applies to submit-on-Enter fields: the chat composer, goal input, ask input, etc
 
 #### Motion tokens (the only tier source)
 
-Global tokens live in `:root` of `apps/desktop/src/renderer/styles/globals.css`; mobile (`apps/mobile`) mirrors same-name same-value constants in `src/theme/tokens.ts` (dual-platform isomorphism, same policy as color tokens, landing with the mobile motion overhaul). **New transitions/animations must reference tokens — no hardcoded durations or cubic-beziers**; 5 interaction-duration tiers + 3 curves, the same philosophy as the §5 three-tier radius. Values outside the tiers require design review first. The single semantic loop-cycle exception is recorded directly below.
+Global tokens live in `:root` of `apps/desktop/src/renderer/styles/globals.css`; mobile (`apps/mobile`) mirrors same-name same-value constants in `src/theme/tokens.ts` (dual-platform isomorphism, same policy as color tokens, landing with the mobile motion overhaul). **New transitions/animations must reference tokens — no hardcoded durations or cubic-beziers**; 5 interaction-duration tiers + 3 curves, the same philosophy as the §5 three-tier radius. Values outside the tiers require design review first. Narrow semantic exceptions are recorded directly below.
 
 | Token | Value | Use |
 |---|---|---|
@@ -568,6 +627,17 @@ Spinner rotation remains linear, transform-only, mounted on an HTML wrapper, and
 must become static under reduced motion. This exception keeps loading rotation
 readable without coupling it to dialog timing or copying a hardcoded Tailwind
 default into components.
+
+**Sidebar title reading exception:** `--motion-sidebar-title-marquee-per-viewport`
+= `2400ms` is the reading time for each visible-width span of an overflowing
+Desktop sidebar task title. It is not an interaction-duration tier and is confined
+to `SidebarTitleMarquee` in `SessionItem.tsx`: actual-overflow only, pointer hover
+only, one-shot, reset immediately on pointer leave, and proportional to the number
+of viewport spans needed to reveal the full title. The track may animate only
+`transform` / `opacity`; `prefers-reduced-motion` keeps the original static
+ellipsis (with the native full-title tooltip) and disables the track. This narrow
+exception preserves readable, constant-paced title playback without allowing the
+long duration to leak into any other hover or transition.
 
 #### Semantics → motion prototypes (one semantic, one motion, app-wide)
 
@@ -592,7 +662,8 @@ default into components.
 - Non-compositor properties (height/grid …) are allowed only in **one-shot transient animations** (user-triggered, with a definite end) — never persistent.
 - Every new `@keyframes` / `animate-*` class must be registered in the `prefers-reduced-motion` whitelist in `globals.css` (the global `* { transition: none }` does not catch keyframes).
 - Real-time direct-manipulation interactions (resizer drag, drag-follow) get **no easing** — following the hand IS the feedback.
-- Forbidden: pointless displacement, bouncing, parallax, looping decoration, `transition-all`, and typewriter per-character animation on streamed text (streaming already is the motion). Interactions stay fast and direct.
+- Forbidden: pointless displacement, bouncing, parallax, looping decoration, `transition-all`, and typewriter per-character animation on streamed text (streaming already is the motion). Interactions stay fast and direct. (Per-**word** opacity fade-in on streamed text is **not** the typewriter — see the sanctioned stream-word-fade class below: the word is fully laid out and only its opacity ramps; ruled distinct on 2026-08-07.)
+- **Cadenced running shimmer (2026-08-07)**: the running status bar's breathing (`status-bar-shimmer`) is **event-driven, not an infinite loop** — one 1.5s dip (1 → 0.45 → 1, `steps(18)`) plays per real sign of progress (status text change / token count advance; re-triggered via keyed remount in `RunningStatusBar`, back-to-back plays merge through an animation-end pending flag). Silence (long thinking, tool wait) holds steady full opacity. Semantics: *breathing = producing*, not *heartbeat = alive*. New loading/working indicators should prefer this cadenced pattern over a new infinite loop.
 
 #### Exception category: container transform (chip lifts off and grows)
 
@@ -615,7 +686,329 @@ default into components.
   - **Definition**: the seal's signature running animation (two gapped arcs, outer 83/17 + inner 39/61, spinning as a whole at 2.4s linear on an HTML wrapper) is a beloved product signature and is preserved verbatim. What was missing was an ending: when the turn stops, the gaps used to freeze in place and read as "stuck mid-load". The choreography gives the animation a curtain call instead of replacing it: **while still spinning, both arcs close their gaps into full circles** (600ms one-shot `stroke-dasharray` transition — permitted as a one-shot transient per the red lines above); when the turn actually issued a `ghost_call` (fulfilled), a success-colored halo ring then dilates outward once (`summon-seal-halo`, 0.9s scale 1→1.65 + fade) while a ✓ badge pops at the avatar's corner (reusing the Done semantic's sanctioned overshoot curve, same as `status-done-pop`); the spin is removed only after the circles are closed — a spinning full circle is visually static, so the removal is seamless. Semantics stay self-consistent: gap = in progress, full circle = turn finished; ✓/halo appear **only on a fulfilled call** — a cancelled/never-issued call closes neutrally with no success badge (the ring must not fake success).
   - **Parameter red lines**: close 600ms (`--motion-ease-out`; outside the duration tiers — sanctioned here, do not reuse elsewhere), halo 0.9s one-shot, tick pop 0.3s. Historic messages mount directly on the closed static frame with zero animation; the choreography plays only for a mount that actually witnessed `running` flip false. Halo/badge fill comes from the status-dot done-green exemption (`--card-status-done`); the ✓ glyph uses `--completion-badge-fg` (dark ink both modes, 5.29:1 on the done green — white would be 2.88:1, below the WCAG 1.4.11 non-text 3:1 floor). All keyframes are in the `prefers-reduced-motion` whitelist — reduced motion lands straight on the terminal frame.
   - **Scope boundary**: this seal only. The closing-ring language must not leak into other spinners or progress indicators. Implementation: `apps/desktop/src/renderer/components/chat/GhostSummonCard.tsx` + `.summon-seal-*` in `globals.css`.
+- **Stream-word fade(流式正文逐词淡入)** — the fifth sanctioned motion class (approved 2026-08-07), **only** for streaming assistant prose in the chat message flow:
+  - **Definition**: during streaming, each newly-arrived **word** fades in over `--motion-fast` (150ms, opacity only) instead of popping in — text appears to *surface*, not *type*. This is explicitly **not** the forbidden per-character typewriter: the word is fully rendered and positioned from its first frame; only opacity ramps. CJK is segmented per word via `Intl.Segmenter`, so Chinese prose flows word-by-word too.
+  - **Architecture red lines**: CSS owns the form, JS owns only the timing — `rehypeStreamWordFade` wraps words in `span.stream-word` and writes a per-word `--wf-delay`. The nominal tick step is capped at **24ms per word**; when the pending lead would exceed the **320ms** lead budget, the step is compressed adaptively so rendering keeps up with any arrival rate. Words are keyed by stable content matching (same-position matches, prefix continuation, and bounded backward matching), not by document word index. Each word keeps an absolute scheduled start time / remaining delay across re-parse and remount, so already-seen words never replay. The animation itself is a pure-opacity one-shot keyframe in `globals.css` (compositor-only). The final (non-streaming) render carries **zero** wrapper spans — the plugin only mounts while `isStreaming`.
+  - **Degradation**: `prefers-reduced-motion` short-circuits in JS (plugin not mounted, no spans in DOM) *and* the CSS reduce block strips the animation — double coverage, and the CSS side is safe because `.stream-word` has no own opacity declaration to get stuck on.
+  - **Scope boundary**: streaming chat prose only. Skips `code`/`pre` (chips and code blocks keep whole-form) and KaTeX subtrees. Must not be applied to static content, titles, toasts, or any non-streamed text. Implementation: `apps/desktop/src/renderer/components/chat/rehypeStreamWordFade.ts` + `.stream-word` in `globals.css`; tests: `rehypeStreamWordFade.test.ts`.
+- **Session-loading wordmark sheen(会话加载字标扫光)** — the sixth sanctioned motion class (approved 2026-08-10), **only** for Desktop `BrandLoadingMark` while `MessageStream` defers its message tree during a session switch:
+  - **Definition**: the active theme's official Light/Dark Cindy wordmark sits centered in the empty message viewport at 35% opacity; after a 200ms delayed-reveal threshold, one narrow neutral highlight traverses the wordmark shape. The PNG alpha channel is the mask, so motion is confined to the glyphs and never paints a panel/background. This is functional loading feedback for a measured long switch, not a decorative brand loop: ordinary sessions complete before the reveal threshold and never show it; the mark unmounts immediately when the message tree mounts.
+  - **Parameters / performance**: highlight cycle 1.6s, `cubic-bezier(0.4, 0, 0.2, 1)`, HTML pseudo-element `transform: translateX(-120% → 350%)` only (compositor-only). The neutral gradient is the narrow §2 exception registered under “Gradient System”; it may use only `transparent` and `--text-primary`, never brand red or a component-authored chromatic value. `prefers-reduced-motion` removes both the reveal and sheen animations and shows a static wordmark; `[data-app-hidden='true']` pauses the infinite sheen via `animation-play-state` while the window is hidden.
+  - **Scope boundary**: session-switch deferred-loading overlay only. No reuse for startup, streaming, tool execution, message generation, dialogs, cards, sidebars, empty states, or static branding. The standard `animate-spinner` remains the default loader everywhere else. Implementation: `components/branding/BrandLoadingMark.tsx`, `MessageStream.tsx`, and `.brand-loading-mark*` in `globals.css`.
 - **Retired: mobile-download QR brand edge** — a rotating app-icon edge on the `MobileDownloadDialog` QR card was briefly registered here as a fourth (persistent) motion class on 2026-07-25 and **removed the same day** at the user's request: read as a strange ring turning behind the code. There is **no sanctioned persistent decorative motion** — the red lines above hold without exception. The card is now a bare QR (no edge, no border, no shadow, no tilt); its only motion is the linked ↔ onboarding size tween. Do not re-add. Contract test: `mobileDownloadDialog.test.tsx` → `keeps the QR card flat with no brand edge`.
+
+### 14.5 聊天正文的可点性信号(Clickability in message bodies)
+
+> 拍板 2026-07-30。起因:用户问「哪些是链接可以点、哪些不是，现在是不是看得不够清楚？」
+> 排查结论是**两个独立缺陷叠在一起**,且方向相反——加强可点信号会放大误判,所以两者必须
+> 一起修。本节是聊天正文(消息气泡 + 文件阅读器)可点性的权威口径。
+
+**缺陷一:装饰被两种正交语义共用。** 「等宽 + 底色」既表示「这是代码/路径」(排版语义),
+又被指望表示「这个能点」(交互语义),读者无法从外观反推可点性。实测数值:改前桌面可点的
+`FileTargetChip` 用实色底(1.26:1),不可点的 markdown 行内 code 用半透明底(light
+1.11~1.13:1 / **dark 1.26~1.28:1**)——深色模式下两者几乎相同,只能靠 hover 与指针形状
+区分,等于「必须拿鼠标扫一遍才知道哪个能点」;移动端无 hover 无指针,该信号直接不存在。
+
+**缺陷二:普通行内 code 会被误判成可点。** 行内 code 的候选判定曾挂一条宽松兜底
+(桌面 `classifyMarkdownHref` / 移动 `looksLikeLocalHref`:含分隔符**或**有个点后缀即算
+本地路径)。那是**显式 markdown 链接**的口径——作者写了 `[x](y)` 就是主动声明;反引号只
+表示「这是代码」,不表示「这是路径」。实测 29 个真实行内 code 样本有 **21 个**成为路径候选
+(`and/or`、`text/plain`、`A/B`、`n/a`、`1.2`、`array.map`、`console.log` …)。
+
+#### 规则
+
+1. **下划线常显 = 可点,且是唯一的交互信号。** markdown 里粗体占了字重、斜体占了倾斜、
+   行内 code 占了等宽+底色,**下划线是唯一没被排版语义占用的通道**,故专留给交互语义。
+   反过来:**没有下划线的一律不可点**。底色/等宽从此只表示排版含义,不再兼职表达可点
+   (所以可点的路径 chip 与不可点的行内 code **共用同一个底色 token** —— 它们本来就是
+   同一种排版物,差别只在那条下划线)。hover 变色与 `cursor:pointer` 降为**辅助**反馈,
+   不再是主信号:静止状态下就必须能判断。
+
+   **「唯一」是字面意思:可点态相对不可点态,只能多一条下划线,不得另外改文字颜色、
+   字重或字体。** 差异越单一,「有横线 = 能点」越可信;叠三个信号反而让读者无法归纳出
+   规则。参照 GitHub(2026-07-31 核对其 `github-markdown.css`):`.markdown-body code`
+   **刻意不定义 `color`**、纯靠继承,`.markdown-body a` 也只有 `text-decoration`、
+   没有 `font-weight`;可点与不可点的行内 code 差别就是那条横线。
+   落地推论两条:
+   - 移动端 `markdownPathChip` **只写 `textDecorationLine: 'underline'`**。它总是叠在
+     `markdownInlineCode` 之后,于是自然继承行内 code 的压暗档 —— 压暗是「这是代码」的
+     排版语义,继承它才对。(2026-07-30 首版曾在此钉 `textPrimary + medium`,那是下划线
+     还不是主信号时的补偿,信号收敛后即为冗余,已移除。)
+   - **正文裸写的路径点亮后保持正文字体,只加下划线 —— 两端同口径**(2026-07-31 实机
+     走查后拍板)。它的未点亮态是普通正文,若点亮就套等宽,同一句里点亮的 `src/a.ts`
+     与未点亮的 `src/b.ts` 会在**字体、底色、下划线三处齐变**,跳变无法向用户解释。
+     两端都必须**按来源 + label 形态分三档**(判定口径同源:桌面
+     `shouldRenderCodeReferenceLabel`、移动 `chatPathLabelReadsAsFileReference`):
+
+     | 来源 | label | 点亮后 |
+     |---|---|---|
+     | 正文裸写的路径 | (无独立 label) | 正文字体 + 下划线,**不套等宽** |
+     | 作者手写 `[README.md](path)` | 读起来是文件引用 | 等宽 chip + 下划线 |
+     | 作者手写 `[看这份规则](path)` | 散文 | 正文字体 + 下划线 |
+
+     - 桌面端:`remarkLocalPathLinks` 给切出的 link 节点打 `data-bare-path` 标记
+       (走 mdast `data.hProperties`),`MarkdownTargetLink` 见到它就跳过
+       `shouldRenderCodeReferenceLabel`、直接走 `ResolvedLocalLink`。
+     - 移动端:`matchBareFilePathLink` 在 link inline 上带 `bare: true`,
+       `LinkPathChipSpan` 据此决定 chipStyle 是否含 `markdownInlineCode`;非 bare 时
+       再过一遍 label 形态判定。**不得无条件去掉 `markdownInlineCode`** —— 那会把
+       作者手写的文件名链接一起降级(2026-07-31 PR #1144 review 实捉)。
+     - 作者手写的文件名链接保留 chip 是刻意的:那是作者的排版意图,与桌面一致。
+2. **外链与本地文件不做外观区分**,只表达「可点」;去哪由文本自身可读性承担(斜杠路径
+   vs `https://` 前缀)。
+3. **聊天正文不使用 `--msg-link`。** 该 token 是主题契约(10 个内置主题各自定义,
+   solarized 绿 / monokai 黄 / eclipse 青,用户导入 VS Code 主题时 `linkColor` 也映射到
+   它),而移动端根本没有链接色概念。要满足规则 1+2 的「两端统一」,聊天正文必须退出这个
+   token,统一为**正文色 + 常显下划线**。token 本身保留(其它界面仍在用),只是不进
+   markdown 正文与用户消息气泡。
+4. **候选判定:反引号不等于路径。** 行内 code 只接受真正的路径形状——带分隔符 / 绝对路径,
+   或裸文件名;**不得**用「含斜杠或有个点后缀」兜底。显式 markdown 链接与正文裸路径不受此
+   限(前者作者已声明,后者词法本就要求带分隔符)。
+5. **无法判定时的点亮门槛按形态分级。** 适用于任何存在「无法判定」中间态的链路:移动端
+   全部会话、以及桌面的**远程会话**(两者的 `fs:stat` 都会回 `unknown`)。桌面**本机**
+   会话不适用 —— 那边走真实存在性检查,解析不到一律纯文本,没有中间态。
+
+   判据是「形状是否明确是路径」,精确定义为 **绝对路径 ∨ 尾斜杠目录 ∨(分隔符 **且** 带
+   扩展名)**。其中「绝对路径」= POSIX `/…` ∨ Windows 盘符 ∨ `file://`,**不要求扩展名**,
+   由判据自己正面识别(`ABSOLUTE_PATH_SHAPE_RE`),后两档才落到 `looksLikeFilePath`:
+
+   > ⚠️ **不要把整个判据写成 `!looksLikeFilePath(href)`。** 那个谓词有两条排除项是为
+   > 别的用途写的 —— `URL_SCHEME_RE` 是为「别把 `https://` 当本地路径」、POSIX 分支要求
+   > 扩展名是为「别让无扩展名引用触发 TextLightbox」。照抄就会连带继承这些与歧义判定
+   > 无关的排除,把**最明确的形态判成最可疑的**:`file:///Users/me/a.md` 与 `/etc/hosts`、
+   > `/usr/bin/node` 都曾因此被判歧义、断链时退化成纯文本。两者是同一根因的两个分支
+   > (前者检查点自查发现,后者 PR #1144 review 实捉)。**复用谓词前先看它的排除项是为
+   > 什么写的。**
+   >
+   > 已知取舍:以 `/` 开头、不以 `/` 结尾的正则字面量(`/\d+/g`)与 POSIX 绝对路径形状
+   > 无法区分,会跟着进乐观点亮档。刻意接受 —— 只影响断链这一个降级态(链路正常时
+   > stat 回 `nonfile` → 纯文本),而代价的另一边是开发对话里最常见的那批绝对路径在断链
+   > 时全部不点亮,那个错更醒目也更常见;要为它收紧就得在词法层区分正则与路径,又回到
+   > 规则 4 「靠形状排除必然连真的一起砍」的老问题。两端都有用例把它钉成**显式已知项**。
+
+   | 形状 | 例 | `unknown`(链路断)时 |
+   |---|---|---|
+   | 绝对路径(**含无扩展名**) | `/abs/a.png`、`/etc/hosts`、`C:\Windows\System32`、`file:///a.md` | **乐观点亮**(不因断链把整条消息的 chip 全灭) |
+   | 尾斜杠目录 / 分隔符+扩展名 | `src/x/`、`src/App.tsx` | 同上 |
+   | 无分隔符裸名 | `package.json`、`array.map` | 必须远端明确回 `file` / `directory` |
+   | 有分隔符但无扩展名 | `src/components`、`and/or` | 同上 |
+
+   > ⚠️ **「带分隔符」本身不足以乐观点亮**,必须**同时带扩展名**。`src/components` 与
+   > `and/or` / `n/a` / `read/write` / `text/plain` 词法**完全同形**,词法层分不开;只按
+   > 「带分隔符」放行,链路一抖它们就会一起变成可点假链接,正是本规则要防的缺陷。代价是
+   > 离线时 `src/components` 这类无扩展名目录引用不点亮 —— 这是刻意取舍:宁可少点亮一个
+   > 真目录,不可多点亮一片假链接。**「可点」的视觉信号一旦不可信,加强它只会让误判更醒目。**
+   > (本条曾只写「带分隔符」,措辞不精确,导致 review 出现一条要求放宽、一条要求收紧的
+   > 矛盾反馈;2026-07-31 已按实现精确化。)
+
+#### 正文裸路径的边界规格(两端同形)
+
+正文裸路径走的是「在散文里用**正向正则**定位」,而不是「按空白切 token 再剥边」——
+后者在中文里不成立(`改了src/App.tsx,然后呢` 整句是一个 token)。代价是必须自己保证
+**命中独占它所在的路径 token**:不许从中段起,也不许把紧跟的字符截断。
+
+PR #1144 的第 8、11、12、14 轮 review 各捉到这条规格的一个缺口(扩展名长度 / 右边界
+字符 / 空格中段 / `( ) # %` 等未支持字符 + 行号后缀)。**逐个补字符类注定一轮补一个**,
+故收敛成一条判据(两端 `startsMidPathToken` + `endsMidPathToken`,逐字同形):
+
+| 侧 | 判据 |
+|---|---|
+| 左 | 命中点前是同一 run 内的字符时,只有**白名单**字符可以紧邻路径:开括号 / 引号 / 冒号 / 列表分隔符 / `>`。其余一律拒绝 |
+| 左 | 命中点前是空白时,看空白前那个 run:含分隔符**且不以扩展名收尾** → 拒绝(只跨空格/制表符,不跨换行) |
+| 右 | 命中之后紧跟 token 字符 → 拒绝;`.` 与 `:` 本身放过(句末标点),但**跳过整串 `.`/`:` 之后仍跟 token 字符**时同样拒绝 |
+
+关键收益:`( ) # % [ ] =` 之类**不需要枚举** —— 白名单之外一律拒绝,以后出现别的未支持
+字符自动覆盖,不必再来一轮。
+
+> ⚠️ 左侧必须用**白名单**,不能用黑名单。第 14 轮曾用「run 前缀已含分隔符」的黑名单,它
+> 隐含假设「未支持字符出现在首个分隔符之后」,于是 `foo(bar)/src/index.ts`(括号在第一个
+> `/` 之前)绕过去、还切出个绝对路径 `/src/index.ts`。白名单让未知字符**默认拒绝**,与本节
+> 「宁可少点亮」同向。`>` 在表里是因为字面 HTML 的元素内容按既有口径仍识别
+> (`<div>src/App.tsx</div>`);`=` 刻意不在表里 —— `--config=src/a.json` 因此不点亮,换取
+> `docs/a=b/c.md` 不切出错误前缀 `b/c.md`。
+>
+> ⚠️ 右侧的标点检查必须**跳过整串**,不能只看紧邻一个字符。这一处被连续挖了三轮
+> (`src/a.ts:12345678` → `:12.5` → `:12..5`),每轮多一层嵌套:只看一个字符时
+> `:12..5`、`:12::foo`、`:12:.:foo` 都会因为第二个标点不是 token 字符而绕过去。跳整串是
+> 为了把「再多一个标点」这条路一次封掉;句末连写的省略号(`src/a.ts...`)仍保住 —— 跳完
+> 之后没有 token 字符。
+
+两处刻意的例外,改动它们会让真实用法退化,均有用例钉住:
+- **`.` 与 `:` 不进右边界字符类**:句末英文句点(`见 src/a.ts.`)与句末冒号
+  (`见 src/a.ts:`)是最常见的紧随字符;把 `.` 加进去会让整条失配(SEG 含 `.`,回溯救
+  不回来)。
+- **「不以扩展名收尾」不能省**:少了它,`src/a.ts src/b.ts`(空格相邻的两条真路径)
+  第二条会被当成「被空格截断的后半段」连坐掉。
+
+已知误伤(显式取舍):散文里紧挨着一个「含分隔符、无扩展名」的片段时会被连坐,如
+`见 /etc src/a.ts`。少点亮一条、文本仍可读,方向与本节规则 5 的「宁可少点亮一个真目录,
+不可多点亮一片假链接」一致。
+
+#### 落点
+
+| 端 | 位置 |
+|---|---|
+| 桌面 | `MarkdownRenderer.tsx` 的 `MARKDOWN_LINK_CLASS` / `FileTargetChip`;`UserMessage.tsx` + `UserMessageUrlLink.tsx`;候选判定在 `lib/markdownTarget.ts` |
+| 移动 | `MessageRenderer.tsx` 的 `markdownLink` / `markdownPathChip` / `sessionLinkChipText` 与 `ChatPathChipSpan` 的点亮门槛;候选判定在 `session/chatPathCandidate.ts` |
+| 文件阅读器 | `session/selectableMarkdownHtml.ts`。**该面只有 http(s) 真的可点**,故规则在这里的落地是反过来的:只有 `a` 带下划线,`.xdt-image-chip` / `.xdt-session-chip` 一律不带下划线也不带 `cursor: pointer`,非 http(s) 目标(本地路径 / 会话深链 / mailto)不出 `<a>` |
+
+> **文件阅读器为什么反过来**:`MarkdownFileReader.interceptNavigation` 只把 http(s) 交给
+> `Linking.openURL`、其余导航一律 `return false`,且该 WebView **没有任何 postMessage
+> bridge**,所以 chip 类元素的点击也无处可去。给点不动的元素加下划线,等于在刚建立的
+> 「有下划线 = 可点」信号上立刻造反例 —— 反而比不加更糟。要让该面的路径 / 会话引用真
+> 可点,得先给它接上导航与 bridge,那是另一个功能。(2026-07-31 PR #1144 review 实捉:
+> 初版给会话 chip 加了下划线,且图片 chip 本就带着下划线与 pointer。)
+
+#### 不变量清单与对称路径(收敛检查点,2026-07-31)
+
+PR #1144 的两轮 review 各捉到一个**同族**缺陷:「有下划线却点不动」。根因不是某一处写错,
+而是**「加不加下划线」与「有没有点击行为」在各分支独立决定** —— 判据分散必然漂移。故把
+不变量写死，并要求判据单点化:
+
+> **下划线 ⇔ 可点,双向成立。** 可点的一定有下划线;有下划线的一定可点。
+
+对称路径必须逐条成立(任何新增可点 inline 都要回到这张表核一遍):
+
+> ⚠️ 这张表必须**从代码 grep 出来**,不能凭记忆填。2026-07-31 第一版检查点的桌面几行就是
+> 凭记忆写的,漏掉了「远程会话 unknown 乐观点亮」与「引用 chip 无下划线」两条,下一轮
+> review 又各捉到一个。
+
+| 面 | 元素 | 可点? | 下划线 |
+|---|---|---|---|
+| 桌面聊天正文 | 外链 / anchor / 本地图片 URL | ✅ | ✅ `MARKDOWN_LINK_CLASS` |
+| 桌面聊天正文 | 已解析本地文件(chip / 散文 label) | ✅ | ✅ |
+| 桌面聊天正文 | 未解析路径、行内 code | ❌ | ❌ |
+| 桌面聊天正文 | **远程**会话里 stat 回 `unknown` 的引用 | 仅非歧义形状 | 由 `isAmbiguousPathShape` 门槛裁决 |
+| 桌面聊天正文 / 用户气泡 | 会话 / 项目深链 chip(`InlineReferenceChip`) | 取决于是否注入 onClick / onContextMenu | **与 `interactive` 同源** |
+| 桌面用户气泡 | URL / 图片路径 | ✅ | ✅（改前只有 hover 下划线） |
+| 手机聊天正文 | 外链 / 图片 chip / 会话 chip | 取决于 handler 是否注入 | **与 handler 同源**(`clickableInlineStyle`) |
+| 手机聊天正文 | 路径 chip | 取决于远端 verdict | 由 `ChatPathChipSpan.lit` 单点裁决 |
+| 手机文件阅读器 | http(s) | ✅ | ✅ |
+| 手机文件阅读器 | 会话 chip / 图片 chip / 本地路径 / mailto | ❌（无 bridge、只放行 http(s)） | ❌ |
+
+**颜色也归这条不变量管**:可点态只多一条下划线,所以链接**不得写死颜色**,必须继承所在
+上下文 —— 表头(`markdownTableHeaderCell` 用 `textSecondary`)、引用块等非正文色上下文里
+写死正文色,会让链接相对周围文本除下划线之外还变色。移动端 `markdownLink` 与阅读器的
+`a` 都已去掉显式 `color`。
+
+**判据单点化**:移动端所有可点 inline 一律经 `clickableInlineStyle(styles, onPress, …)`
+取样式 —— 它按 `onPress` 是否存在决定给不给 `markdownLink`,于是结构上无法造出
+「有下划线却点不动」。**不要在 case 分支里直接写 `styles.markdownLink`**;路径 chip 不走
+这里,它的可点性由 `ChatPathChipSpan` 的 `lit` 单点裁决(同样是一个判据)。源码级守卫见
+`chatPathCandidate.test.ts` →「markdownLink 只能经 clickableInlineStyle 取用」。
+
+#### 第二次检查点(2026-07-31,第 5 轮):`unknown` 的生命周期与门槛的来源无关性
+
+第 5 轮 review 又出现同族缺陷,故按止损规则再做一次检查点。这轮的三条都不是「某处写错」,
+而是上一条不变量**没写完整**:它只约束了「谁该有下划线」,没约束「凭什么判定可点」的两个
+前提。补两条:
+
+> **不变量 A:`unknown` 不是结论,只是「这一次没问到」。** 它不得与 `file` / `directory` /
+> `nonfile` 同层缓存,必须能自愈重验;「已缓存」的判据只能是「有确定结论」。
+
+`unknown` 一旦被当成终态缓存,叠上规则 5 的歧义门槛就会**永久**把真实路径钉死在纯文本上:
+peek 有值 → 调用方跳过重验 → 链路恢复后也不再问。两端一律「确定态无 TTL 缓存 + `unknown`
+落 30s 负缓存且不进 peek」:
+
+| 端 | 确定态 | `unknown` |
+|---|---|---|
+| 桌面 `lib/remoteFileOpen.ts` | `verdictCache`,无 TTL | `unknownUntil`,30s,**不进 `peek`** |
+| 移动 `session/remotePathVerdict.ts` | `verdictCache`,无 TTL | `unknownUntil`,30s,**不进 `peek`** |
+
+代价是断链期间乐观点亮的引用每次重挂会先画一帧纯文本。刻意取舍:让「peek 有值」严格等价于
+「有确定结论」,「把 unknown 当结论」在结构上不可表达,比省一帧重绘值钱。
+(桌面侧曾把 `unknown` 写进 `verdictCache`,PR #1144 review 实捉。)
+
+> **「自愈」必须真的会发生 —— TTL 到期本身不是事件。** 没有任何 React 依赖会因 TTL 过期而
+> 变,所以只靠「重挂时重验」等于把恢复条件寄托在用户行为上:一条渲染完就一直挂着不动的
+> 消息(桌面长视图、移动端短转录都不会被回收)在链路恢复后会**永远**停在纯文本。故由 verdict
+> 缓存模块把到期翻译成一次通知:**一个**模块级定时器对齐「最早的负缓存到期时刻」(不是每个
+> 引用挂一个表 —— 一条消息几十个引用就是几十个定时器),没有 unknown 待期时**零定时器、不
+> 轮询**;到期清掉过期条目后发**一次**通知(不是每 key 一次),消费方重跑验证,已有确定结论的
+> 在 peek 处早退,于是实际重发 stat 的只有仍是 unknown 的那批,节奏就是 TTL 本身。
+> 两端出口同名:`subscribeRemotePathVerdictStale`。
+>
+> 消费方接线有一处易错:**`staleGen` 递增不得清掉已有结论** —— 它只表示「该重验了」,不表示
+> 「旧结论失效了」。跟着清会让已乐观点亮的引用每 30s 闪一下(点亮 → 纯文本 → 点亮)。故清
+> 旧结论的 effect 只依赖 target / workdir / streaming,验证的 effect 才额外依赖 `staleGen`。
+> (第 5 轮把缓存改对了,却漏了「谁来触发重验」这一半,第 8 轮 review 实捉。)
+>
+> **重验结论必须无条件覆盖旧结论,不许按 verdict 早返回。** 有了 TTL 到期重验之后,凭空多出
+> 一条状态迁移:「先按 `unknown` 乐观点亮 → 链路恢复后确认 `nonfile`」。`if (verdict ===
+> 'nonfile') return;` 这种早返回写法漏掉它,不存在的路径会一直带着下划线可点。桌面已把判据
+> 抽成纯函数 `decideRemoteLit(verdict, href, originalHref)` —— **每个 verdict 都有返回值,
+> 没有「什么都不做」这个分支**,调用方拿结果无条件 `setAsyncResolved`,于是「忘了撤销」在结构
+> 上不可表达;sync / async 两条分支共用它,判据也随之单点化。
+>
+> ⚠️ 这条在两端的**代码量不同,不能互相推断**:移动端 `ChatPathChipSpan` 存的是 **verdict
+> 本身**,新结论直接覆盖;桌面存的是**由 verdict 派生出的 resolved target**,派生值必须显式
+> 撤销。「移动端是对的」不能作为「桌面也对」的依据。(第 9 轮 review 实捉。)
+
+> **不变量 C(第 10 轮止损重构):点亮态是 verdict 缓存的纯派生,渲染层不得自己存结论。**
+>
+> 第 8、9、10 三轮 review 各捉到一条缺口,根因是同一个:**组件自己存了一份结论,而真值在一个
+> 可变的模块缓存里,组件只在自己的依赖变化时去看一眼**。于是每出现一条新的状态迁移就漏一条:
+>
+> | 轮次 | 漏掉的那条边 |
+> |---|---|
+> | 8 | TTL 到期没有通道通知(长挂载视图永远停在纯文本) |
+> | 9 | 派生值没跟着新结论被覆盖(确认 `nonfile` 后仍点亮) |
+> | 10 | **另一个挂载点**写入的确定态传不过来(同一路径出现在多处时) |
+>
+> 逐条补边补不完 —— 每补一条,下一条新迁移又会漏。故按硬止损线做结构收敛:
+>
+> - **缓存按 key 通知任何变化**(确定态落库 **+** unknown 负缓存到期),出口两端同名
+>   `subscribeRemotePathVerdictChange(listener: (key) => void)`。按 key 而非全量广播:一屏几十个
+>   引用各自订阅,广播会让首屏 N 次 stat 引发 N×N 次重渲染。
+> - **渲染读 `peekRemotePathVerdictForRender`**(确定态优先,否则 TTL 未过期的负缓存回
+>   `'unknown'`)。这个出口存在的唯一理由就是让「断链期间的乐观点亮」也成为缓存的派生 ——
+>   普通 `peek` 刻意不返回 `unknown`(不变量 A),那份状态以前只能存在组件里,而那就是第二个
+>   真值来源的由来。判定「要不要重验」仍用普通 `peek`,两个出口分工写在各自 JSDoc 里。
+> - **消费方单一 state + 一个纯派生函数**,所有触发点(挂载 / 依赖变化 / 缓存通知 / 验证完成)
+>   都调它并无条件覆盖。桌面的 `syncResolved(useMemo) ?? asyncResolved(useState)` 双源已删除,
+>   源码级守卫钉住它不许回来;验证回调**不看返回值**,只重新派生。
+>
+> 收益是任何一条新迁移都只有一个地方需要改对。代价是渲染态多依赖一次订阅,可接受。
+>
+> ⚠️ **通知必须驱动「重验」,不只是「重绘」。** 订阅回调里只 `setState(重新派生)` 是不够的:
+> 派生函数通常是 `[ctx, target]` 的稳定 `useCallback`,通知**不改变验证副作用的任何依赖**,
+> 那个副作用就不会重跑 → 再也不发 stat。TTL 到期时负缓存已被删、又没有确定态,ForRender
+> 回 `undefined`,于是引用只完成**降级成纯文本**、没完成**重验**,挂载期间永不自愈 ——
+> 比重构前(一直乐观点亮)更糟。故订阅回调递增一个 `cacheGen`,并把它放进验证副作用的依赖
+> 数组;两端都要有。(第 10 轮重构只做对了桌面那一半,第 11 轮 review 实捉;这类 bug 的形状
+> 是「依赖数组漏了触发源」,没有类型保护,故两端各有源码级守卫。)
+
+> **不变量 B:点亮门槛(规则 5)对所有候选来源同口径。** 与候选门槛(规则 4)的来源豁免
+> **无关** —— 两者是两道独立的门,显式 markdown 链接只豁免前者。
+
+作者写下 `[配置](package.json)` 只声明了「我想让它可点」,并不能让远端在链路断时知道它是否
+存在;点亮了却点不开正是规则 1 要防的反例。判据在两端各只有一份、且**逐字同形**:桌面
+`markdownTarget.isAmbiguousPathShape`、移动 `chatPathCandidate.isAmbiguousChatPathShape`;
+所有入口都调它,**不得按来源硬写 `true` / `false`**(移动端曾对链接入口恒 `false`,与桌面
+不对称,review 实捉)。
+
+| 候选来源 | 桌面入口 | 移动入口 | 走门槛? |
+|---|---|---|---|
+| 行内 code | `classifyInlineCodeTarget` | `classifyInlineCodePathCandidate` | ✅ |
+| 显式 markdown 链接 | `classifyMarkdownLinkTarget` | `classifyChatPathLinkTarget` | ✅ |
+| 正文裸写路径 | `remarkLocalPathLinks` → 同上 | `matchBareFilePathLink` → 同上 | ✅(词法强制带扩展名 → 恒非歧义,实际无影响) |
+| 尾斜杠目录 | 回看 `originalHref` → 非歧义 | 同左 | ✅ |
+| `file://` 绝对路径 | 单列为非歧义 | 同左 | ✅ |
+
+> `file://` 必须在判据里**单列**:`looksLikeFilePath` 会被 `URL_SCHEME_RE` 挡掉而回 `false`
+> (那条排除是为「别把 `https://` 当本地路径」服务的),照抄它会把最明确的形态判成最可疑的。
+> 这条是检查点自查 grep 出来的,不是 reviewer 提的 —— 也说明「表要从代码 grep」这条有用。
+
+**给守卫测试的一条元规则**:守卫要钉**不变量**,不能钉**调用点个数**。本轮就有一条第 3 轮写的
+守卫要求歧义判据「至少出现 2 处(sync + async 各一)」,而收敛后它只该有 1 处 —— 那条守卫在
+反向阻止判据单点化。计数式断言只在「必须存在」时用,不要用它表达「必须重复」。
+
+契约测试:`apps/mobile/src/__tests__/chatPathCandidate.test.ts`(候选精度 + 分级门槛 + 门槛
+来源无关性)、`apps/mobile/src/__tests__/selectableMarkdownHtml.test.ts`(阅读器点不动的元素
+一律无下划线无 pointer)、`apps/desktop/src/renderer/__tests__/markdownTarget.test.ts`
+(行内 code 不收宽松兜底)、`apps/desktop/src/renderer/__tests__/remotePathVerdictCache.test.ts`
+(不变量 A,含三种错误修法各自的反例)、
+`apps/desktop/src/renderer/__tests__/chatClickabilitySignal.test.ts`(源码级守卫)。
 
 ## 15. CINDY Skin Family(品牌化可选 family)
 
@@ -676,7 +1069,21 @@ The brand block reads only `brand.icon/logo` — no compatibility with the legac
 
 The splash wordmark is a separate asset pair (`assets/splash/wordmark.png`, white text, for DARK / `wordmark-light.png`, dark text, for LIGHT): both 459×156 (@2x) with a 229.5×78 render frame (its exact 2x full frame), and **neither carries a drop shadow** — `SplashScreen.test.tsx` asserts the absence. (Asset-size and shadow history: decision log.)
 
-**Sanctioned brand surface — mobile download dialog (approved 2026-07-25).** The fourth surface allowed to carry brand artwork, alongside login / splash / new-session:
+**Sanctioned brand surface — session-switch deferred-loading overlay (Desktop approved 2026-08-10).**
+
+- **Where**: `BrandLoadingMark` mounted by `MessageStream` only while a session switch has committed the shell but deferred the message tree. It is centered as a pointer-transparent overlay in the empty message viewport and is eligible to become visible only after the 200ms delayed-reveal threshold. The live message tree and composer never carry the mark; once messages mount, the overlay unmounts immediately.
+- **Asset / theme boundary**: use only the active theme's official Light/Dark horizontal wordmark returned by `useBrandLogo`; source aspect ratio is preserved and no custom-theme asset mapping beyond that existing hook is introduced. Brand red is intrinsic to the official artwork per the asset rule above, not authored by this component.
+- **Motion / treatment**: 35% static base wordmark plus the §14.4 session-loading sheen. No character artwork, app icon, shadow, border, plate, enlarged hero composition, slogan, or additional brand copy. The single neutral mask-clipped sheen is the narrow gradient exception registered in §2; reduced motion lands on the static wordmark.
+- **Scope boundary**: this approval identifies an in-progress session switch only. It is not precedent for branding streaming, running tasks, tools, cards, dialogs, sidebars, empty states, or other working-UI surfaces; those remain neutral and use the standard spinner/cadenced patterns.
+
+**Sanctioned brand surface — conversation-share export footer (Desktop approved 2026-08-06; Mobile approved 2026-08-08).**
+
+- **Where**: the footer of conversation-share PNG images generated by Desktop `renderer/lib/shareConversationImage.ts` or Mobile `src/session/conversationShareWebViewHtml.ts` only. The live conversation, selection mode, message stream, composer, and other working-UI surfaces remain neutral and must not display the character artwork.
+- **Lockup**: Desktop uses one static 40×40px product-approved Cindy character crop (8px radius), followed by the active theme's 24px-high wordmark with an 8px gap. Mobile uses the same crop at 22×22px (6px radius), followed by an 18px-high wordmark with a 6px gap, keeping the narrower export understated. Do not append a website or regional host. The character keeps the source asset's original color and opacity without component-authored filtering.
+- **Constraints**: no animation, shadow, decorative background, additional brand color, enlarged hero treatment, or alternate character composition. This approval identifies the source of an exported Cindy conversation; it is not precedent for adding mascots to cards, dialogs, tool output, or other share-adjacent UI.
+- **Theme boundary**: Light and Dark use their matching wordmark assets. The same static character crop may be used in both modes because it is an exported brand asset, not a UI color surface.
+
+**Sanctioned brand surface — mobile download dialog (approved 2026-07-25).**
 
 - **Where**: `components/sidebar/MobileDownloadDialog.tsx` only, and only the dialog header icon (64px `resources/icon.png`). This is a promotion surface for the mobile app, so showing the app's own icon is identification, not decoration.
 - **Constraints**: the color comes only from the official asset — no component-authored gradient or brand hex. The QR card itself carries **no brand edge, no border, no shadow and no pointer 3D tilt**: a 2px edge made of the scaled app icon was tried on 2026-07-25 and removed the same day (it read as a strange ring rotating behind the code — see §14.4). Do not re-add it in any form, static or animated.
@@ -689,6 +1096,12 @@ The splash wordmark is a separate asset pair (`assets/splash/wordmark.png`, whit
 - **Payload / rollout**: this surface accepts only the server-issued Alipay short link. Desktop rollout is gated on the server being fully deployed and all pre-deployment QR actions having exceeded their 5-minute TTL; do not add a legacy long-Scheme or lower-error-correction fallback.
 - **Constraints**: the white QR background is a scanner-contrast requirement, not a general brand panel. Do not add a border, edge, shadow, motion or other decoration to the code.
 - **Scope boundary**: this approval covers the current Alipay QR payment paths only. `BillingPaymentAction` currently does not carry a provider; any future non-Alipay `QR_CODE` channel must first add provider-aware rendering rather than inheriting this mark by default.
+
+**Sanctioned brand surface — Computer Use cursor (approved 2026-08-04).**
+
+- **Where**: the optional agent cursor configured by `apps/desktop/src/main/mcp-integrations/computer.ts` while Cindy Computer Use actions are running. Its arrow color and bloom use Brand red `#DF0C27`; the driver-required gradient transitions from Brand red to Deep brand red `#A61629`.
+- **Why the values are concrete**: the cursor is rendered by the out-of-process `cua-driver`, which cannot consume renderer CSS variables or the active theme registry. The fixed two-color brand palette is therefore identical in Light, Dark, and imported themes.
+- **Scope boundary**: this approval identifies Cindy's automated pointer only. It does not authorize brand red for ordinary controls, focus/caret states, buttons, or other working UI. Cursor styling remains optional; a driver capability/policy rejection degrades without blocking Computer Use and is remembered for the current MCP session.
 
 ### 15.8 status-badge-fg
 
@@ -789,7 +1202,7 @@ The execution rulebook for subsequent desktop / mobile UI updates. Sources: the 
 ### 15.14 Running / Collaboration Orange (finalized 2026-07-20)
 
 - **Running breathing icons are always Thinking Orange** (`--warning-accent` `#EA6B17`, all themes): VendorIcon, SessionStatusIcon (Puzzle/RadioTower), AutomationSessionGroupItem (Clock); the selected state stays orange — priority: running > selected inverse foreground > rest. Mobile `statusAccent` mirrors value and priority (glyphColor same).
-- **Collaboration toggle ON state is orange**: CollaborationModeToggle's active text + Puzzle icon use `warning-accent` (an explicit carve-out from the 2026-07-17 "composer pills go neutral" rule — ON state only; the OFF entry state stays neutral).
+- **Collaboration menu row ON state is orange**: the collaboration item inside the composer「+」menu sits beside Goal and Plan. Its active text + UsersRound icon use `warning-accent`; the row background remains the standard `--model-item-hover`, and the OFF state stays neutral. This is an explicit carve-out from the 2026-07-17 neutral composer-menu rule for the ON state only.
 - **SVG persistent-animation red line**: breathing-type persistent animation sits on an HTML wrapper (span); SVG stays static.
 
 ### 15.15 Create-Page Content Position + Titlebar Hover Discipline (finalized 2026-07-21)
@@ -907,11 +1320,11 @@ The execution rulebook for subsequent desktop / mobile UI updates. Sources: the 
 
 **Apple「Sign in with Apple」按钮**：iOS HIG 硬性要求使用 Apple 官方按钮样式，**不可皮肤化**——iOS 上 Apple 槽位保持原生 `ASAuthorizationAppleIDButton`，不套 `LoginSocialButton` 皮。这是合规底线，非视觉遗漏。其余社交圆钮（Google / WeChat / SSO）正常上皮。
 
-**i18n**：登录文案走 `react-i18next`（桌面 `common.json` `login.*` 节）/ `loginMessages`（手机），4 语对齐 `zh-CN` / `en` / `ja` / `ko`（zh-TW 已随旧仓 #488 回退对齐主干四语基线——设计阶段旧文（不在仓库内）的五语门为回退前遗留，待清理，以本节四语为准）。4 语全部翻准，不留空（空 key 静默回退英文）。
+**i18n**：登录文案走 `react-i18next`（桌面 `common.json` `login.*` 节）/ `loginMessages`（手机），5 语对齐 `zh-CN` / `zh-TW` / `en` / `ja` / `ko`。5 语全部翻准，不留空（空 key 静默回退英文）。
 
 **多语言长文本与翻译长度预算（2026-07-24 拍板）**：
 
-- **原则：登录链路里截断与省略号不可作为可见结果**。登录面板是 680×500 冻结几何（2026-07-27 改版后值）、槽位不撑高，长文案没有退路——所以约束加在**文案侧**：所有 `login.*` 文案（含 agent 代写 / 补翻的四语文本）必须言简意赅、按槽位长度预算写作。线上出现可见省略号 = 该语言文案超预算 = **文案 bug（P1，修文案，不改布局）**。
+- **原则：登录链路里截断与省略号不可作为可见结果**。登录面板是 680×500 冻结几何（2026-07-27 改版后值）、槽位不撑高，长文案没有退路——所以约束加在**文案侧**：所有 `login.*` 文案（含 agent 代写 / 补翻的五语文本）必须言简意赅、按槽位长度预算写作。线上出现可见省略号 = 该语言文案超预算 = **文案 bug（P1，修文案，不改布局）**。
 - **长度预算自检**（写 / 翻文案时逐语言过一遍）：估宽公式——汉字 / 假名 / 谚文 ≈ 1×字号 px，拉丁字母 / 数字 / 空格 ≈ 0.5×字号 px；估宽 ≤ 槽宽 × 0.95 才算过。常用槽预算：
 
   | 槽 | 宽×字号 | ≈汉字上限 | ≈拉丁字符上限 |
@@ -972,7 +1385,7 @@ The execution rulebook for subsequent desktop / mobile UI updates. Sources: the 
 - **挂哪些区域**：`cn` → `CN`；`dev` → `Dev`；**`global` 不挂**。这是产品叙事的硬规则而非视觉遗漏——Cindy 是「天生全球」的产品，默认版本不给自己贴标签自证是全球版，只有为特定法规单独构建的版本才被标注（不对称命名）。旧实现给 global 挂 `Global` 徽标，读出来反而是「存在一个本土主场版、这是它的出口型号」，与叙事相反。**给 global 恢复徽标即回退该决策，不得回退。**
 - **为什么 cn / dev 仍标**：两者连的都不是 global 端点（cn 走国内端点、dev 走独立 dev 端点），登录页是用户确认自己连向哪个后端的位置；dev 另有并存场景——`CindyDev` 保持独立可执行名，可与正式包同机共存。⚠️ **不要把 cn 的理由写成「区分同机双装的 cn / global」**：2026-07-26 起两者可执行名同为 `Cindy`、安装目录与快捷方式同名互抢，该双装场景已**明确放弃支持**（见 `packages/maker-shared/src/brandIdentity.ts` 的 `executableNameByRegion` doc）。
 - **宽度自适应**：由 `REGION_PILL.paddingX`（11）撑开，不再固定 70px——70 是为 `Global` 一词量身定的，`CN` / `Dev` 在固定宽里会留大片空白。11 由原几何反推（(70 − `Global` 6 拉丁字符 @16 Bold ≈ 48) / 2），保住 figma 的左右留白密度。
-- **文案不翻译**：四语同文的区域代号（承袭旧 `login.globalRegion` 的做法），但仍走 i18n（`login.regionPill.*`），以便日后改判为「中国大陆版」这类可译文案时不必回改组件。
+- **文案不翻译**：五语同文的区域代号（承袭旧 `login.globalRegion` 的做法），但仍走 i18n（`login.regionPill.*`），以便日后改判为「中国大陆版」这类可译文案时不必回改组件。
 - **手机端无此变体**：`apps/mobile` 的 `LoginTitleBlock` 不接 `regionPill`（移动端未做区域徽标）。
 
 **组件库新增（2026-07-24 登记；协议 UI 已随 consent PR 落地，游客圆钮方案已由上述「跳过登录」文字按钮取代）**：
@@ -1027,7 +1440,7 @@ The execution rulebook for subsequent desktop / mobile UI updates. Sources: the 
 - **视觉(同为设计单位)**:圆角 22、四边 padding 20、**不透明底**(浮层压立绘必须不透明,不靠阴影 / 模糊);描边保持 1 物理 px 细线(不随缩放,否则小系数下会消失);无图标、无阴影、无动效。标题与正文同为 20 / 行高 23 / Regular 400、全部居中(长文案居中换行),仅以颜色区分层级(标题 `--login-control-text` / 正文 `--login-secondary-text`);标题↔正文 5、正文↔「我知道了」22、**「我知道了」↔气泡底固定 20**(= 下 padding,文案拉长该距不变)。内部几何由组件子元素坐标反算自洽:figma 678:1074 标题 text @(20,20) h=23、正文 @(20,48) h=23,无钮变体总高 91 = 20+23+5+23+20。
 - **「我知道了」**(仅 `completed` 态):下划线文字链(非按钮)。热区按端处理——桌面用上下各 11 设计单位 padding + 等量负 margin 抵消视觉(缩放后约 22 CSS px 高,鼠标指针足够);触摸端 hitSlop **按气泡内可用空间钳制**:上 = min(18, 正文↔链接间距×scale)、下 = min(18, 下 padding×scale)、左右 20 物理 pt——RN 的 hitSlop 不会越过父 View 边界,写大了是虚标。**不设未缩放的 44pt 绝对下限**:整个登录系统按 stage 缩放(320pt 窗口下登录主按钮本身仅 ≈34pt 高),孤立保 44 必须打破「正文↔链接 22 / 底距 20 恒定」的拍板视觉;热区随系统同步缩放、在边界内取最大。
 - **颜色**：底 `--login-deletion-bubble-bg`（#FFFFFF / #1F1F1E）、描边 `--login-deletion-bubble-border`（#D7D7D4 / #3C3C3A），均为**固定亮 / 暗二值**——与 §16.2「`--login-*` 只分 light / dark、不随扩展主题」一致，**不得**改用 `var(--surface)` / `var(--chat-input-*)` 等会被扩展主题 override 的 alias（同 `--login-bg-base` 的改判先例）；移动端色板逐值一致。
-- **状态与文案**：`pending`（预计删除日期 + 重新登录可取消）/ `processing`（等待期结束、正在删除）/ `completed`（已删除 + 「我知道了」）三态；`cancelled` 在轮询侧拦截、不渲染气泡（改为登录后的一次性「注销已取消」提示）。四语言（zh-CN / en / ja / ko）× light / dark 全覆盖。
+- **状态与文案**：`pending`（预计删除日期 + 重新登录可取消）/ `processing`（等待期结束、正在删除）/ `completed`（已删除 + 「我知道了」）三态；`cancelled` 在轮询侧拦截、不渲染气泡（改为登录后的一次性「注销已取消」提示）。五语言（zh-CN / zh-TW / en / ja / ko）× light / dark 全覆盖。
 
 ### 16.5 深色模式与主题跟随
 

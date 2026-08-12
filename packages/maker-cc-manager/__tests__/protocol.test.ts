@@ -17,6 +17,10 @@ describe('protocol constants', () => {
     expect(PROTOCOL_VERSION).toBeGreaterThan(0);
   });
 
+  it('requires v3 so old daemons cannot ignore root-only host tool guards', () => {
+    expect(PROTOCOL_VERSION).toBe(3);
+  });
+
   it('METHODS has expected method names', () => {
     expect(METHODS.PROTOCOL_HELLO).toBe('protocol/hello');
     expect(METHODS.QUERY_START).toBe('query/start');

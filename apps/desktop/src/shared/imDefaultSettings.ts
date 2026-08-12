@@ -1,4 +1,4 @@
-export type ImDefaultAgentKind = 'claude-code' | 'codex';
+export type ImDefaultAgentKind = 'claude-code' | 'codex' | 'pi';
 export type ImDefaultPermissionMode =
   'ask' | 'default' | 'acceptEdits' | 'plan' | 'auto' | 'bypassPermissions';
 export type ImDefaultEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -8,7 +8,8 @@ export type ImDefaultEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 
  * 刻意读 global(channel=undefined, 见 hook-control/session-runner.ts), 不落
  * 在这个键上 — 两者互不影响。
  */
-export type ImDefaultSettingsChannel = 'feishu' | 'slack' | 'discord' | 'wechat' | 'telegram';
+export type ImDefaultSettingsChannel =
+  'feishu' | 'slack' | 'discord' | 'wechat' | 'telegram' | 'dingtalk' | 'wecom';
 
 export interface ImDefaultAgentSettings {
   providerId: string | null;
@@ -48,6 +49,12 @@ export const IM_DEFAULT_SETTINGS: ImDefaultSettings = {
       model: 'codex/gpt-5.5',
       effort: 'high',
     },
+    // Pi 走网关中档模型作为 IM 新会话默认值，可在各渠道设置中覆盖。
+    pi: {
+      providerId: null,
+      model: 'claude-sonnet-5',
+      effort: 'high',
+    },
   },
 };
 
@@ -57,6 +64,8 @@ export const IM_DEFAULT_SETTINGS_CHANNELS: readonly ImDefaultSettingsChannel[] =
   'discord',
   'wechat',
   'telegram',
+  'dingtalk',
+  'wecom',
 ];
 
 export const IM_DEFAULT_EFFORT_OVERRIDES: Readonly<Partial<Record<string, ImDefaultEffort>>> = {
@@ -64,7 +73,7 @@ export const IM_DEFAULT_EFFORT_OVERRIDES: Readonly<Partial<Record<string, ImDefa
   'codex/gpt-5.5': 'high',
 };
 
-const AGENT_KINDS = new Set<ImDefaultAgentKind>(['claude-code', 'codex']);
+const AGENT_KINDS = new Set<ImDefaultAgentKind>(['claude-code', 'codex', 'pi']);
 const EFFORTS = new Set<ImDefaultEffort>([
   'minimal',
   'low',
@@ -87,6 +96,28 @@ export const WECHAT_UNSUPPORTED_PERMISSION_MODES: readonly ImDefaultPermissionMo
   'acceptEdits',
   'bypassPermissions',
 ];
+
+/**
+ * 渠道对**任何消息**都挂 turnPermissionPolicy 的清单(与 main 侧 adapter 的
+ * turnPermissionPolicy / turnPermissionPolicyFor 事实对齐):这些渠道把
+ * 工具确认渲染成渠道文本提示,要求所选 Agent 声明 turnPermissionPolicy
+ * capability。Pi 未声明该 capability,在这些渠道的任何权限模式下都不可用
+ * (fail-closed);Claude Code / Codex 声明了,仅在个别权限模式不可用。
+ *
+ * 目前只有个人微信(WechatIM.turnPermissionPolicy)对每次 dispatch
+ * 无条件挂 policy;Telegram / 钉钉的 turnPermissionPolicyFor 仅在群聊
+ * (event.speaker 存在)时挂载,主人私聊不挂 → Pi 在私聊可用,设置 UI 不区分
+ * 群聊/私聊,不能整体警告。新增渠道时先确认其 policy 挂载是否无条件。
+ */
+export const UNCONDITIONAL_TURN_POLICY_CHANNELS: readonly ImDefaultSettingsChannel[] = [
+  'wechat',
+];
+
+export function isUnconditionalTurnPolicyChannel(
+  channel: ImDefaultSettingsChannel,
+): boolean {
+  return UNCONDITIONAL_TURN_POLICY_CHANNELS.includes(channel);
+}
 
 export function isImDefaultAgentKind(value: unknown): value is ImDefaultAgentKind {
   return typeof value === 'string' && AGENT_KINDS.has(value as ImDefaultAgentKind);

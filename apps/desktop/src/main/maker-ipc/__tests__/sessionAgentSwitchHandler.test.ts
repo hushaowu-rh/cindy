@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   applyPendingAgentSwitchIfIdle,
   applySetModelThenCancelAgentSwitchIntent,
+  createPendingAgentSwitchRegistry,
   performSessionAgentSwitch,
   registerMakerSessionAgentSwitchHandler,
   type AgentSwitchSessionRow,
@@ -116,6 +117,47 @@ describe('performSessionAgentSwitch', () => {
     expect(boundary.toAgentKind).toBe('cc');
   });
 
+  it('claude-code → pi 不会被参数校验拒绝', async () => {
+    const { deps } = makeDeps();
+    const result = await performSessionAgentSwitch(deps, {
+      sessionId: 's1',
+      targetAgentKind: 'pi',
+      model: 'gpt-5.5',
+      applyNow: true,
+    });
+    expect(result).toMatchObject({ switched: true, agentKind: 'pi' });
+    expect(deps.applyAgentSwitchToDb).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ agentKind: 'pi' }),
+    );
+  });
+
+  it('codex → pi + OpenAI 关闭旧会话并保持目标 provider route', async () => {
+    const { deps, calls } = makeDeps({
+      getSessionRow: vi.fn(async () =>
+        makeRow({ agentKind: 'codex', model: 'gpt-5.5-codex', sdkSessionId: 'codex-thread' }),
+      ),
+    });
+
+    const result = await performSessionAgentSwitch(deps, {
+      sessionId: 's1',
+      targetAgentKind: 'pi',
+      model: 'chatgpt/gpt-5.5',
+      providerId: 'openai',
+      applyNow: true,
+    });
+
+    expect(result).toMatchObject({ switched: true, agentKind: 'pi', engineReady: true });
+    expect(calls).toEqual(['close', 'db', 'provider', 'boundary', 'pending', 'bootstrap']);
+    expect(deps.applyAgentSwitchToDb).toHaveBeenCalledWith('s1', {
+      agentKind: 'pi',
+      model: 'chatgpt/gpt-5.5',
+      providerId: 'openai',
+      sdkSessionId: null,
+    });
+    expect(deps.setSessionProvider).toHaveBeenCalledWith('s1', 'openai');
+  });
+
   it('跨引擎 DB 提交后立即覆盖旧 provider route', async () => {
     const { deps } = makeDeps();
 
@@ -164,6 +206,17 @@ describe('performSessionAgentSwitch', () => {
     await expect(performSessionAgentSwitch(deleted.deps, validParams)).rejects.toThrow(/NOT_FOUND/);
   });
 
+  it('Review 审计任务拒绝切换 harness', async () => {
+    const { deps, calls } = makeDeps({
+      getSessionRow: vi.fn(async () => makeRow({ source: 'review' })),
+    });
+
+    await expect(performSessionAgentSwitch(deps, validParams)).rejects.toThrow(
+      /Review task settings are fixed/,
+    );
+    expect(calls).toEqual([]);
+  });
+
   it('远程会话与 Orca 会话抛 UNSUPPORTED_CAPABILITY', async () => {
     const remote = makeDeps({ getSessionRow: vi.fn(async () => makeRow({ remoteHostId: 'host-1' })) });
     await expect(performSessionAgentSwitch(remote.deps, validParams)).rejects.toThrow(/UNSUPPORTED_CAPABILITY/);
@@ -180,6 +233,79 @@ describe('performSessionAgentSwitch', () => {
     });
     expect(result.switched).toBe(false);
     expect(calls).toEqual([]);
+  });
+
+  it('同引擎 no-op 通过真实 registry CAS 清意图并返回因果修订号', async () => {
+    const pendingSwitches = createPendingAgentSwitchRegistry();
+    pendingSwitches.set('s1', {
+      targetAgentKind: 'codex',
+      model: 'gpt-5.5',
+      providerId: null,
+    });
+    const onPendingSwitchChanged = vi.fn();
+    const { deps } = makeDeps({ pendingSwitches, onPendingSwitchChanged });
+
+    const result = await performSessionAgentSwitch(deps, {
+      ...validParams,
+      targetAgentKind: 'claude-code',
+      model: 'claude-sonnet-5',
+    });
+
+    expect(result).toMatchObject({
+      switched: false,
+      sameEngineRevision: 2,
+    });
+    expect(pendingSwitches.get('s1')).toBeUndefined();
+    expect(pendingSwitches.revision?.('s1')).toBe(2);
+    expect(onPendingSwitchChanged).toHaveBeenCalledWith('s1', null);
+  });
+
+  it('回归:同引擎 no-op 在 await 期间被外部 set→clear ABA 超车时不再应用旧选择', async () => {
+    const pendingSwitches = createPendingAgentSwitchRegistry();
+    pendingSwitches.set('s1', {
+      targetAgentKind: 'codex',
+      model: 'gpt-5.5',
+      providerId: null,
+    });
+    let releaseRouteCheck!: () => void;
+    let routeCheckStarted!: () => void;
+    const routeCheckGate = new Promise<void>((resolve) => {
+      releaseRouteCheck = resolve;
+    });
+    const routeCheckEntered = new Promise<void>((resolve) => {
+      routeCheckStarted = resolve;
+    });
+    const onPendingSwitchChanged = vi.fn();
+    const { deps } = makeDeps({
+      pendingSwitches,
+      onPendingSwitchChanged,
+      assertModelRouteUsable: vi.fn(async () => {
+        routeCheckStarted();
+        await routeCheckGate;
+        return undefined;
+      }),
+    });
+
+    const request = performSessionAgentSwitch(deps, {
+      ...validParams,
+      targetAgentKind: 'claude-code',
+      model: 'claude-sonnet-5',
+    });
+    await routeCheckEntered;
+    pendingSwitches.set('s1', {
+      targetAgentKind: 'codex',
+      model: 'gpt-5.5-codex',
+      providerId: 'openai',
+    });
+    pendingSwitches.clear('s1');
+    releaseRouteCheck();
+
+    await expect(request).resolves.toMatchObject({
+      switched: false,
+      sameEngineSuperseded: true,
+    });
+    expect(pendingSwitches.revision?.('s1')).toBe(3);
+    expect(onPendingSwitchChanged).not.toHaveBeenCalled();
   });
 
   it('turn 进行中抛 SESSION_RUNNING,不触碰任何状态', async () => {
@@ -238,7 +364,7 @@ describe('deferred switch (turn running)', () => {
     const store = new Map<
       string,
       {
-        targetAgentKind: 'claude-code' | 'codex';
+        targetAgentKind: 'claude-code' | 'codex' | 'pi';
         model: string;
         providerId: string | null | undefined;
         effort?: string;
@@ -402,6 +528,31 @@ describe('deferred switch (turn running)', () => {
       fastMode: true,
     });
     await expect(ipc.invoke(MAKER_INVOKE.GET_SESSION_AGENT_SWITCH_INTENT, '')).rejects.toThrow(/INVALID_PARAMS/);
+  });
+
+  it('IPC 切换与 send / SET_MODEL 共用 session 锁', async () => {
+    const withSessionLockSpy = vi.fn();
+    const withSessionLock: NonNullable<MakerSessionAgentSwitchHandlerDeps['withSessionLock']> =
+      async <T>(sessionId: string, task: () => Promise<T>): Promise<T> => {
+        withSessionLockSpy(sessionId, task);
+        return task();
+      };
+    const { deps } = makeDeps({ withSessionLock });
+    const ipc = new IpcHarness();
+    registerMakerSessionAgentSwitchHandler(ipc, deps);
+
+    await ipc.invoke(
+      MAKER_INVOKE.SWITCH_SESSION_AGENT,
+      's1',
+      'claude-code',
+      'claude-sonnet-5',
+      null,
+      undefined,
+      undefined,
+    );
+
+    expect(withSessionLockSpy).toHaveBeenCalledTimes(1);
+    expect(withSessionLockSpy).toHaveBeenCalledWith('s1', expect.any(Function));
   });
 
   it('applyPendingAgentSwitchIfIdle:直发路径可要求切换后同步 bootstrap', async () => {

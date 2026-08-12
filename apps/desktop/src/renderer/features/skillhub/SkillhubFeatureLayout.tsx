@@ -76,7 +76,12 @@ export function SkillhubFeatureLayout() {
       const reg = s.registryEntry;
       if (reg !== null) {
         const needsAuthorId = reg.authorId !== serverAuthorId;
-        const needsOrigin = !(reg.origin === 'published' || reg.origin === 'installed' || reg.origin === 'learned');
+        const needsOrigin = !(
+          reg.origin === 'published' ||
+          reg.origin === 'installed' ||
+          reg.origin === 'learned' ||
+          reg.origin === 'imported'
+        );
         if (!needsAuthorId && !needsOrigin) continue;
       }
       const key = `${s.name}\u0000${s.absolutePath}\u0000${serverAuthorId}`;
@@ -125,11 +130,13 @@ export function SkillhubFeatureLayout() {
   const skillhubProjects = useMemo<SkillhubProject[] | null>(() => {
     if (sessionsLoading) return null;
     const { projects } = groupSessions(sessions);
-    return projects.map((p) => ({
-      projectRoot: p.workingDir,
-      hash: projectHash(p.workingDir),
-      displayName: p.displayName,
-    }));
+    return projects
+      .filter((p) => p.scope === 'local')
+      .map((p) => ({
+        projectRoot: p.workingDir,
+        hash: projectHash(p.workingDir),
+        displayName: p.displayName,
+      }));
   }, [sessions, sessionsLoading]);
 
   useEffect(() => {

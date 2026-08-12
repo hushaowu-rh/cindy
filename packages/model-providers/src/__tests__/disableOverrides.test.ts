@@ -141,6 +141,41 @@ describe('来源过滤(模型级停用拷贝)', () => {
   });
 });
 
+describe('retired tombstone 的新路由与运行中会话分层', () => {
+  const retiredCatalog = {
+    providers: [
+      provider('alpha', [model('claude-opus-5', { status: 'retired' })]),
+      provider('beta', [model('claude-opus-5')]),
+    ],
+  } as Catalog;
+  const views = buildRegistry(retiredCatalog, ALL_CONNECTED, {});
+
+  it('effective 新路由跳过 retired；actual 仍保留运行中会话的真实来源', () => {
+    expect(effectiveSourceIdForModel(views, 'alpha', 'claude-opus-5', 'claude-code')).toBe('beta');
+    expect(actualSourceIdForModel(views, 'alpha', 'claude-opus-5', 'claude-code')).toBe('alpha');
+  });
+
+  it('全部 retired 时禁止新选择，但 keepSelected 仍保留当前行', () => {
+    const allRetired = buildRegistry(
+      {
+        providers: [provider('alpha', [model('claude-opus-5', { status: 'retired' })])],
+      } as Catalog,
+      { alpha: true },
+      {},
+    );
+    expect(effectiveSourceIdForModel(allRetired, null, 'claude-opus-5', 'claude-code')).toBeNull();
+    expect(actualSourceIdForModel(allRetired, null, 'claude-opus-5', 'claude-code')).toBe('alpha');
+    expect(deriveModelList({ providers: allRetired, agent: 'claude-code' })).toEqual([]);
+    expect(
+      deriveModelList({
+        providers: allRetired,
+        agent: 'claude-code',
+        keepSelected: { providerId: 'alpha', modelId: 'claude-opus-5' },
+      }).map((entry) => entry.id),
+    ).toEqual(['claude-opus-5']);
+  });
+});
+
 describe('未知 group 的例外只限用户供应商', () => {
   it('user 供应商 + group=custom:<id> 且模型名含 image/audio 关键字 ⇒ 仍是 agent 可选模型', () => {
     const views = buildRegistry(
@@ -161,9 +196,9 @@ describe('未知 group 的例外只限用户供应商', () => {
     expect(ids).toEqual(['gpt-4o-audio-preview', 'flux-image-x']);
   });
 
-  it('builtin 网关补的 custom:xd 未知组**不**豁免:无分组下发的图像模型仍被硬排除', () => {
-    // active-catalog 对缺 group 的网关条目补 `custom:xd`(见 active-catalog.ts)——
-    // 若无条件放行未知组,这类图像/音频模型会绕过能力分类重新漏进对话清单。
+  it('builtin 网关显式下发的 custom:xd 未知组**不**豁免:图像模型仍被硬排除', () => {
+    // 即使服务端显式下发未知组,也不能像用户自定义供应商一样获得豁免；否则这类
+    // 图像/音频模型会绕过能力分类重新漏进对话清单。
     const views = buildRegistry(
       {
         providers: [

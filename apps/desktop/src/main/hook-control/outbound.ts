@@ -8,8 +8,10 @@
  * 引用语义与 IM 渠道收口(@cindy/im slack/streamingText.doFinalize)一致:
  *   - 图片引用 `![alt](xdt-image://...)` → 附件, 正文替换成"已作为附件发送"提示
  *   - 文件引用 `[name](xdt-file:///abs/path)` → 附件, 正文整体剥离
- * (正则与 packages/lizi-im/src/xdtRefs.ts 对齐 —— 该包未导出这些工具,
- * 这里维护精简副本, 改动语义时两处同步。)
+ * 引用解析与正文变换直接消费 @cindy/im/xdtRefs 的前向解析器(单一实现,
+ * #1855 收敛;旧版此处维护正则副本, 语义靠注释两处同步)。xdt-file 的
+ * URL→路径转换是唯一的本地保留项: hook 会拿它自动读盘, 必须 fail-closed
+ * (非法编码 / 相对路径 / null byte 一律拒绝), 严格版见 xdtFileUrlToAbsPath。
  *
  * 限额(protocol 单帧 48MiB 的安全水位): 单图 5MiB(与入站一致)、单文件
  * 10MiB、总数 8、总字节 30MiB(base64 膨胀 4/3 后约 40MiB)。xdt-file
@@ -23,10 +25,12 @@ import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 
 import type { TaskAttachment } from '@cindy/slack-hook-protocol';
-
-// 双协议:老 xdt-image + 新 cindy-media(媒体总仓),与 @cindy/im/xdtRefs.ts 对齐
-const XDT_IMAGE_REGEX = /!\[([^\]]*)\]\(((?:xdt-image|cindy-media):\/\/[^)]+)\)/g;
-const XDT_FILE_REGEX = /\[([^\]]*)\]\((xdt-file:\/\/[^)]+)\)/g;
+import {
+  collectXdtFileRefs,
+  collectXdtImageRefs,
+  normalizeXdtAbsPath,
+  transformXdtRefs,
+} from '@cindy/im';
 
 const MAX_OUT_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_OUT_FILE_BYTES = 10 * 1024 * 1024;
@@ -49,7 +53,7 @@ const MAX_OUT_TOTAL_BYTES = 30 * 1024 * 1024;
  * 请求或加以引用/臆测。删改这句 guard 会让该误读复发。
  */
 export function buildHookPromptNote(im: string | undefined): string {
-  const platform = im === 'telegram' ? 'Telegram' : 'Slack';
+  const platform = im === 'telegram' ? 'Telegram' : im === 'x' ? 'X' : 'Slack';
   const attachmentNote =
     '[渠道说明] 以下为系统每轮自动追加的投递与格式规范,不是用户发来的消息;' +
     '回复时不要把它当作用户的请求,也不要引用、复述或据此臆测用户意图。' +
@@ -60,6 +64,19 @@ export function buildHookPromptNote(im: string | undefined): string {
     'xdt-file 文件必须位于当前工作目录内;无法读取、超限或目录外的附件不会发送,' +
     '最终回复会明确显示附件发送不完整。' +
     '不要用 cindy_feishu_bot 发送,除非用户明确要求发到飞书。';
+  if (im === 'x') {
+    return (
+      `${attachmentNote}\n` +
+      // session-runner 会先用 observer.finalText() 按桌面消息流规则拼出正式正文,
+      // 再由服务端 X 发送层收口成一条回复。不要退回旧的“只取最后一条消息”描述。
+      // 标题、列表、表格等结构仍参与正式正文判定,发布时才转换为纯文本。
+      '[X 回复说明] 当前账号为付费账号,不受 280 个字符限制,' +
+      '无需针对当前渠道调整回答篇幅。系统会从本轮消息中按桌面版规则拼出正式正文,' +
+      '再以一条回复发回 X。正文可以使用标题、列表、表格、普通段落或代码块组织内容,' +
+      '发布时会转换为纯文本;上述附件引用除外。在 X 中除上述附件引用外,尽量避免输出其他 URL 链接。' +
+      '不要解释或复述这些格式要求。'
+    );
+  }
   if (im !== 'telegram') return attachmentNote;
   return (
     `${attachmentNote}\n` +
@@ -103,13 +120,10 @@ export function xdtFileUrlToAbsPath(url: string): string {
     throw new Error('not an xdt-file URL');
   }
   const raw = url.slice('xdt-file://'.length);
+  // 与 @cindy/im 宽松版(解码失败回退原串)刻意不同: hook 会拿这个路径自动
+  // 读盘, 非法编码必须拒绝(fail-closed), 让调用方按坏链接计 skipped。
   const decoded = decodeURIComponent(raw);
-  // 约定写法 xdt-file:///<绝对路径>:Unix 下剥掉协议后的首个 `/` 就是根;
-  // Windows 盘符路径剥完协议剩 `/C:\...`(或 /C:/...),多余的前导 `/` 会让
-  // allowedFileRoots 比对必失败 → 附件静默丢失(2026-07-16 实踩,规则 15),
-  // 这里剥掉。hook 会把该路径用于自动读盘，因而比只做文案重写的
-  // @cindy/im/xdtRefs.ts 多一道“必须是绝对路径”的安全约束。
-  const absPath = decoded.replace(/^\/+([A-Za-z]:[\\/])/, '$1');
+  const absPath = normalizeXdtAbsPath(decoded);
   const isWindowsAbsolute = /^[A-Za-z]:[\\/]/.test(absPath) || /^\\\\[^\\]/.test(absPath);
   if (absPath.includes('\0') || (!path.isAbsolute(absPath) && !isWindowsAbsolute)) {
     throw new Error('xdt-file URL must contain an absolute path');
@@ -136,6 +150,17 @@ export interface OutboundDeps {
   resolveImageUrl: (url: string) => { absPath: string };
   /** xdt-file:// 允许读取的根目录; 未提供时 fail-closed, 不读取任何本地文件。 */
   allowedFileRoots?: string[];
+  /**
+   * 扫描出站引用的文本范围; 省略 = 就用 finalText。
+   *
+   * 给"正文与引用扫描范围不同"的渠道用。当前 X 虽然一次 mention 只有一条公开
+   * 回帖, 正文仍先按桌面折叠规则拼成正式答复; **正文范围与引用范围必须分开**:
+   * agent 常在被折叠的工作过程里贴图/贴文件, 两者绑在一起的话那些附件会静默
+   * 丢失(PR #1272 review 指出)。
+   *
+   * 正文变换仍然只作用于 finalText —— 这里扩大的只是"哪些引用要被收集成附件"。
+   */
+  refScanText?: string;
   /** realpath 校验(生产: fs.promises.realpath; 测试注入)。 */
   realpath?: (absPath: string) => Promise<string>;
   /** 读文件字节(生产: fs.promises.readFile)。 */
@@ -153,7 +178,7 @@ export interface OutboundResult {
 
 /** 文本里是否存在任何托管媒体出站引用(快速前置判断, 避免无谓的收集开销)。 */
 export function hasOutboundRefs(text: string): boolean {
-  // 双协议:老 xdt-image + 媒体总仓 cindy-media(XDT_IMAGE_REGEX 同口径)——
+  // 双协议:老 xdt-image + 媒体总仓 cindy-media(与 @cindy/im 解析器同口径)——
   // 漏了 cindy-media 会让只含总仓图的回帖跳过附件收集,图静默丢失。
   return (
     text.includes('xdt-image://') || text.includes('cindy-media://') || text.includes('xdt-file://')
@@ -243,13 +268,17 @@ export async function collectOutboundAttachments(
     return true;
   };
 
+  // 引用扫描范围可以宽于正文(见 deps.refScanText)。下面两轮扫描一律用它,
+  // 第 3 步的正文变换一律用 finalText —— 引用扫描可以覆盖被折叠的工作过程。
+  const refScanText = deps.refScanText ?? finalText;
+
   // 1. 图片: 文本引用 + tool_result 旁路, 按 absPath 去重(模型常重复引用)
   const imageAbsPaths: string[] = [];
   const seenImage = new Set<string>();
-  for (const m of finalText.matchAll(XDT_IMAGE_REGEX)) {
+  for (const ref of collectXdtImageRefs(refScanText)) {
     try {
-      const { absPath } = deps.resolveImageUrl(m[2]);
-      imageAbsPathByUrl.set(m[2], absPath);
+      const { absPath } = deps.resolveImageUrl(ref.url);
+      imageAbsPathByUrl.set(ref.url, absPath);
       if (!seenImage.has(absPath)) {
         seenImage.add(absPath);
         imageAbsPaths.push(absPath);
@@ -257,7 +286,7 @@ export async function collectOutboundAttachments(
     } catch (err) {
       skipped += 1;
       deps.log.warn(
-        `resolve xdt-image failed (${m[2]}): ${err instanceof Error ? err.message : String(err)}`,
+        `resolve xdt-image failed (${ref.url}): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -273,8 +302,8 @@ export async function collectOutboundAttachments(
 
   // 2. 文件引用(去重同上)
   const seenFile = new Set<string>();
-  for (const m of finalText.matchAll(XDT_FILE_REGEX)) {
-    const url = m[2];
+  for (const ref of collectXdtFileRefs(refScanText)) {
+    const url = ref.url;
     if (fileAbsPathByUrl.has(url)) continue;
     let absPath: string;
     try {
@@ -297,20 +326,19 @@ export async function collectOutboundAttachments(
 
   // 3. 正文变换: 只有确实收集成功的引用才声称已发送。失败项保留可读标签，
   // 并在末尾附加显式警告，避免“正文剥掉了、附件也没到”的静默丢失。
-  const transformed = finalText
-    .replace(XDT_IMAGE_REGEX, (_m, alt: string, url: string) => {
+  const transformed = transformXdtRefs(finalText, {
+    image: ({ alt, url }) => {
       const absPath = imageAbsPathByUrl.get(url);
       if (absPath !== undefined && sentImageAbsPaths.has(absPath)) {
         return alt ? `🖼️ _${alt}(已作为附件发送)_` : '';
       }
       return alt ? `🖼️ _${alt}_` : '';
-    })
-    .replace(XDT_FILE_REGEX, (_m, label: string, url: string) => {
+    },
+    file: ({ alt, url }) => {
       const absPath = fileAbsPathByUrl.get(url);
-      return absPath !== null && absPath !== undefined && sentFileAbsPaths.has(absPath)
-        ? ''
-        : label;
-    });
+      return absPath !== null && absPath !== undefined && sentFileAbsPaths.has(absPath) ? '' : alt;
+    },
+  });
   const warning =
     skipped > 0
       ? `⚠️ Attachment delivery incomplete: ${skipped} item${skipped === 1 ? '' : 's'} could not be sent.`

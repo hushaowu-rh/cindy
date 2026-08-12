@@ -14,9 +14,11 @@
  * 的清单本就来自本机实时供应商目录, 非法值只出现在
  * "偏好过期"(模型下架 / agent 换代)的窗口里。
  *
- * permissionMode 例外: IM 草稿默认没有权限概念, 取值链是「显式且该 agent
- * 支持 > 显式但不支持时回落该 agent **最严**档 > 从未填显式档时
- * 'bypassPermissions'」。
+ * permissionMode 例外: 本模块**刻意不消费**草稿里的权限档(注入面
+ * `HookDefaultsDeps.readDefaults` 压根没这个字段 —— 草稿本身是有的,
+ * `ImDefaultSettings.permissionMode` 出厂 'auto', 个人 IM 那侧照常用它)。
+ * 这里的取值链是「显式且该 agent 支持 > 显式但不支持时回落该 agent **最严**档 >
+ * 从未填显式档时 'bypassPermissions'」。
  *
  * 「不支持时只能更严不能更宽」是安全方向的硬要求(2026-07 修正; 旧实现在此
  * 回落 bypass): 用户填过显式档 = 明确表达过「不要默认的完全访问」, 换 agent
@@ -35,24 +37,24 @@ import type { Effort } from '@cindy/maker-core';
 /** 依赖注入面: IM 默认值 + 各 agent 当前可用模型清单。 */
 export interface HookDefaultsDeps {
   readDefaults: () => {
-    agentKind: 'claude-code' | 'codex';
+    agentKind: 'claude-code' | 'codex' | 'pi';
     agents: Record<
-      'claude-code' | 'codex',
+      'claude-code' | 'codex' | 'pi',
       { providerId: string | null; model: string; effort: string }
     >;
   };
-  getModels: (agentKind: 'claude-code' | 'codex') => Array<{
+  getModels: (agentKind: 'claude-code' | 'codex' | 'pi') => Array<{
     id: string;
     efforts: readonly string[];
     defaultEffort: string | null;
   }>;
   /** 该 agent 支持的权限档 id 清单(capabilities.permissionModes)。 */
-  getPermissionModes: (agentKind: 'claude-code' | 'codex') => readonly string[];
+  getPermissionModes: (agentKind: 'claude-code' | 'codex' | 'pi') => readonly string[];
   log: { warn(msg: string): void };
 }
 
 export interface ResolvedHookSessionConfig {
-  agentKind: 'claude-code' | 'codex';
+  agentKind: 'claude-code' | 'codex' | 'pi';
   model: string;
   effort: Effort | undefined;
   permissionMode: string;
@@ -64,7 +66,7 @@ export interface ResolvedHookSessionConfig {
   providerId: string | null;
 }
 
-const AGENT_KINDS = new Set(['claude-code', 'codex']);
+const AGENT_KINDS = new Set(['claude-code', 'codex', 'pi']);
 
 /**
  * 合成新 hook 会话的 agent/model/effort。
@@ -82,9 +84,9 @@ export function resolveHookSessionConfig(
   const defaults = deps.readDefaults();
 
   // 1. agent: 显式合法值 > 草稿默认
-  const agentKind: 'claude-code' | 'codex' =
+  const agentKind: 'claude-code' | 'codex' | 'pi' =
     overrides.agentKind !== null && AGENT_KINDS.has(overrides.agentKind)
-      ? (overrides.agentKind as 'claude-code' | 'codex')
+      ? (overrides.agentKind as 'claude-code' | 'codex' | 'pi')
       : defaults.agentKind;
 
   const models = deps.getModels(agentKind);
